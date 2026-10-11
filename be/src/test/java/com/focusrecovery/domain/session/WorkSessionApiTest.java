@@ -9,7 +9,14 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -124,8 +131,90 @@ class WorkSessionApiTest {
 			.andExpect(jsonPath("$.fieldErrors").isEmpty());
 	}
 
+	@Test
+	void 같은_키와_같은_목표로_재요청하면_기존_세션을_반환한다() throws Exception {
+		String first = createSession("재시도 목표", "key-1");
+		String second = createSession("  재시도 목표 ", "key-1");
+
+		assertThat(second).isEqualTo(first);
+		assertThat(workSessionRepository.count()).isEqualTo(1);
+	}
+
+	@Test
+	void 다른_키로_요청하면_새_세션을_생성한다() throws Exception {
+		String first = createSession("같은 목표", "key-1");
+		String second = createSession("같은 목표", "key-2");
+
+		assertThat(first).isNotEqualTo(second);
+		assertThat(workSessionRepository.count()).isEqualTo(2);
+	}
+
+	@Test
+	void 같은_키로_다른_목표를_보내면_422이다() throws Exception {
+		createSession("원래 목표", "key-1");
+
+		mockMvc.perform(post("/api/sessions")
+				.header("Idempotency-Key", "key-1")
+				.contentType(MediaType.APPLICATION_JSON)
+				.content("{\"goalText\": \"다른 목표\"}"))
+			.andExpect(status().isUnprocessableContent())
+			.andExpect(jsonPath("$.code").value("IDEMPOTENCY_KEY_MISMATCH"))
+			.andExpect(jsonPath("$.fieldErrors").isEmpty());
+
+		assertThat(workSessionRepository.count()).isEqualTo(1);
+	}
+
+	@ParameterizedTest
+	@ValueSource(ints = {1, 256})
+	void 키가_공백이거나_너무_길면_400이다(int length) throws Exception {
+		String key = length == 1 ? " " : "k".repeat(length);
+		mockMvc.perform(post("/api/sessions")
+				.header("Idempotency-Key", key)
+				.contentType(MediaType.APPLICATION_JSON)
+				.content("{\"goalText\": \"목표\"}"))
+			.andExpect(status().isBadRequest())
+			.andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+
+		assertThat(workSessionRepository.count()).isZero();
+	}
+
+	@Test
+	void 같은_키로_동시에_요청해도_세션은_하나다() throws Exception {
+		int threads = 8;
+		CountDownLatch ready = new CountDownLatch(1);
+		ExecutorService executor = Executors.newFixedThreadPool(threads);
+		try {
+			Callable<String> task = () -> {
+				ready.await();
+				return createSession("동시 요청", "concurrent-key");
+			};
+			List<Future<String>> futures = new ArrayList<>();
+			for (int i = 0; i < threads; i++) {
+				futures.add(executor.submit(task));
+			}
+			ready.countDown();
+			String expected = futures.get(0).get();
+			for (Future<String> future : futures) {
+				assertThat(future.get()).isEqualTo(expected);
+			}
+		} finally {
+			executor.shutdown();
+		}
+		assertThat(workSessionRepository.count()).isEqualTo(1);
+	}
+
 	private String createSession(String goalText) throws Exception {
 		String body = mockMvc.perform(post("/api/sessions")
+				.contentType(MediaType.APPLICATION_JSON)
+				.content("{\"goalText\": \"" + goalText + "\"}"))
+			.andExpect(status().isCreated())
+			.andReturn().getResponse().getContentAsString();
+		return JsonPath.read(body, "$.sessionId");
+	}
+
+	private String createSession(String goalText, String idempotencyKey) throws Exception {
+		String body = mockMvc.perform(post("/api/sessions")
+				.header("Idempotency-Key", idempotencyKey)
 				.contentType(MediaType.APPLICATION_JSON)
 				.content("{\"goalText\": \"" + goalText + "\"}"))
 			.andExpect(status().isCreated())
