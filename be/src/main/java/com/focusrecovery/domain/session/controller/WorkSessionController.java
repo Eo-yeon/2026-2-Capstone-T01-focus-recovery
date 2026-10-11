@@ -8,6 +8,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
@@ -35,8 +36,14 @@ public class WorkSessionController {
 
 	@PostMapping
 	@ResponseStatus(HttpStatus.CREATED)
-	public WorkSessionResponse create(@Valid @RequestBody CreateWorkSessionRequest request) {
-		return workSessionService.create(request.goalText());
+	public WorkSessionResponse create(
+		@RequestHeader(name = "Idempotency-Key", required = false) String idempotencyKey,
+		@Valid @RequestBody CreateWorkSessionRequest request
+	) {
+		if (idempotencyKey != null && (idempotencyKey.isBlank() || idempotencyKey.length() > 255)) {
+			throw new InvalidRequestException("Idempotency-Key는 1~255자여야 합니다.");
+		}
+		return workSessionService.create(request.goalText(), idempotencyKey);
 	}
 
 	@GetMapping("/{sessionId}")

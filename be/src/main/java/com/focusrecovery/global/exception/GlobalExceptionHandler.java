@@ -7,6 +7,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
+import com.focusrecovery.domain.session.exception.IdempotencyKeyMismatchException;
 import com.focusrecovery.domain.session.exception.SessionNotFoundException;
 
 @RestControllerAdvice
@@ -42,5 +43,11 @@ public class GlobalExceptionHandler {
 	@ResponseStatus(HttpStatus.NOT_FOUND)
 	public ErrorResponse handleSessionNotFound(SessionNotFoundException e) {
 		return ErrorResponse.of("SESSION_NOT_FOUND", e.getMessage());
+	}
+
+	@ExceptionHandler(IdempotencyKeyMismatchException.class)
+	@ResponseStatus(HttpStatus.UNPROCESSABLE_CONTENT)
+	public ErrorResponse handleIdempotencyKeyMismatch(IdempotencyKeyMismatchException e) {
+		return ErrorResponse.of("IDEMPOTENCY_KEY_MISMATCH", e.getMessage());
 	}
 }
