@@ -104,6 +104,37 @@ class WorkSessionApiTest {
 		assertThat(workSessionRepository.count()).isZero();
 	}
 
+	@ParameterizedTest
+	@ValueSource(strings = {"abcde", "  abcde  ", "가나다라마"})
+	void 공백_제외_5자이면_생성된다(String goalText) throws Exception {
+		mockMvc.perform(post("/api/sessions")
+				.contentType(MediaType.APPLICATION_JSON)
+				.content("{\"goalText\": \"" + goalText + "\"}"))
+			.andExpect(status().isCreated())
+			.andExpect(jsonPath("$.goalText").value(goalText.strip()));
+	}
+
+	@Test
+	void 공백_제외_150자이면_생성된다() throws Exception {
+		String goalText = "가".repeat(150);
+		mockMvc.perform(post("/api/sessions")
+				.contentType(MediaType.APPLICATION_JSON)
+				.content("{\"goalText\": \"  " + goalText + "  \"}"))
+			.andExpect(status().isCreated())
+			.andExpect(jsonPath("$.goalText").value(goalText));
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {"abcd", "  abcd  ", "가나다라"})
+	void 공백_제외_5자_미만이면_400이다(String goalText) throws Exception {
+		assertLengthRejected(goalText);
+	}
+
+	@Test
+	void 공백_제외_150자_초과이면_400이다() throws Exception {
+		assertLengthRejected("가".repeat(151));
+	}
+
 	@Test
 	void 본문이_없으면_400이다() throws Exception {
 		mockMvc.perform(post("/api/sessions").contentType(MediaType.APPLICATION_JSON))
@@ -171,7 +202,7 @@ class WorkSessionApiTest {
 		mockMvc.perform(post("/api/sessions")
 				.header("Idempotency-Key", key)
 				.contentType(MediaType.APPLICATION_JSON)
-				.content("{\"goalText\": \"목표\"}"))
+				.content("{\"goalText\": \"길이 검증 목표\"}"))
 			.andExpect(status().isBadRequest())
 			.andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
 
@@ -201,6 +232,18 @@ class WorkSessionApiTest {
 			executor.shutdown();
 		}
 		assertThat(workSessionRepository.count()).isEqualTo(1);
+	}
+
+	private void assertLengthRejected(String goalText) throws Exception {
+		mockMvc.perform(post("/api/sessions")
+				.contentType(MediaType.APPLICATION_JSON)
+				.content("{\"goalText\": \"" + goalText + "\"}"))
+			.andExpect(status().isBadRequest())
+			.andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+			.andExpect(jsonPath("$.fieldErrors[0].field").value("goalText"))
+			.andExpect(jsonPath("$.fieldErrors[0].message").value("작업 목표는 5자 이상 150자 이하로 입력해 주세요."));
+
+		assertThat(workSessionRepository.count()).isZero();
 	}
 
 	private String createSession(String goalText) throws Exception {
