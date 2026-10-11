@@ -36,13 +36,17 @@ public class WorkSession {
 	@Column(name = "ended_at", columnDefinition = "DATETIME(3)")
 	private Instant endedAt;
 
+	@Column(name = "idempotency_key", unique = true, updatable = false)
+	private String idempotencyKey;
+
 	protected WorkSession() {
 	}
 
-	public static WorkSession start(String goalText) {
+	public static WorkSession start(String goalText, String idempotencyKey) {
 		WorkSession session = new WorkSession();
 		session.sessionId = UUID.randomUUID();
 		session.goalText = goalText;
+		session.idempotencyKey = idempotencyKey;
 		session.status = WorkSessionStatus.ACTIVE;
 		// DATETIME(3) 정밀도에 맞춰 저장 값과 응답 값을 일치시킨다
 		session.startedAt = Instant.now().truncatedTo(ChronoUnit.MILLIS);
@@ -67,5 +71,9 @@ public class WorkSession {
 
 	public Instant getEndedAt() {
 		return endedAt;
+	}
+
+	public String getIdempotencyKey() {
+		return idempotencyKey;
 	}
 }
