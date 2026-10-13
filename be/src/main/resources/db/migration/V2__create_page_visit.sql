@@ -1,0 +1,20 @@
+CREATE TABLE page_visit (
+    visit_id              CHAR(36)     NOT NULL,
+    session_id            CHAR(36)     NOT NULL,
+    sequence              INT          NOT NULL,
+    browser_tab_key       VARCHAR(100) NOT NULL,
+    normalized_url        TEXT         NOT NULL,
+    domain                VARCHAR(255) NOT NULL,
+    title                 TEXT         NULL,
+    content               MEDIUMTEXT   NULL,
+    search_query          TEXT         NULL,
+    is_search_result_page BOOLEAN      NOT NULL DEFAULT FALSE,
+    visited_at            DATETIME(3)  NOT NULL,
+    active_duration_ms    BIGINT       NOT NULL DEFAULT 0,
+    tab_switch_count      INT          NOT NULL DEFAULT 0,
+    behavior_version      BIGINT       NOT NULL DEFAULT 0,
+    updated_at            DATETIME(3)  NULL,
+    PRIMARY KEY (visit_id),
+    CONSTRAINT uk_page_visit_session_sequence UNIQUE (session_id, sequence),
+    CONSTRAINT fk_page_visit_session FOREIGN KEY (session_id) REFERENCES work_session (session_id)
+);
