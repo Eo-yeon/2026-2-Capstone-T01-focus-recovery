@@ -117,7 +117,8 @@ class PageVisitApiTest {
 		String visitId = UUID.randomUUID().toString();
 		String body = """
 			{"visitId": "%s", "sequence": 1, "browserTabKey": "tab-1", "normalizedUrl": "http://example.com",
-			 "domain": "example.com", "title": null, "visitedAt": "2026-10-13T01:23:45.678Z"}""".formatted(visitId);
+			 "domain": "example.com", "title": null, "activeDurationMs": 1000,
+			 "visitedAt": "2026-10-13T01:23:45.678Z"}""".formatted(visitId);
 
 		String response = mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
 			.andExpect(status().isCreated())
@@ -125,7 +126,7 @@ class PageVisitApiTest {
 			.andExpect(jsonPath("$.content").value(nullValue()))
 			.andExpect(jsonPath("$.searchQuery").value(nullValue()))
 			.andExpect(jsonPath("$.isSearchResultPage").value(false))
-			.andExpect(jsonPath("$.activeDurationMs").value(0))
+			.andExpect(jsonPath("$.activeDurationMs").value(1000))
 			.andExpect(jsonPath("$.tabSwitchCount").value(0))
 			.andExpect(jsonPath("$.behaviorVersion").value(0))
 			.andReturn().getResponse().getContentAsString();
@@ -173,6 +174,39 @@ class PageVisitApiTest {
 		assertThat(pageVisitRepository.findById(UUID.fromString(visitId)).orElseThrow().getContent()).isNull();
 	}
 
+	@ParameterizedTest
+	@ValueSource(longs = {1000, 1001, 60_000})
+	void 체류시간이_1000ms_이상이면_저장된다(long activeDurationMs) throws Exception {
+		String visitId = UUID.randomUUID().toString();
+		String body = withField(visitJson(visitId, 1, "제목"), "activeDurationMs", String.valueOf(activeDurationMs));
+
+		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
+			.andExpect(status().isCreated())
+			.andExpect(jsonPath("$.activeDurationMs").value(activeDurationMs));
+
+		assertThat(pageVisitRepository.findById(UUID.fromString(visitId)).orElseThrow().getActiveDurationMs())
+			.isEqualTo(activeDurationMs);
+	}
+
+	@ParameterizedTest
+	@CsvSource(delimiter = '|', value = {
+		"0|체류시간은 1000ms(1초) 이상이어야 합니다.",
+		"999|체류시간은 1000ms(1초) 이상이어야 합니다.",
+		"null|체류시간을 입력해 주세요.",
+	})
+	void 체류시간이_없거나_1000ms_미만이면_400이고_저장하지_않는다(String value, String message) throws Exception {
+		String body = withField(visitJson(UUID.randomUUID().toString(), 1, "제목"), "activeDurationMs", value);
+
+		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
+			.andExpect(status().isBadRequest())
+			.andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+			.andExpect(jsonPath("$.fieldErrors.length()").value(1))
+			.andExpect(jsonPath("$.fieldErrors[0].field").value("activeDurationMs"))
+			.andExpect(jsonPath("$.fieldErrors[0].message").value(message));
+
+		assertThat(pageVisitRepository.count()).isZero();
+	}
+
 	@Test
 	void 같은_방문을_재전송하면_200으로_기존_방문을_반환하고_행동정보를_덮어쓰지_않는다() throws Exception {
 		String visitId = UUID.randomUUID().toString();
@@ -181,7 +215,7 @@ class PageVisitApiTest {
 			.andExpect(jsonPath("$.applied").value(true))
 			.andReturn().getResponse().getContentAsString(), "$.updatedAt");
 
-		// 재전송 요청의 행동 정보(0)는 무시되고 갱신된 값이 유지된다
+		// 재전송 요청의 행동 정보(1000ms, 버전 0)는 무시되고 갱신된 값이 유지된다
 		saveVisit(sessionId, visitId, 1, "제목")
 			.andExpect(status().isOk())
 			.andExpect(jsonPath("$.visitId").value(visitId))
@@ -408,6 +442,7 @@ class PageVisitApiTest {
 		"\"visitId\": \"%s\",", // visitId 누락
 		"\"sequence\": 1,", // sequence 누락
 		"\"browserTabKey\": \"tab-1\",", // browserTabKey 누락
+		"\"activeDurationMs\": 1000,", // activeDurationMs 누락
 		", \"visitedAt\": \"" + VISITED_AT + "\"", // visitedAt 누락 (마지막 필드)
 	})
 	void 필수값이_없으면_400이고_저장하지_않는다(String removed) throws Exception {
@@ -428,6 +463,9 @@ class PageVisitApiTest {
 		"sequence|0",
 		"normalizedUrl|\"ftp://example.com\"",
 		"activeDurationMs|-1",
+		"activeDurationMs|0",
+		"activeDurationMs|999",
+		"activeDurationMs|null",
 		"tabSwitchCount|-1",
 		"behaviorVersion|-1",
 	})
@@ -694,7 +732,7 @@ class PageVisitApiTest {
 	private static String visitJson(String visitId, int sequence, String title) {
 		return """
 			{"visitId": "%s", "sequence": %d, "browserTabKey": "tab-1", "normalizedUrl": "https://example.com/%d", \
-			"domain": "example.com", "title": "%s", "content": "본문", "visitedAt": "%s"}"""
+			"domain": "example.com", "title": "%s", "content": "본문", "activeDurationMs": 1000, "visitedAt": "%s"}"""
 			.formatted(visitId, sequence, sequence, title, VISITED_AT);
 	}
 

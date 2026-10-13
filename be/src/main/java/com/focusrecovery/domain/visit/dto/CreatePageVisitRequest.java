@@ -72,8 +72,10 @@ public record CreatePageVisitRequest(
 	@NotNull(message = "방문 시각을 입력해 주세요.")
 	Instant visitedAt,
 
-	@Schema(description = "누적 활성 체류시간(ms, 생략 시 0)", example = "0", minimum = "0")
-	@Min(value = 0, message = "체류시간은 0 이상이어야 합니다.")
+	@Schema(description = "누적 활성 체류시간(ms). 유효 방문 최소 기준(data-collection-spec §5)에 따라 1000 이상 필수",
+		example = "1000", minimum = "1000", requiredMode = Schema.RequiredMode.REQUIRED)
+	@NotNull(message = "체류시간을 입력해 주세요.")
+	@Min(value = 1000, message = "체류시간은 1000ms(1초) 이상이어야 합니다.")
 	Long activeDurationMs,
 
 	@Schema(description = "누적 탭 전환 횟수 (생략 시 0)", example = "0", minimum = "0")
@@ -94,7 +96,7 @@ public record CreatePageVisitRequest(
 		return new PageVisit(
 			UUID.fromString(visitId), sessionId, sequence, browserTabKey, normalizedUrl, domain, title, content,
 			searchQuery, Boolean.TRUE.equals(isSearchResultPage), visitedAt,
-			activeDurationMs == null ? 0 : activeDurationMs,
+			activeDurationMs,
 			tabSwitchCount == null ? 0 : tabSwitchCount,
 			behaviorVersion == null ? 0 : behaviorVersion
 		);
