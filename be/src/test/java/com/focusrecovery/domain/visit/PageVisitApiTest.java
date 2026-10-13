@@ -133,6 +133,47 @@ class PageVisitApiTest {
 	}
 
 	@Test
+	void 본문은_5000자까지_저장된다() throws Exception {
+		String visitId = UUID.randomUUID().toString();
+		String content = "가".repeat(5000);
+		String body = withField(visitJson(visitId, 1, "제목"), "content", "\"" + content + "\"");
+
+		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
+			.andExpect(status().isCreated())
+			.andExpect(jsonPath("$.content").value(content));
+		// 같은 본문으로 재전송하면 기존 방문을 반환한다
+		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
+			.andExpect(status().isOk());
+
+		assertThat(pageVisitRepository.findById(UUID.fromString(visitId)).orElseThrow().getContent()).isEqualTo(content);
+	}
+
+	@Test
+	void 본문이_5000자를_넘으면_400이고_저장하지_않는다() throws Exception {
+		String body = withField(visitJson(UUID.randomUUID().toString(), 1, "제목"), "content", "\"" + "a".repeat(5001) + "\"");
+
+		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
+			.andExpect(status().isBadRequest())
+			.andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+			.andExpect(jsonPath("$.fieldErrors[0].field").value("content"))
+			.andExpect(jsonPath("$.fieldErrors[0].message").value("본문은 5,000자 이하여야 합니다."));
+
+		assertThat(pageVisitRepository.count()).isZero();
+	}
+
+	@Test
+	void 본문을_null로_보내면_null로_저장된다() throws Exception {
+		String visitId = UUID.randomUUID().toString();
+		String body = withField(visitJson(visitId, 1, "제목"), "content", "null");
+
+		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
+			.andExpect(status().isCreated())
+			.andExpect(jsonPath("$.content").value(nullValue()));
+
+		assertThat(pageVisitRepository.findById(UUID.fromString(visitId)).orElseThrow().getContent()).isNull();
+	}
+
+	@Test
 	void 같은_방문을_재전송하면_200으로_기존_방문을_반환하고_행동정보를_덮어쓰지_않는다() throws Exception {
 		String visitId = UUID.randomUUID().toString();
 		saveVisit(sessionId, visitId, 1, "제목").andExpect(status().isCreated());

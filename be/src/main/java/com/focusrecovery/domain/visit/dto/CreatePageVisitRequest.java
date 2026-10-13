@@ -16,7 +16,7 @@ import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
-// TEXT(65,535바이트)·MEDIUMTEXT(16,777,215바이트)에 utf8mb4 최대 4바이트 문자로도 들어가는 길이로 제한한다
+// 주소·제목·검색어는 TEXT(65,535바이트)에 utf8mb4 최대 4바이트 문자로도 들어가는 길이로, 본문은 명세(data-collection-spec §4) 기준으로 제한한다
 @Schema(description = "방문 기록 저장 요청")
 public record CreatePageVisitRequest(
 	@Schema(description = "FE가 발급한 방문 ID (UUID). 재전송 시 같은 값", example = "7d3f8a2e-1c4b-4f6a-9e2d-5b8c0a1f3e47",
@@ -52,8 +52,9 @@ public record CreatePageVisitRequest(
 	@Size(max = 16383, message = "제목이 너무 깁니다.")
 	String title,
 
-	@Schema(description = "페이지 본문 텍스트 (생략 가능)", example = "Spring Boot helps you to create stand-alone...")
-	@Size(max = 4194303, message = "본문이 너무 깁니다.")
+	@Schema(description = "FE가 추출한 페이지 본문 텍스트 (생략 또는 null 가능, 최대 5,000자)", maxLength = 5000,
+		example = "Spring Boot helps you to create stand-alone...")
+	@Size(max = 5000, message = "본문은 5,000자 이하여야 합니다.")
 	String content,
 
 	@Schema(description = "검색어 (생략 가능)", example = "spring boot jpa")

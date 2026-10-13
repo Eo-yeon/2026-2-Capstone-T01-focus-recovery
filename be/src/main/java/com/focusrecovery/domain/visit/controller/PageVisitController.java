@@ -54,11 +54,12 @@ public class PageVisitController {
 			- normalizedUrl은 FE가 정규화한 주소여야 합니다: http/https 스킴(대소문자 무관), 소문자 호스트, 기본 포트(http:80, https:443)·인증정보·Query·Fragment 없음.
 			  예) 원본 `https://Example.com:443/docs/JWT?ref=home#intro` → `https://example.com/docs/JWT`. 서버는 변환하지 않고 검증만 하며, 정규화되지 않은 주소는 400입니다.
 			- title, content, searchQuery는 생략하거나 null로 보낼 수 있습니다. isSearchResultPage 생략 시 false, 행동 정보 생략 시 0입니다.
+			- content는 FE가 추출한 본문이며 최대 5,000자입니다. 초과하면 서버가 자르지 않고 400을 반환합니다.
 			- visitedAt은 밀리초까지 저장되며, 응답은 UTC ISO 8601(밀리초) 형식입니다.
 			""")
 	@ApiResponse(responseCode = "201", description = "새 방문 저장")
 	@ApiResponse(responseCode = "200", description = "같은 방문 재전송: 저장된 방문 반환")
-	@ApiResponse(responseCode = "400", description = "잘못된 UUID, 필수값 누락, 음수, "
+	@ApiResponse(responseCode = "400", description = "잘못된 UUID, 필수값 누락, 음수, 본문(content) 5,000자 초과, "
 		+ "정규화되지 않은 주소(http/https가 아닌 스킴, 호스트 없음·대문자, 기본 포트, 인증정보, Query·Fragment 포함, URL 문법 오류)",
 		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
 			{"code": "INVALID_REQUEST", "message": "요청 값이 올바르지 않습니다.",
