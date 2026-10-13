@@ -18,6 +18,7 @@ import jakarta.validation.constraints.Size;
 
 // 주소·제목·검색어는 TEXT(65,535바이트)에 utf8mb4 최대 4바이트 문자로도 들어가는 길이로, 본문은 명세(data-collection-spec §4) 기준으로 제한한다
 @Schema(description = "방문 기록 저장 요청")
+@DomainMatchesUrl
 public record CreatePageVisitRequest(
 	@Schema(description = "FE가 발급한 방문 ID (UUID). 재전송 시 같은 값", example = "7d3f8a2e-1c4b-4f6a-9e2d-5b8c0a1f3e47",
 		requiredMode = Schema.RequiredMode.REQUIRED)
@@ -43,7 +44,8 @@ public record CreatePageVisitRequest(
 	@Size(max = 16383, message = "페이지 주소가 너무 깁니다.")
 	String normalizedUrl,
 
-	@Schema(description = "페이지 도메인 (최대 255자)", example = "docs.spring.io", requiredMode = Schema.RequiredMode.REQUIRED)
+	@Schema(description = "페이지의 전체 호스트명 (서브도메인 포함, 포트 제외, 최대 255자). normalizedUrl의 호스트와 같아야 합니다(FE의 URL.hostname).",
+		example = "docs.spring.io", requiredMode = Schema.RequiredMode.REQUIRED)
 	@NotBlank(message = "도메인을 입력해 주세요.")
 	@Size(max = 255, message = "도메인은 255자 이하여야 합니다.")
 	String domain,

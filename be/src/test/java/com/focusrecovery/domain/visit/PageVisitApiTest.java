@@ -443,26 +443,68 @@ class PageVisitApiTest {
 	}
 
 	@ParameterizedTest
-	@ValueSource(strings = {
-		"https://example.com/docs/JWT",
-		"HTTPS://example.com",
-		"Http://example.com/Path/Upper",
-		"https://example.com:8443/a/b",
-		"http://example.com:443/",
-		"https://example.com:80/",
-		"http://127.0.0.1/x",
-		"http://[::1]:8080/",
-		"https://xn--3e0b707e.kr/",
+	@CsvSource(delimiter = '|', value = {
+		"https://example.com/docs/JWT|example.com",
+		"HTTPS://example.com|example.com",
+		"Http://example.com/Path/Upper|example.com",
+		"https://docs.spring.io:8443/a/b|docs.spring.io",
+		"http://example.com:443/|example.com",
+		"https://example.com:80/|example.com",
+		"http://127.0.0.1/x|127.0.0.1",
+		"http://[::1]:8080/|[::1]",
+		"https://xn--3e0b707e.kr/|xn--3e0b707e.kr",
 	})
-	void 정규화된_주소는_허용하고_그대로_저장한다(String url) throws Exception {
+	void 정규화된_주소는_허용하고_그대로_저장한다(String url, String domain) throws Exception {
 		String visitId = UUID.randomUUID().toString();
-		String body = withField(visitJson(visitId, 1, "제목"), "normalizedUrl", "\"" + url + "\"");
+		String body = withField(withField(visitJson(visitId, 1, "제목"), "normalizedUrl", "\"" + url + "\""),
+			"domain", "\"" + domain + "\"");
 
 		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
 			.andExpect(status().isCreated())
-			.andExpect(jsonPath("$.normalizedUrl").value(url));
+			.andExpect(jsonPath("$.normalizedUrl").value(url))
+			.andExpect(jsonPath("$.domain").value(domain));
 
-		assertThat(pageVisitRepository.findById(UUID.fromString(visitId)).orElseThrow().getNormalizedUrl()).isEqualTo(url);
+		PageVisit saved = pageVisitRepository.findById(UUID.fromString(visitId)).orElseThrow();
+		assertThat(saved.getNormalizedUrl()).isEqualTo(url);
+		assertThat(saved.getDomain()).isEqualTo(domain);
+	}
+
+	@ParameterizedTest
+	@CsvSource(delimiter = '|', value = {
+		"https://docs.spring.io/a|spring.io",
+		"https://spring.io/a|docs.spring.io",
+		"https://www.example.com/|example.com",
+		"https://docs.spring.io:8443/a|docs.spring.io:8443",
+		"https://docs.spring.io/a|Docs.spring.io",
+		"https://docs.spring.io/a|docs.spring.io.",
+		"https://docs.spring.io/a|other.com",
+		"http://[::1]:8080/|::1",
+	})
+	void 도메인이_주소의_호스트명과_다르면_400이다(String url, String domain) throws Exception {
+		String body = withField(withField(visitJson(UUID.randomUUID().toString(), 1, "제목"), "normalizedUrl", "\"" + url + "\""),
+			"domain", "\"" + domain + "\"");
+
+		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
+			.andExpect(status().isBadRequest())
+			.andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+			.andExpect(jsonPath("$.fieldErrors.length()").value(1))
+			.andExpect(jsonPath("$.fieldErrors[0].field").value("domain"))
+			.andExpect(jsonPath("$.fieldErrors[0].message").value("도메인은 페이지 주소의 호스트명과 같아야 합니다."));
+
+		assertThat(pageVisitRepository.count()).isZero();
+	}
+
+	@Test
+	void 같은_방문을_다른_도메인으로_재전송하면_검증에서_400이다() throws Exception {
+		String visitId = UUID.randomUUID().toString();
+		saveVisit(sessionId, visitId, 1, "제목").andExpect(status().isCreated());
+
+		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON)
+				.content(withField(visitJson(visitId, 1, "제목"), "domain", "\"other.com\"")))
+			.andExpect(status().isBadRequest())
+			.andExpect(jsonPath("$.fieldErrors[0].field").value("domain"));
+
+		assertThat(pageVisitRepository.findById(UUID.fromString(visitId)).orElseThrow().getDomain()).isEqualTo("example.com");
 	}
 
 	@ParameterizedTest

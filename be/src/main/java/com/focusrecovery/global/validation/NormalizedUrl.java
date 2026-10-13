@@ -44,7 +44,7 @@ public @interface NormalizedUrl {
 			return false;
 		}
 
-		static String findViolation(String value) {
+		public static String findViolation(String value) {
 			URI uri;
 			try {
 				uri = new URI(value);
