@@ -6,7 +6,8 @@ import io.swagger.v3.oas.annotations.media.Schema;
 
 @Schema(description = "오류 응답")
 public record ErrorResponse(
-	@Schema(description = "오류 코드 (INVALID_REQUEST, SESSION_NOT_FOUND, IDEMPOTENCY_KEY_MISMATCH)", example = "INVALID_REQUEST")
+	@Schema(description = "오류 코드 (INVALID_REQUEST, SESSION_NOT_FOUND, VISIT_NOT_FOUND, IDEMPOTENCY_KEY_MISMATCH, "
+		+ "SESSION_ENDED, VISIT_ID_CONFLICT, VISIT_SEQUENCE_CONFLICT, BEHAVIOR_VERSION_CONFLICT, BEHAVIOR_COUNTER_DECREASED)", example = "INVALID_REQUEST")
 	String code,
 	@Schema(description = "오류 메시지", example = "요청 값이 올바르지 않습니다.")
 	String message,
