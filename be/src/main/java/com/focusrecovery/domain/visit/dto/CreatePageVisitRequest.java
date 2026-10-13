@@ -7,7 +7,7 @@ import java.util.UUID;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.focusrecovery.domain.visit.entity.PageVisit;
 import com.focusrecovery.global.util.Uuids;
-import com.focusrecovery.global.validation.HttpUrl;
+import com.focusrecovery.global.validation.NormalizedUrl;
 
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.Min;
@@ -35,11 +35,11 @@ public record CreatePageVisitRequest(
 	@Size(max = 100, message = "브라우저 탭 식별값은 100자 이하여야 합니다.")
 	String browserTabKey,
 
-	@Schema(description = "정규화된 HTTP/HTTPS 페이지 주소. 스킴은 대소문자 구분 없이 http/https만 허용하며 호스트가 있어야 합니다. "
-		+ "보낸 값 그대로(대소문자 유지) 저장·비교합니다.",
+	@Schema(description = "FE가 정규화한 페이지 주소. http/https 스킴(대소문자 무관), 소문자 호스트, "
+		+ "기본 포트(http:80, https:443)·인증정보·Query·Fragment 없음. 서버는 검증만 하고 보낸 값 그대로(경로 대소문자 유지) 저장·비교합니다.",
 		example = "https://docs.spring.io/spring-boot/index.html", requiredMode = Schema.RequiredMode.REQUIRED)
 	@NotBlank(message = "페이지 주소를 입력해 주세요.")
-	@HttpUrl(message = "페이지 주소는 호스트가 있는 http 또는 https 주소여야 합니다.")
+	@NormalizedUrl
 	@Size(max = 16383, message = "페이지 주소가 너무 깁니다.")
 	String normalizedUrl,
 

@@ -51,14 +51,15 @@ public class PageVisitController {
 			- 새 방문은 ACTIVE 세션에만 저장되며 201을 반환합니다.
 			- 같은 visitId + 같은 원본 정보(sessionId, sequence, browserTabKey, normalizedUrl, domain, title, content, searchQuery, isSearchResultPage, visitedAt)로 재전송하면 저장된 방문을 200으로 반환합니다.
 			  이때 이미 갱신된 행동 정보와 updatedAt은 바뀌지 않습니다. 종료된 세션에서도 재전송 응답은 그대로 반환합니다.
-			- normalizedUrl은 http/https(대소문자 무관) 스킴과 호스트가 있는 주소여야 하며, 보낸 값 그대로 저장됩니다.
+			- normalizedUrl은 FE가 정규화한 주소여야 합니다: http/https 스킴(대소문자 무관), 소문자 호스트, 기본 포트(http:80, https:443)·인증정보·Query·Fragment 없음.
+			  예) 원본 `https://Example.com:443/docs/JWT?ref=home#intro` → `https://example.com/docs/JWT`. 서버는 변환하지 않고 검증만 하며, 정규화되지 않은 주소는 400입니다.
 			- title, content, searchQuery는 생략하거나 null로 보낼 수 있습니다. isSearchResultPage 생략 시 false, 행동 정보 생략 시 0입니다.
 			- visitedAt은 밀리초까지 저장되며, 응답은 UTC ISO 8601(밀리초) 형식입니다.
 			""")
 	@ApiResponse(responseCode = "201", description = "새 방문 저장")
 	@ApiResponse(responseCode = "200", description = "같은 방문 재전송: 저장된 방문 반환")
 	@ApiResponse(responseCode = "400", description = "잘못된 UUID, 필수값 누락, 음수, "
-		+ "잘못된 주소(http/https가 아닌 스킴, 호스트 없음, URL 문법 오류)",
+		+ "정규화되지 않은 주소(http/https가 아닌 스킴, 호스트 없음·대문자, 기본 포트, 인증정보, Query·Fragment 포함, URL 문법 오류)",
 		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
 			{"code": "INVALID_REQUEST", "message": "요청 값이 올바르지 않습니다.",
 			 "fieldErrors": [{"field": "sequence", "message": "방문 순서는 1 이상이어야 합니다."}]}""")))

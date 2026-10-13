@@ -403,14 +403,17 @@ class PageVisitApiTest {
 
 	@ParameterizedTest
 	@ValueSource(strings = {
+		"https://example.com/docs/JWT",
 		"HTTPS://example.com",
-		"Http://Example.com/Path?Q=Value#Frag",
+		"Http://example.com/Path/Upper",
 		"https://example.com:8443/a/b",
+		"http://example.com:443/",
+		"https://example.com:80/",
 		"http://127.0.0.1/x",
 		"http://[::1]:8080/",
-		"https://user@example.com/",
+		"https://xn--3e0b707e.kr/",
 	})
-	void HTTP_HTTPS_주소는_대소문자와_관계없이_허용하고_그대로_저장한다(String url) throws Exception {
+	void 정규화된_주소는_허용하고_그대로_저장한다(String url) throws Exception {
 		String visitId = UUID.randomUUID().toString();
 		String body = withField(visitJson(visitId, 1, "제목"), "normalizedUrl", "\"" + url + "\"");
 
@@ -422,27 +425,42 @@ class PageVisitApiTest {
 	}
 
 	@ParameterizedTest
-	@ValueSource(strings = {
-		"https:///path",
-		"https://",
-		"http://:80/path",
-		"https:example.com",
-		"example.com",
-		"/relative/path",
-		"ftp://example.com",
-		"javascript://example.com",
-		"https://exa mple.com",
-		"https://example.com/a b",
-		"https://[::1/",
+	@CsvSource(delimiter = '|', value = {
+		"https:///path|페이지 주소는 호스트가 있는 http 또는 https 주소여야 합니다.",
+		"https://|페이지 주소의 형식이 올바르지 않습니다.",
+		"http://:80/path|페이지 주소는 호스트가 있는 http 또는 https 주소여야 합니다.",
+		"https:example.com|페이지 주소는 호스트가 있는 http 또는 https 주소여야 합니다.",
+		"example.com|페이지 주소는 호스트가 있는 http 또는 https 주소여야 합니다.",
+		"/relative/path|페이지 주소는 호스트가 있는 http 또는 https 주소여야 합니다.",
+		"ftp://example.com|페이지 주소는 호스트가 있는 http 또는 https 주소여야 합니다.",
+		"javascript://example.com|페이지 주소는 호스트가 있는 http 또는 https 주소여야 합니다.",
+		"https://exa mple.com|페이지 주소의 형식이 올바르지 않습니다.",
+		"https://example.com/a b|페이지 주소의 형식이 올바르지 않습니다.",
+		"https://[::1/|페이지 주소의 형식이 올바르지 않습니다.",
+		"https://Example.com/docs|페이지 주소의 호스트는 소문자여야 합니다.",
+		"https://EXAMPLE.COM|페이지 주소의 호스트는 소문자여야 합니다.",
+		"http://[::A]/|페이지 주소의 호스트는 소문자여야 합니다.",
+		"https://example.com:443/docs|페이지 주소에서 기본 포트를 제거해야 합니다.",
+		"HTTPS://example.com:443/|페이지 주소에서 기본 포트를 제거해야 합니다.",
+		"http://example.com:80/docs|페이지 주소에서 기본 포트를 제거해야 합니다.",
+		"https://example.com:/docs|페이지 주소에서 기본 포트를 제거해야 합니다.",
+		"https://example.com/docs?ref=home|페이지 주소에서 Query와 Fragment를 제거해야 합니다.",
+		"https://example.com/docs#intro|페이지 주소에서 Query와 Fragment를 제거해야 합니다.",
+		"https://example.com/docs?|페이지 주소에서 Query와 Fragment를 제거해야 합니다.",
+		"https://example.com/docs#|페이지 주소에서 Query와 Fragment를 제거해야 합니다.",
+		"https://Example.com:443/docs/JWT?ref=home#intro|페이지 주소의 호스트는 소문자여야 합니다.",
+		"https://user@example.com/|페이지 주소에 인증정보를 포함할 수 없습니다.",
+		"https://user:pw@example.com/|페이지 주소에 인증정보를 포함할 수 없습니다.",
 	})
-	void 호스트가_없거나_잘못된_주소는_400이다(String url) throws Exception {
+	void 정규화되지_않았거나_잘못된_주소는_400이다(String url, String message) throws Exception {
 		String body = withField(visitJson(UUID.randomUUID().toString(), 1, "제목"), "normalizedUrl", "\"" + url + "\"");
 
 		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
 			.andExpect(status().isBadRequest())
 			.andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+			.andExpect(jsonPath("$.fieldErrors.length()").value(1))
 			.andExpect(jsonPath("$.fieldErrors[0].field").value("normalizedUrl"))
-			.andExpect(jsonPath("$.fieldErrors[0].message").value("페이지 주소는 호스트가 있는 http 또는 https 주소여야 합니다."));
+			.andExpect(jsonPath("$.fieldErrors[0].message").value(message));
 
 		assertThat(pageVisitRepository.count()).isZero();
 	}
