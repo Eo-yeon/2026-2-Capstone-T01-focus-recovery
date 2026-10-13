@@ -1,5 +1,7 @@
 package com.focusrecovery.domain.session.service;
 
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.UUID;
 
 import org.springframework.dao.DataIntegrityViolationException;
@@ -46,6 +48,15 @@ public class WorkSessionService {
 			throw new IdempotencyKeyMismatchException();
 		}
 		return WorkSessionResponse.from(existing);
+	}
+
+	// 세션 행을 배타 잠금으로 조회하므로 방문 저장·갱신(공유 잠금)과 동시 종료 요청이 모두 직렬화된다
+	@Transactional
+	public WorkSessionResponse end(UUID sessionId) {
+		WorkSession session = workSessionRepository.findForUpdateBySessionId(sessionId)
+			.orElseThrow(SessionNotFoundException::new);
+		session.end(Instant.now().truncatedTo(ChronoUnit.MILLIS));
+		return WorkSessionResponse.from(session);
 	}
 
 	@Transactional(readOnly = true)

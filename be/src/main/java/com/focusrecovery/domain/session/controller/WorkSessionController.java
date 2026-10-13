@@ -90,4 +90,28 @@ public class WorkSessionController {
 	) {
 		return workSessionService.get(Uuids.parse(sessionId, "세션 ID가 올바른 UUID 형식이 아닙니다."));
 	}
+
+	@Operation(
+		summary = "작업 세션 종료",
+		description = """
+			진행 중(ACTIVE)인 작업 세션을 종료(ENDED)하고 서버 현재 시각(UTC, 밀리초)을 endedAt으로 기록합니다. 요청 본문은 없습니다.
+
+			- 이미 종료된 세션에 다시 요청하면 변경 없이 200으로 기존 세션을 반환하며, 최초 endedAt이 유지됩니다(동시 요청 포함).
+			- goalText, startedAt과 저장된 방문 기록은 그대로 유지됩니다.
+			- 종료 후에는 새 방문 저장과 행동 정보 갱신이 409 SESSION_ENDED로 거절됩니다. 이미 저장된 같은 방문의 재전송(200), 세션 조회와 방문 목록 조회는 계속 가능합니다.
+			""")
+	@ApiResponse(responseCode = "200", description = "종료 성공 또는 이미 종료된 세션 (status=ENDED, endedAt 포함)")
+	@ApiResponse(responseCode = "400", description = "세션 ID가 UUID 형식(8-4-4-4-12)이 아님",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "INVALID_REQUEST", "message": "세션 ID가 올바른 UUID 형식이 아닙니다.", "fieldErrors": []}""")))
+	@ApiResponse(responseCode = "404", description = "세션이 존재하지 않음",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "SESSION_NOT_FOUND", "message": "작업 세션을 찾을 수 없습니다.", "fieldErrors": []}""")))
+	@PostMapping("/{sessionId}/end")
+	public WorkSessionResponse end(
+		@Parameter(description = "작업 세션 ID (UUID)", example = "1ba72f77-c166-4e06-88c7-1d6ed919cd9b")
+		@PathVariable String sessionId
+	) {
+		return workSessionService.end(Uuids.parse(sessionId, "세션 ID가 올바른 UUID 형식이 아닙니다."));
+	}
 }

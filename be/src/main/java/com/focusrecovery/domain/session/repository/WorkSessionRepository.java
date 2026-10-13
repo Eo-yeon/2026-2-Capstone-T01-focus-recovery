@@ -17,4 +17,8 @@ public interface WorkSessionRepository extends JpaRepository<WorkSession, UUID> 
 	// 공유 잠금: 방문 저장·갱신끼리는 동시에 진행되고, 세션 상태 변경(종료)과는 직렬화된다
 	@Lock(LockModeType.PESSIMISTIC_READ)
 	Optional<WorkSession> findForShareBySessionId(UUID sessionId);
+
+	// 배타 잠금: 처음부터 쓰기 잠금으로 조회해 공유 잠금→쓰기 잠금 전환(데드락 원인)을 피한다
+	@Lock(LockModeType.PESSIMISTIC_WRITE)
+	Optional<WorkSession> findForUpdateBySessionId(UUID sessionId);
 }
