@@ -1,8 +1,5 @@
 package com.focusrecovery.domain.session.controller;
 
-import java.util.UUID;
-import java.util.regex.Pattern;
-
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -17,6 +14,7 @@ import com.focusrecovery.domain.session.dto.CreateWorkSessionRequest;
 import com.focusrecovery.domain.session.dto.WorkSessionResponse;
 import com.focusrecovery.domain.session.service.WorkSessionService;
 import com.focusrecovery.global.exception.InvalidRequestException;
+import com.focusrecovery.global.util.Uuids;
 
 import com.focusrecovery.global.exception.ErrorResponse;
 
@@ -33,10 +31,6 @@ import jakarta.validation.Valid;
 @RestController
 @RequestMapping("/api/sessions")
 public class WorkSessionController {
-
-	// UUID.fromString은 "1-1-1-1-1" 같은 비표준 형식도 허용하므로 8-4-4-4-12 형식을 직접 검사한다
-	private static final Pattern UUID_PATTERN =
-		Pattern.compile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
 
 	private final WorkSessionService workSessionService;
 
@@ -94,9 +88,6 @@ public class WorkSessionController {
 		@Parameter(description = "작업 세션 ID (UUID)", example = "1ba72f77-c166-4e06-88c7-1d6ed919cd9b")
 		@PathVariable String sessionId
 	) {
-		if (!UUID_PATTERN.matcher(sessionId).matches()) {
-			throw new InvalidRequestException("세션 ID가 올바른 UUID 형식이 아닙니다.");
-		}
-		return workSessionService.get(UUID.fromString(sessionId));
+		return workSessionService.get(Uuids.parse(sessionId, "세션 ID가 올바른 UUID 형식이 아닙니다."));
 	}
 }

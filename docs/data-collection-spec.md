@@ -73,12 +73,14 @@ URL의 Query를 제거하면 서로 다른 문서가 같은 정규화 URL을 갖
 - 경로(Path)는 의미가 달라지지 않도록 유지한다.
 - **Query parameter와 Fragment(`#`)는 제거한다.**
 - 인증정보가 포함된 URL이나 민감한 인증 페이지는 수집하지 않는다.
+- 도메인(`domain`)은 정규화 URL의 **전체 호스트명**(서브도메인 포함, 포트 제외)이며, 브라우저 `URL.hostname` 값과 같다. 대표 도메인(예: `spring.io`)으로 줄이지 않는다.
 
 예를 들어 다음 주소는 같은 형태로 저장한다.
 
 ```text
 원본:   https://Example.com:443/docs/JWT?ref=home#intro
 저장:   https://example.com/docs/JWT
+도메인: example.com
 ```
 
 검색어는 URL에서 Query를 제거하기 **전에** 추출한다. 초기 대상은 Google 검색의 `q`, Naver 통합 검색의 `query` 파라미터다. 실제 지원 URL과 검색 결과 추출 규칙은 샘플 페이지로 검증하며, 원본 Query 전체는 저장하지 않는다.
