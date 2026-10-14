@@ -53,6 +53,15 @@ public class WorkSession {
 		return session;
 	}
 
+	// 이미 종료된 세션은 최초 종료 시각을 유지한다
+	public void end(Instant endedAt) {
+		if (status == WorkSessionStatus.ENDED) {
+			return;
+		}
+		this.status = WorkSessionStatus.ENDED;
+		this.endedAt = endedAt;
+	}
+
 	public UUID getSessionId() {
 		return sessionId;
 	}

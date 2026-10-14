@@ -31,7 +31,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.http.MediaType;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
@@ -59,9 +58,6 @@ class PageVisitApiTest {
 
 	@Autowired
 	private PageVisitRepository pageVisitRepository;
-
-	@Autowired
-	private JdbcTemplate jdbcTemplate;
 
 	private UUID sessionId;
 
@@ -721,8 +717,8 @@ class PageVisitApiTest {
 		return workSessionRepository.save(WorkSession.start("방문 기록 테스트", null)).getSessionId();
 	}
 
-	private void endSession(UUID id) {
-		jdbcTemplate.update("UPDATE work_session SET status = 'ENDED' WHERE session_id = ?", id.toString());
+	private void endSession(UUID id) throws Exception {
+		mockMvc.perform(post("/api/sessions/{sessionId}/end", id)).andExpect(status().isOk());
 	}
 
 	private static String visitsUrl(UUID id) {

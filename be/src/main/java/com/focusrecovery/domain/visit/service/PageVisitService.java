@@ -2,15 +2,18 @@ package com.focusrecovery.domain.visit.service;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import com.focusrecovery.domain.session.dto.EndWorkSessionRequest;
 import com.focusrecovery.domain.session.entity.WorkSession;
 import com.focusrecovery.domain.session.entity.WorkSessionStatus;
 import com.focusrecovery.domain.session.exception.SessionNotFoundException;
@@ -91,23 +94,36 @@ public class PageVisitService {
 			throw sessionEnded();
 		}
 
-		long version = request.behaviorVersion();
-		long duration = request.activeDurationMs();
-		int tabSwitches = request.tabSwitchCount();
+		boolean applied = applyBehavior(visit, request.activeDurationMs(), request.tabSwitchCount(),
+			request.behaviorVersion(), Instant.now().truncatedTo(ChronoUnit.MILLIS));
+		return VisitBehaviorResponse.of(visit, applied);
+	}
+
+	// 세션 종료 트랜잭션 안에서만 호출한다: 하나라도 실패하면 예외로 행동 정보와 종료가 함께 롤백된다
+	@Transactional(propagation = Propagation.MANDATORY)
+	public void applyFinalBehaviors(UUID sessionId, List<EndWorkSessionRequest.FinalBehavior> behaviors, Instant now) {
+		for (EndWorkSessionRequest.FinalBehavior behavior : behaviors) {
+			PageVisit visit = pageVisitRepository.findForUpdateByVisitIdAndSessionId(UUID.fromString(behavior.visitId()), sessionId)
+				.orElseThrow(VisitNotFoundException::new);
+			applyBehavior(visit, behavior.activeDurationMs(), behavior.tabSwitchCount(), behavior.behaviorVersion(), now);
+		}
+	}
+
+	private boolean applyBehavior(PageVisit visit, long duration, int tabSwitches, long version, Instant now) {
 		if (version < visit.getBehaviorVersion()) {
-			return VisitBehaviorResponse.of(visit, false);
+			return false;
 		}
 		if (version == visit.getBehaviorVersion()) {
 			if (duration == visit.getActiveDurationMs() && tabSwitches == visit.getTabSwitchCount()) {
-				return VisitBehaviorResponse.of(visit, false);
+				return false;
 			}
 			throw new ConflictException("BEHAVIOR_VERSION_CONFLICT", "같은 행동 갱신 버전에 다른 값이 전달되었습니다.");
 		}
 		if (duration < visit.getActiveDurationMs() || tabSwitches < visit.getTabSwitchCount()) {
 			throw new ConflictException("BEHAVIOR_COUNTER_DECREASED", "더 높은 버전에서 누적값이 감소했습니다.");
 		}
-		visit.updateBehavior(duration, tabSwitches, version, Instant.now().truncatedTo(ChronoUnit.MILLIS));
-		return VisitBehaviorResponse.of(visit, true);
+		visit.updateBehavior(duration, tabSwitches, version, now);
+		return true;
 	}
 
 	@Transactional(readOnly = true)

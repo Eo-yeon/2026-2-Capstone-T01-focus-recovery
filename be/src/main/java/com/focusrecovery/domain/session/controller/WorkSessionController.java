@@ -11,6 +11,7 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.focusrecovery.domain.session.dto.CreateWorkSessionRequest;
+import com.focusrecovery.domain.session.dto.EndWorkSessionRequest;
 import com.focusrecovery.domain.session.dto.WorkSessionResponse;
 import com.focusrecovery.domain.session.service.WorkSessionService;
 import com.focusrecovery.global.exception.InvalidRequestException;
@@ -89,5 +90,45 @@ public class WorkSessionController {
 		@PathVariable String sessionId
 	) {
 		return workSessionService.get(Uuids.parse(sessionId, "세션 ID가 올바른 UUID 형식이 아닙니다."));
+	}
+
+	@Operation(
+		summary = "작업 세션 종료",
+		description = """
+			진행 중(ACTIVE)인 작업 세션을 종료(ENDED)하고 서버 현재 시각(UTC, 밀리초)을 endedAt으로 기록합니다.
+
+			**finalBehaviors (선택)**
+			- 종료 직전 방문별 마지막 행동 정보입니다. 본문 생략, `{}`, finalBehaviors 생략·null·빈 배열이면 종료만 처리합니다.
+			- 각 방문은 이 세션에 속해야 하며(아니면 404 VISIT_NOT_FOUND), 방문 행동 정보 갱신(PATCH)과 같은 버전·누적값 규칙으로 반영됩니다.
+			  낮은 버전과 같은 버전·같은 값은 무시되고, 같은 버전·다른 값과 높은 버전의 누적값 감소는 409입니다.
+			- 행동 정보 반영과 종료는 하나의 트랜잭션입니다. 하나라도 실패하면 행동 정보와 종료 모두 반영되지 않고 세션은 ACTIVE로 남습니다.
+
+			- 이미 종료된 세션에 다시 요청하면 finalBehaviors를 반영하지 않고 200으로 기존 세션을 반환하며, 최초 endedAt이 유지됩니다(동시 요청 포함).
+			- goalText, startedAt과 저장된 방문 기록은 그대로 유지됩니다.
+			- 종료 후에는 새 방문 저장과 행동 정보 갱신이 409 SESSION_ENDED로 거절됩니다. 이미 저장된 같은 방문의 재전송(200), 세션 조회와 방문 목록 조회는 계속 가능합니다.
+			""")
+	@ApiResponse(responseCode = "200", description = "종료 성공 또는 이미 종료된 세션 (status=ENDED, endedAt 포함)")
+	@ApiResponse(responseCode = "400", description = "세션 ID가 UUID 형식이 아님, finalBehaviors 항목의 필수값 누락·음수·잘못된 방문 ID",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "INVALID_REQUEST", "message": "세션 ID가 올바른 UUID 형식이 아닙니다.", "fieldErrors": []}""")))
+	@ApiResponse(responseCode = "404", description = "SESSION_NOT_FOUND: 세션 없음 / VISIT_NOT_FOUND: finalBehaviors의 방문이 이 세션에 없음",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = {
+			@ExampleObject(name = "SESSION_NOT_FOUND", value = """
+				{"code": "SESSION_NOT_FOUND", "message": "작업 세션을 찾을 수 없습니다.", "fieldErrors": []}"""),
+			@ExampleObject(name = "VISIT_NOT_FOUND", value = """
+				{"code": "VISIT_NOT_FOUND", "message": "해당 세션에서 방문 기록을 찾을 수 없습니다.", "fieldErrors": []}""")
+		}))
+	@ApiResponse(responseCode = "409", description = "BEHAVIOR_VERSION_CONFLICT: 같은 버전에 다른 값 / "
+		+ "BEHAVIOR_COUNTER_DECREASED: 높은 버전에서 누적값 감소 (세션은 종료되지 않음)",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "BEHAVIOR_COUNTER_DECREASED", "message": "더 높은 버전에서 누적값이 감소했습니다.", "fieldErrors": []}""")))
+	@PostMapping("/{sessionId}/end")
+	public WorkSessionResponse end(
+		@Parameter(description = "작업 세션 ID (UUID)", example = "1ba72f77-c166-4e06-88c7-1d6ed919cd9b")
+		@PathVariable String sessionId,
+		@Valid @RequestBody(required = false) EndWorkSessionRequest request
+	) {
+		return workSessionService.end(Uuids.parse(sessionId, "세션 ID가 올바른 UUID 형식이 아닙니다."),
+			request == null ? null : request.finalBehaviors());
 	}
 }
