@@ -164,6 +164,134 @@ class WorkSessionEndApiTest {
 	}
 
 	@ParameterizedTest
+	@ValueSource(strings = {"", "{}", "{\"finalBehaviors\": null}", "{\"finalBehaviors\": []}"})
+	void 최종_행동정보가_없으면_종료만_처리한다(String body) throws Exception {
+		UUID sessionId = newSession();
+		String visitId = UUID.randomUUID().toString();
+		saveVisit(sessionId.toString(), visitId, 1).andExpect(status().isCreated());
+
+		mockMvc.perform(post("/api/sessions/{sessionId}/end", sessionId)
+				.contentType(MediaType.APPLICATION_JSON)
+				.content(body))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.status").value("ENDED"));
+
+		PageVisit visit = pageVisitRepository.findById(UUID.fromString(visitId)).orElseThrow();
+		assertThat(visit.getBehaviorVersion()).isZero();
+		assertThat(visit.getUpdatedAt()).isNull();
+	}
+
+	@Test
+	void 최종_행동정보를_PATCH와_같은_규칙으로_반영하고_종료한다() throws Exception {
+		UUID sessionId = newSession();
+		String newer = UUID.randomUUID().toString();
+		String older = UUID.randomUUID().toString();
+		String same = UUID.randomUUID().toString();
+		saveVisit(sessionId.toString(), newer, 1).andExpect(status().isCreated());
+		saveVisit(sessionId.toString(), older, 2).andExpect(status().isCreated());
+		saveVisit(sessionId.toString(), same, 3).andExpect(status().isCreated());
+		patchBehavior(sessionId, newer, 2000, 1, 1).andExpect(jsonPath("$.applied").value(true));
+		patchBehavior(sessionId, older, 5000, 3, 5).andExpect(jsonPath("$.applied").value(true));
+		patchBehavior(sessionId, same, 3000, 2, 2).andExpect(jsonPath("$.applied").value(true));
+
+		Instant endedAt = Instant.parse(endedAt(endSession(sessionId, behavior(newer, 9000, 4, 2),
+			behavior(older, 1000, 0, 4), behavior(same, 3000, 2, 2))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.status").value("ENDED"))));
+
+		PageVisit applied = pageVisitRepository.findById(UUID.fromString(newer)).orElseThrow();
+		assertThat(applied.getActiveDurationMs()).isEqualTo(9000);
+		assertThat(applied.getTabSwitchCount()).isEqualTo(4);
+		assertThat(applied.getBehaviorVersion()).isEqualTo(2);
+		assertThat(applied.getUpdatedAt()).isEqualTo(endedAt);
+		PageVisit ignored = pageVisitRepository.findById(UUID.fromString(older)).orElseThrow();
+		assertThat(ignored.getActiveDurationMs()).isEqualTo(5000);
+		assertThat(ignored.getBehaviorVersion()).isEqualTo(5);
+		assertThat(pageVisitRepository.findById(UUID.fromString(same)).orElseThrow().getBehaviorVersion()).isEqualTo(2);
+	}
+
+	@Test
+	void 최종_행동정보_하나라도_실패하면_행동정보와_종료_모두_반영하지_않는다() throws Exception {
+		UUID sessionId = newSession();
+		UUID otherSessionId = newSession();
+		String visitId = UUID.randomUUID().toString();
+		String decreasing = UUID.randomUUID().toString();
+		String otherVisitId = UUID.randomUUID().toString();
+		saveVisit(sessionId.toString(), visitId, 1).andExpect(status().isCreated());
+		saveVisit(sessionId.toString(), decreasing, 2).andExpect(status().isCreated());
+		saveVisit(otherSessionId.toString(), otherVisitId, 1).andExpect(status().isCreated());
+		patchBehavior(sessionId, decreasing, 5000, 3, 1).andExpect(jsonPath("$.applied").value(true));
+		patchBehavior(sessionId, visitId, 2000, 1, 1).andExpect(jsonPath("$.applied").value(true));
+
+		endSession(sessionId, behavior(visitId, 9000, 4, 2), behavior(decreasing, 4000, 3, 2))
+			.andExpect(status().isConflict())
+			.andExpect(jsonPath("$.code").value("BEHAVIOR_COUNTER_DECREASED"));
+		endSession(sessionId, behavior(visitId, 9000, 4, 2), behavior(decreasing, 6000, 3, 1))
+			.andExpect(status().isConflict())
+			.andExpect(jsonPath("$.code").value("BEHAVIOR_VERSION_CONFLICT"));
+		endSession(sessionId, behavior(visitId, 9000, 4, 2), behavior(otherVisitId, 9000, 4, 2))
+			.andExpect(status().isNotFound())
+			.andExpect(jsonPath("$.code").value("VISIT_NOT_FOUND"));
+		endSession(sessionId, behavior(visitId, 9000, 4, 2), behavior(UUID.randomUUID().toString(), 9000, 4, 2))
+			.andExpect(status().isNotFound())
+			.andExpect(jsonPath("$.code").value("VISIT_NOT_FOUND"));
+
+		WorkSession session = workSessionRepository.findById(sessionId).orElseThrow();
+		assertThat(session.getStatus()).isEqualTo(WorkSessionStatus.ACTIVE);
+		assertThat(session.getEndedAt()).isNull();
+		PageVisit visit = pageVisitRepository.findById(UUID.fromString(visitId)).orElseThrow();
+		assertThat(visit.getActiveDurationMs()).isEqualTo(2000);
+		assertThat(visit.getBehaviorVersion()).isEqualTo(1);
+		assertThat(pageVisitRepository.findById(UUID.fromString(otherVisitId)).orElseThrow().getBehaviorVersion()).isZero();
+
+		endSession(sessionId, behavior(visitId, 9000, 4, 2)).andExpect(status().isOk());
+		assertThat(pageVisitRepository.findById(UUID.fromString(visitId)).orElseThrow().getBehaviorVersion()).isEqualTo(2);
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {
+		"{\"finalBehaviors\": [null]}",
+		"{\"finalBehaviors\": [{\"visitId\": \"not-a-uuid\", \"activeDurationMs\": 1, \"tabSwitchCount\": 0, \"behaviorVersion\": 1}]}",
+		"{\"finalBehaviors\": [{\"visitId\": \"%s\", \"activeDurationMs\": -1, \"tabSwitchCount\": 0, \"behaviorVersion\": 1}]}",
+		"{\"finalBehaviors\": [{\"visitId\": \"%s\", \"tabSwitchCount\": 0, \"behaviorVersion\": 1}]}",
+		"{\"finalBehaviors\": [{\"activeDurationMs\": 1, \"tabSwitchCount\": 0, \"behaviorVersion\": 1}]}"
+	})
+	void 최종_행동정보_형식이_잘못되면_400이고_종료하지_않는다(String body) throws Exception {
+		UUID sessionId = newSession();
+		String visitId = UUID.randomUUID().toString();
+		saveVisit(sessionId.toString(), visitId, 1).andExpect(status().isCreated());
+
+		mockMvc.perform(post("/api/sessions/{sessionId}/end", sessionId)
+				.contentType(MediaType.APPLICATION_JSON)
+				.content(body.formatted(visitId)))
+			.andExpect(status().isBadRequest())
+			.andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+			.andExpect(jsonPath("$.fieldErrors[0].field").value(matchesPattern("finalBehaviors\\[0\\].*")));
+
+		assertThat(workSessionRepository.findById(sessionId).orElseThrow().getStatus()).isEqualTo(WorkSessionStatus.ACTIVE);
+	}
+
+	@Test
+	void 이미_종료된_세션은_최종_행동정보를_반영하지_않고_최초_종료결과를_반환한다() throws Exception {
+		UUID sessionId = newSession();
+		String visitId = UUID.randomUUID().toString();
+		saveVisit(sessionId.toString(), visitId, 1).andExpect(status().isCreated());
+		Instant firstEndedAt = Instant.parse(endedAt(endSession(sessionId, behavior(visitId, 2000, 1, 1))));
+		Thread.sleep(5);
+
+		Instant secondEndedAt = Instant.parse(endedAt(endSession(sessionId, behavior(visitId, 9000, 4, 2))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.status").value("ENDED"))));
+		endSession(sessionId, behavior(visitId, 0, 0, 1)).andExpect(status().isOk());
+
+		assertThat(secondEndedAt).isEqualTo(firstEndedAt);
+		assertThat(workSessionRepository.findById(sessionId).orElseThrow().getEndedAt()).isEqualTo(firstEndedAt);
+		PageVisit visit = pageVisitRepository.findById(UUID.fromString(visitId)).orElseThrow();
+		assertThat(visit.getActiveDurationMs()).isEqualTo(2000);
+		assertThat(visit.getBehaviorVersion()).isEqualTo(1);
+	}
+
+	@ParameterizedTest
 	@ValueSource(strings = {"not-a-uuid", "1-1-1-1-1", "123e4567e89b12d3a456426614174000"})
 	void 잘못된_UUID는_400이다(String sessionId) throws Exception {
 		mockMvc.perform(post("/api/sessions/{sessionId}/end", sessionId))
@@ -315,6 +443,17 @@ class WorkSessionEndApiTest {
 
 	private ResultActions endSession(UUID sessionId) throws Exception {
 		return mockMvc.perform(post("/api/sessions/{sessionId}/end", sessionId));
+	}
+
+	private ResultActions endSession(UUID sessionId, String... finalBehaviors) throws Exception {
+		return mockMvc.perform(post("/api/sessions/{sessionId}/end", sessionId)
+			.contentType(MediaType.APPLICATION_JSON)
+			.content("{\"finalBehaviors\": [" + String.join(",", finalBehaviors) + "]}"));
+	}
+
+	private static String behavior(String visitId, long activeDurationMs, int tabSwitchCount, long behaviorVersion) {
+		return "{\"visitId\": \"%s\", \"activeDurationMs\": %d, \"tabSwitchCount\": %d, \"behaviorVersion\": %d}"
+			.formatted(visitId, activeDurationMs, tabSwitchCount, behaviorVersion);
 	}
 
 	private static String endedAt(ResultActions result) throws Exception {

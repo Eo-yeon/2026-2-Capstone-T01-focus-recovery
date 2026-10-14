@@ -2,25 +2,31 @@ package com.focusrecovery.domain.session.service;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.UUID;
 
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.focusrecovery.domain.session.dto.EndWorkSessionRequest;
 import com.focusrecovery.domain.session.dto.WorkSessionResponse;
 import com.focusrecovery.domain.session.entity.WorkSession;
+import com.focusrecovery.domain.session.entity.WorkSessionStatus;
 import com.focusrecovery.domain.session.exception.IdempotencyKeyMismatchException;
 import com.focusrecovery.domain.session.exception.SessionNotFoundException;
 import com.focusrecovery.domain.session.repository.WorkSessionRepository;
+import com.focusrecovery.domain.visit.service.PageVisitService;
 
 @Service
 public class WorkSessionService {
 
 	private final WorkSessionRepository workSessionRepository;
+	private final PageVisitService pageVisitService;
 
-	public WorkSessionService(WorkSessionRepository workSessionRepository) {
+	public WorkSessionService(WorkSessionRepository workSessionRepository, PageVisitService pageVisitService) {
 		this.workSessionRepository = workSessionRepository;
+		this.pageVisitService = pageVisitService;
 	}
 
 	// 트랜잭션을 걸지 않는다: 동시 요청으로 유니크 제약이 위반되면 저장 트랜잭션이 끝난 뒤 다시 조회해야 한다
@@ -51,11 +57,19 @@ public class WorkSessionService {
 	}
 
 	// 세션 행을 배타 잠금으로 조회하므로 방문 저장·갱신(공유 잠금)과 동시 종료 요청이 모두 직렬화된다
+	// 이미 종료된 세션은 재시도로 보고 finalBehaviors를 반영하지 않은 채 기존 결과를 돌려준다
 	@Transactional
-	public WorkSessionResponse end(UUID sessionId) {
+	public WorkSessionResponse end(UUID sessionId, List<EndWorkSessionRequest.FinalBehavior> finalBehaviors) {
 		WorkSession session = workSessionRepository.findForUpdateBySessionId(sessionId)
 			.orElseThrow(SessionNotFoundException::new);
-		session.end(Instant.now().truncatedTo(ChronoUnit.MILLIS));
+		if (session.getStatus() == WorkSessionStatus.ENDED) {
+			return WorkSessionResponse.from(session);
+		}
+		Instant now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+		if (finalBehaviors != null) {
+			pageVisitService.applyFinalBehaviors(sessionId, finalBehaviors, now);
+		}
+		session.end(now);
 		return WorkSessionResponse.from(session);
 	}
 
