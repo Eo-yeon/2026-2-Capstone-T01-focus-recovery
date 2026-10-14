@@ -38,6 +38,7 @@ import com.focusrecovery.domain.session.entity.WorkSessionStatus;
 import com.focusrecovery.domain.session.repository.WorkSessionRepository;
 import com.focusrecovery.domain.visit.entity.PageVisit;
 import com.focusrecovery.domain.visit.repository.PageVisitRepository;
+import com.focusrecovery.domain.window.repository.AnalysisWindowRepository;
 import com.jayway.jsonpath.JsonPath;
 
 @SpringBootTest
@@ -56,8 +57,12 @@ class WorkSessionEndApiTest {
 	@Autowired
 	private PageVisitRepository pageVisitRepository;
 
+	@Autowired
+	private AnalysisWindowRepository analysisWindowRepository;
+
 	@BeforeEach
 	void setUp() {
+		analysisWindowRepository.deleteAll();
 		pageVisitRepository.deleteAll();
 		workSessionRepository.deleteAll();
 	}
@@ -65,6 +70,7 @@ class WorkSessionEndApiTest {
 	// 다른 테스트 클래스가 세션을 지울 때 외래키에 걸리지 않도록 방문 기록을 남기지 않는다
 	@AfterEach
 	void tearDown() {
+		analysisWindowRepository.deleteAll();
 		pageVisitRepository.deleteAll();
 	}
 
