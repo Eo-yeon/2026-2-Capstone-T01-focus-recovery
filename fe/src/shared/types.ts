@@ -15,7 +15,7 @@ export interface PageVisit {
   content: string;
   visitedAt: string;
   isSearchResultPage: boolean;
-  searchQuery: null; // FE-007 owns extraction; search pages cannot become valid yet.
+  searchQuery: string | null;
   activeDurationMs: number;
   tabSwitchCount: null; // Unmeasured, never fabricate zero.
   behaviorVersion: null; // FE-005/006 will define snapshot updates.
@@ -28,6 +28,8 @@ export interface PageSnapshot {
   title: string;
   content: string;
   isSearchResultPage: boolean;
+  searchQuery?: string | null; // Absent on older ordinary HTML messages.
+  organicResultCount?: number; // Internal extraction evidence; omitted from PageVisit.
 }
 export interface VisitCandidate {
   visitId: string;

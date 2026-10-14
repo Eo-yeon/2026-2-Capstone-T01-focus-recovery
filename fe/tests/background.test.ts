@@ -287,3 +287,45 @@ describe('background Chrome adapter', () => {
     expect((await message({ type: 'status' })).status?.candidates).toHaveLength(1);
   });
 });
+
+describe('background search verification', () => {
+  async function openSearch() {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(10000);
+    frame.url = 'https://www.google.com/search?q=JWT&extra=OMITTED#OMITTED';
+    const start = await message({ type: 'start', goalText: '공개 검색 조사하기' });
+    const sessionId = start.status!.session!.sessionId;
+    await message({ type: 'context' }, pageSender);
+    const snapshot = { ...await describeUrl(frame.url), title: '검색', content: '검색어: JWT\n\n검색 결과 1\n제목: 인증', organicResultCount: 1 };
+    clock.mockReturnValue(11000);
+    return { sessionId, snapshot };
+  }
+  it('matches the query to the browser-owned URL and stores only bounded search data', async () => {
+    const { sessionId, snapshot } = await openSearch();
+    expect((await message({ type: 'snapshot', sessionId, snapshot }, pageSender)).ok).toBe(true);
+    const status = (await message({ type: 'status' })).status!;
+    expect(status.visits[0]).toMatchObject({ searchQuery: 'JWT', isSearchResultPage: true, normalizedUrl: 'https://www.google.com/search' });
+    expect(JSON.stringify(memory)).not.toContain('OMITTED');
+    expect(JSON.stringify(status)).not.toContain('organicResultCount');
+  });
+  it.each([{ searchQuery: '위조 검색어' }, { rawUrl: 'PRIVATE_URL' }, { isSearchResultPage: false, searchQuery: null, organicResultCount: undefined }, { organicResultCount: 0 }])('rejects mismatched or unchecked fields: %s', async fields => {
+    const { sessionId, snapshot } = await openSearch();
+    expect((await message({ type: 'snapshot', sessionId, snapshot: { ...snapshot, ...fields } }, pageSender)).ok).toBe(false);
+    expect(memory.collection.candidates[0].snapshot).toBeUndefined();
+  });
+  it('rejects a syntactically valid query that differs from the live browser URL', async () => {
+    const { sessionId, snapshot } = await openSearch();
+    expect((await message({ type: 'snapshot', sessionId, snapshot: { ...snapshot, searchQuery: '위조' } }, pageSender)).ok).toBe(false);
+    expect(memory.collection.candidates[0].snapshot).toBeUndefined();
+  });
+  it('does not store unauthorized search data even after script injection', async () => {
+    const { sessionId, snapshot } = await openSearch(); api.permissions.contains.mockResolvedValue(false);
+    expect(await message({ type: 'snapshot', sessionId, snapshot }, pageSender)).toMatchObject({ sessionId: null });
+    expect(memory.collection.candidates[0].snapshot).toBeUndefined();
+  });
+  it('rehydrates valid search fields through actual adapter initialization', async () => {
+    const { sessionId, snapshot } = await openSearch(); await message({ type: 'snapshot', sessionId, snapshot }, pageSender);
+    const original = (await message({ type: 'status' })).status!.visits[0];
+    vi.resetModules(); api.runtime.onMessage.listeners.length = 0; await import('../src/background/index');
+    expect((await message({ type: 'status' })).status!.visits[0]).toEqual(original);
+  });
+});

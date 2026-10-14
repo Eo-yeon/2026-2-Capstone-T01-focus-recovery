@@ -1,5 +1,6 @@
 import type { CollectionState, DevStatus, ExclusionReason, PageSnapshot, PageVisit, VisitCandidate } from '../shared/types';
-import { isMajorContentChange } from '../shared/content-change';
+import { isMajorContentChange, isSearchContentChange } from '../shared/content-change';
+import { validSearchQuery } from '../shared/url';
 import { resumeActiveTime, settleActiveTime } from './active-time';
 export const MAX_CANDIDATES = 200;
 export function emptyState(): CollectionState {
@@ -18,9 +19,12 @@ export class Collector {
   current(tabId: number): VisitCandidate | undefined {
     return this.state.candidates.find(candidate => candidate.visitId === this.state.tabs[tabId]?.candidateId);
   }
+  private hasContent(snapshot: PageSnapshot): boolean {
+    return snapshot.isSearchResultPage ? validSearchQuery(snapshot.searchQuery) && Number.isSafeInteger(snapshot.organicResultCount) && (snapshot.organicResultCount ?? 0) > 0 && snapshot.content.trim().length > 0 : [...snapshot.content].length >= 50;
+  }
   private validate(candidate: VisitCandidate): void {
     if (candidate.state === 'excluded') return;
-    if (candidate.snapshot && [...candidate.snapshot.content].length >= 50 && candidate.activeDurationMs >= 1000) {
+    if (candidate.snapshot && this.hasContent(candidate.snapshot) && candidate.activeDurationMs >= 1000) {
       candidate.state = 'valid';
       delete candidate.reason;
     }
@@ -36,7 +40,7 @@ export class Collector {
     if (!candidate) return;
     settleActiveTime(candidate, now);
     this.validate(candidate);
-    if (final && candidate.state === 'pending') this.exclude(candidate, candidate.snapshot ? ([...candidate.snapshot.content].length < 50 ? 'short-content' : 'short-duration') : 'unavailable-content');
+    if (final && candidate.state === 'pending') this.exclude(candidate, candidate.snapshot ? (!this.hasContent(candidate.snapshot) ? 'short-content' : 'short-duration') : 'unavailable-content');
   }
   foreground(tabId: number | null, now: number): void {
     const old = this.state.foregroundTabId;
@@ -82,19 +86,28 @@ export class Collector {
     const tab = this.state.tabs[tabId];
     if (!tab || tab.documentId !== documentId || tab.navigationFailed) return;
     let candidate = this.current(tabId)!;
-    if (reason === 'dom-policy' || reason === 'url-policy' || reason === 'search-pending' || snapshot?.isSearchResultPage) {
-      this.exclude(candidate, reason ?? 'search-pending');
+    if (reason === 'dom-policy' || reason === 'url-policy' || reason === 'search-pending' || (snapshot?.isSearchResultPage && !this.hasContent(snapshot))) {
+      if (candidate.state !== 'valid' || reason === 'dom-policy' || reason === 'url-policy') this.exclude(candidate, reason ?? 'search-pending');
       return;
     }
-    if (candidate.state === 'excluded') return;
-    if (snapshot && candidate.snapshot && tab.identity !== snapshot.identity && isMajorContentChange(candidate.snapshot.content, snapshot.content)) {
+    if (reason === 'unavailable-content') {
+      if (candidate.state === 'pending') this.exclude(candidate, reason);
+      return;
+    }
+    // Bounded search retries can recover on a later DOM/history event.
+    if (candidate.state === 'excluded') {
+      if (candidate.reason !== 'unavailable-content' || !snapshot?.isSearchResultPage || !this.hasContent(snapshot)) return;
+      candidate.state = 'pending';
+      delete candidate.reason;
+    }
+    if (snapshot && candidate.snapshot && tab.identity !== snapshot.identity && (snapshot.isSearchResultPage && candidate.snapshot.isSearchResultPage ? isSearchContentChange(candidate.snapshot.content, snapshot.content) : isMajorContentChange(candidate.snapshot.content, snapshot.content))) {
       this.navigate(tabId, documentId, snapshot.identity, 'spa', now);
       if (this.state.capacityReached) return;
       candidate = this.current(tabId)!;
     }
     // URL-only changes keep the original identity/content baseline until content changes too.
     if (snapshot) this.state.tabs[tabId].currentIdentity = snapshot.identity;
-    if (snapshot && (!candidate.snapshot || ([...candidate.snapshot.content].length < 50 && tab.identity === snapshot.identity))) {
+    if (snapshot && (!candidate.snapshot || (!this.hasContent(candidate.snapshot) && tab.identity === snapshot.identity))) {
       candidate.snapshot = snapshot;
       tab.identity = snapshot.identity;
     }
@@ -129,8 +142,8 @@ export class Collector {
   status(now: number): DevStatus {
     if (this.state.session && this.state.foregroundTabId !== null) this.foreground(this.state.foregroundTabId, now);
     const visits: PageVisit[] = this.state.candidates.filter(candidate => candidate.state === 'valid' && candidate.snapshot).map(candidate => {
-      const { identity: _, ...snapshot } = candidate.snapshot!;
-      return { ...snapshot, visitId: candidate.visitId, sessionId: candidate.sessionId, sequence: candidate.sequence, browserTabKey: candidate.browserTabKey, visitedAt: candidate.visitedAt, searchQuery: null, activeDurationMs: candidate.activeDurationMs, tabSwitchCount: null, behaviorVersion: null };
+      const { identity: _, organicResultCount: __, ...snapshot } = candidate.snapshot!;
+      return { ...snapshot, visitId: candidate.visitId, sessionId: candidate.sessionId, sequence: candidate.sequence, browserTabKey: candidate.browserTabKey, visitedAt: candidate.visitedAt, searchQuery: snapshot.searchQuery ?? null, activeDurationMs: candidate.activeDurationMs, tabSwitchCount: null, behaviorVersion: null };
     });
     return { session: this.state.session, capacityReached: this.state.capacityReached, visits, candidates: this.state.candidates.map(({ snapshot: _, activeSince: __, ...candidate }) => candidate) };
   }

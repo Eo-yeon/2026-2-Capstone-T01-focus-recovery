@@ -7,11 +7,23 @@ export function isVisible(element: Element): boolean {
   }
   return true;
 }
-export function isExcludedDocument(doc: Document): boolean {
+function isSearchForm(form: Element, searchUrl: URL): boolean {
+  if (form.tagName !== 'FORM') return false;
+  let action: URL;
+  try { action = new URL(form.getAttribute('action') || searchUrl.href, searchUrl); }
+  catch { return false; }
+  if (action.origin !== searchUrl.origin || action.pathname !== searchUrl.pathname) return false;
+  const inputs = [...form.querySelectorAll('input')];
+  if (form.querySelector('textarea,select,[contenteditable],[role="textbox"]')) return false;
+  if (inputs.length && inputs.every(input => input.type === 'hidden')) return true;
+  const parameter = searchUrl.hostname.endsWith('naver.com') ? 'query' : 'q';
+  return (form.getAttribute('role') === 'search' || form.id === 'nx_search_form') && inputs.some(input => input.name === parameter && ['text', 'search'].includes(input.type)) && inputs.every(input => input.type === 'hidden' || ['submit', 'button'].includes(input.type) || (input.name === parameter && ['text', 'search'].includes(input.type)));
+}
+export function isExcludedDocument(doc: Document, searchUrl?: URL): boolean {
   if (doc.contentType !== 'text/html') return true;
   // Even hidden auth inputs indicate an unsafe document. Never inspect their values.
   if (doc.querySelector(PRIVATE_INPUT)) return true;
-  if ([...doc.querySelectorAll('form,[contenteditable="true"],[role="textbox"]')].some(isVisible)) return true;
+  if ([...doc.querySelectorAll('form,[contenteditable="true"],[role="textbox"]')].some(element => isVisible(element) && !(searchUrl && isSearchForm(element, searchUrl)))) return true;
   const errorHeading = /^(?:error|404|403|500|access denied|page not found|not found|오류|접근 거부|페이지를 찾을 수)/i;
   if (errorHeading.test(doc.title.trim()) || [...doc.querySelectorAll('h1')].some(heading => isVisible(heading) && errorHeading.test(heading.textContent?.trim() ?? ''))) return true;
   return false;
@@ -19,7 +31,7 @@ export function isExcludedDocument(doc: Document): boolean {
 export function cleanText(text: string): string {
   return text.replace(/\r\n?/g, '\n').split('\n').map(line => line.replace(/[\t\u00a0 ]+/g, ' ').trim()).filter(Boolean).join('\n').trim();
 }
-function textFrom(element: Element): string {
+export function textFrom(element: Element): string {
   if (element.matches(OMIT) || !isVisible(element)) return '';
   const pieces: string[] = [];
   for (const node of element.childNodes) {

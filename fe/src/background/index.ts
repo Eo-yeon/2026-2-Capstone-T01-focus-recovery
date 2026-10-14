@@ -132,7 +132,7 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
     } else {
       const expected = await describeUrl(frame.url);
       const snapshot = message.snapshot;
-      if (snapshot && (!expected || Object.keys(expected).some(key => expected[key as keyof typeof expected] !== snapshot[key as keyof typeof expected]))) return { ok: false };
+      if (snapshot && (!expected || Object.keys(expected).some(key => key === 'searchQuery' ? expected.searchQuery !== (snapshot.searchQuery ?? null) : expected[key as keyof typeof expected] !== snapshot[key as keyof typeof expected]))) return { ok: false };
       collector.observe(tabId, sender.documentId, message.sessionId, snapshot, message.reason, Date.now());
     }
     return { ok: true, sessionId: collector.state.session?.sessionId ?? null };

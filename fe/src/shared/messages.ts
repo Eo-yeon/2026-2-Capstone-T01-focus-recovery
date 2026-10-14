@@ -1,4 +1,5 @@
 import type { ContentMessage, PopupMessage } from './types';
+import { inspectUrl, normalizeUrl, validSearchQuery } from './url';
 const reasons = new Set(['url-policy', 'dom-policy', 'search-pending', 'short-content', 'short-duration', 'unavailable-content']);
 export function isContentMessage(value: unknown): value is ContentMessage {
   if (!value || typeof value !== 'object') return false;
@@ -10,7 +11,12 @@ export function isContentMessage(value: unknown): value is ContentMessage {
   if (v.snapshot === null) return true;
   if (!v.snapshot || typeof v.snapshot !== 'object') return false;
   const s = v.snapshot as Record<string, unknown>;
-  return typeof s.normalizedUrl === 'string' && s.normalizedUrl.length <= 8192 && typeof s.domain === 'string' && s.domain.length <= 253 && typeof s.identity === 'string' && /^[a-f0-9]{64}$/.test(s.identity) && typeof s.title === 'string' && [...s.title].length <= 500 && typeof s.content === 'string' && [...s.content].length <= 5000 && typeof s.isSearchResultPage === 'boolean';
+  if (Object.keys(s).some(key => !['normalizedUrl', 'domain', 'identity', 'title', 'content', 'isSearchResultPage', 'searchQuery', 'organicResultCount'].includes(key))) return false;
+  if (!(typeof s.normalizedUrl === 'string' && s.normalizedUrl.length <= 8192 && typeof s.domain === 'string' && s.domain.length <= 253 && typeof s.identity === 'string' && /^[a-f0-9]{64}$/.test(s.identity) && typeof s.title === 'string' && [...s.title].length <= 500 && typeof s.content === 'string' && [...s.content].length <= 5000 && typeof s.isSearchResultPage === 'boolean')) return false;
+  const url = inspectUrl(s.normalizedUrl);
+  if (!url || normalizeUrl(s.normalizedUrl) !== s.normalizedUrl || url.url.hostname !== s.domain || url.isSearchResultPage !== s.isSearchResultPage) return false;
+  if (!s.isSearchResultPage) return s.searchQuery == null && s.organicResultCount === undefined;
+  return validSearchQuery(s.searchQuery) && Number.isSafeInteger(s.organicResultCount) && (s.organicResultCount as number) > 0 && (s.organicResultCount as number) <= 100 && s.content.trim().length > 0;
 }
 export function isPopupMessage(value: unknown): value is PopupMessage {
   if (!value || typeof value !== 'object') return false;

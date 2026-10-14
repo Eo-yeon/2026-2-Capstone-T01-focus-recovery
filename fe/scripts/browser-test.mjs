@@ -24,12 +24,27 @@ try {
   const manifest = JSON.parse(await readFile(join(extension, 'manifest.json'), 'utf8'));
   // The unattended test profile pre-grants only its synthetic fixture host.
   // The shipped manifest still uses optional per-site permissions.
-  manifest.host_permissions = ['http://127.0.0.1/*'];
+  manifest.host_permissions = ['http://127.0.0.1/*', 'https://www.google.com/*', 'https://search.naver.com/*'];
   await writeFile(join(extension, 'manifest.json'), JSON.stringify(manifest));
   context = await chromium.launchPersistentContext(join(root, 'profile'), {
     channel: 'chromium', headless: !process.env.HEADED,
     executablePath: process.env.CHROMIUM_PATH || undefined,
     args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
+  });
+  // All search test responses are intercepted fixtures, never live-service evidence.
+  await context.route(/^https:\/\/(?:www\.google\.com|search\.naver\.com)\//, async route => {
+    const url = new URL(route.request().url());
+    const google = url.hostname === 'www.google.com';
+    const parameter = google ? 'q' : 'query';
+    const empty = url.searchParams.get(parameter) === 'NO_RESULTS';
+    const card = google
+      ? '<div class="MjjYud"><a href="https://example.com/docs"><h3>인증</h3></a></div>'
+      : '<div data-block-id="web/prs_template_v2_web_basic_desk.ts"><a href="https://example.com/docs"><span class="sds-comps-text-type-headline1">인증</span></a></div>';
+    const ad = google ? '<div id="tads" class="MjjYud"><span>Sponsored</span><a href="https://example.com/ad"><h3>PRIVATE_AD</h3></a></div>' : '<div data-ad data-block-id="web/example"><span>광고</span><a href="https://example.com/ad"><span class="sds-comps-text-type-headline1">PRIVATE_AD</span></a></div>';
+    const root = google ? '<div id="search"><div id="rso"></div></div>' : '<div id="main_pack"></div>';
+    const selector = google ? '#rso' : '#main_pack';
+    const action = google ? '/search' : '/search.naver';
+    await route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<!doctype html><title>공개 검색 fixture</title><form role="search" action="${action}"><input name="${parameter}" value="PRIVATE_INPUT"></form>${root}${empty ? '' : `<script>setTimeout(() => document.querySelector('${selector}').innerHTML = ${JSON.stringify(card + ad)}, 500)</script>`}` });
   });
   let [worker] = context.serviceWorkers();
   worker ??= await context.waitForEvent('serviceworker', { timeout: 10000 });
@@ -132,12 +147,56 @@ try {
   await page.goto(`${origin}/short`);
   await new Promise(resolve => setTimeout(resolve, 1200));
   assert.equal((await status()).visits.length, 7, 'short content excluded');
+  const initialSearchCount = (await status()).visits.length;
+  await page.goto('https://www.google.com/search?q=JWT&extra=OMITTED#OMITTED'); await page.bringToFront();
+  result = await until(state => state.visits.length === initialSearchCount + 1, 'synthetic Google delayed organic result');
+  const searchVisit = result.visits.at(-1);
+  assert.equal(searchVisit.searchQuery, 'JWT'); assert.equal(searchVisit.isSearchResultPage, true);
+  assert.equal(searchVisit.normalizedUrl, 'https://www.google.com/search');
+  assert.equal([...searchVisit.content].length < 50, true, 'short organic result bypasses ordinary HTML threshold');
+  assert.equal(JSON.stringify(result).includes('PRIVATE_'), false);
+  assert.equal(JSON.stringify(result).includes('OMITTED'), false);
+  await page.reload();
+  result = await until(state => state.visits.at(-1)?.activeDurationMs > searchVisit.activeDurationMs, 'search reload resumes');
+  assert.equal(result.visits.at(-1).visitId, searchVisit.visitId);
+  const searchCandidates = result.candidates.length;
+  await page.evaluate(() => history.pushState({}, '', '?q=우주'));
+  await new Promise(resolve => setTimeout(resolve, 500));
+  assert.equal((await status()).candidates.length, searchCandidates, 'query-only search change does not duplicate');
+  await page.evaluate(() => { document.querySelector('#rso h3').textContent = '행성'; });
+  result = await until(state => state.visits.length === initialSearchCount + 2, 'search SPA query and results change');
+  assert.equal(result.visits.at(-1).searchQuery, '우주');
+  await page.goto('https://search.naver.com/search.naver?query=한글+인증');
+  result = await until(state => state.visits.length === initialSearchCount + 3, 'synthetic Naver Korean results');
+  assert.equal(result.visits.at(-1).searchQuery, '한글 인증');
+  await page.goBack();
+  result = await until(state => state.visits.length === initialSearchCount + 4, 'search back creates a visit');
+  assert.notEqual(result.visits.at(-1).visitId, searchVisit.visitId);
+  await page.goForward();
+  result = await until(state => state.visits.length === initialSearchCount + 5, 'search forward creates a visit');
+  const naverVisit = result.visits.at(-1);
+  await second.goto('https://www.google.com/search?q=Spring+Boot+JWT'); await second.bringToFront();
+  result = await until(state => state.visits.length === initialSearchCount + 6, 'second search tab');
+  assert.equal(new Set(result.candidates.map(c => c.sequence)).size, result.candidates.length);
+  await page.bringToFront(); await new Promise(resolve => setTimeout(resolve, 400));
+  assert.equal((await status()).visits.at(-2).visitId, naverVisit.visitId, 'search tab return reuses ID');
+  const searchBeforeRestart = await status();
+  const searchCdp = await context.newCDPSession(page); await searchCdp.send('ServiceWorker.enable'); await searchCdp.send('ServiceWorker.stopAllWorkers');
+  result = await status();
+  assert.deepEqual(result.visits.map(v => [v.visitId, v.sequence, v.searchQuery]), searchBeforeRestart.visits.map(v => [v.visitId, v.sequence, v.searchQuery]), 'worker restores search visits');
+  await searchCdp.detach();
+  const preserved = result.visits.map(v => [v.visitId, v.sequence, v.content]);
+  await page.goto('https://www.google.com/search?q=NO_RESULTS');
+  await new Promise(resolve => setTimeout(resolve, 8500));
+  result = await status();
+  assert.equal(result.candidates.at(-1).reason, 'unavailable-content', 'zero search results exhaust bounded wait');
+  assert.deepEqual(result.visits.map(v => [v.visitId, v.sequence, v.content]), preserved, 'empty search preserves valid visits');
   await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'stop' }));
   const stopped = await status();
   await page.goto(`${origin}/a`);
   await new Promise(resolve => setTimeout(resolve, 400));
   assert.equal((await status()).candidates.length, stopped.candidates.length, 'no collection after stop');
-  console.log(`PASS: real MV3 load, popup, messaging, session gate, extraction, reload, back/forward, SPA, tabs, sequence, navigation failure/tab-close race, worker restart, sensitive/short exclusion, stop (${context.browser()?.version() ?? 'Chromium'})`);
+  console.log(`PASS: real MV3 load, popup, messaging, session gate, extraction, reload, back/forward, SPA, tabs, sequence, navigation failure/tab-close race, worker restart, sensitive/short exclusion, synthetic Google/Naver organic results, search SPA/reload/history/tabs/recovery/zero results, stop (${context.browser()?.version() ?? 'Chromium'})`);
 } finally {
   await context?.close();
   await new Promise(resolve => server.close(resolve));

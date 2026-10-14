@@ -2,8 +2,17 @@ const sensitivePath = /(?:^|[\/_.-])(login|logon|signin|sign-in|signup|sign-up|r
 const sensitiveQuery = /^(?:.*token.*|code|password|passwd|secret|authorization|credential|session|sessionid|sid|email|phone|address|ssn|card.*)$/i;
 const sensitiveHost = /(?:^|[.-])(bank|banking|paypal|stripe|accounts|login|auth|finance|wallet)(?:[.-]|$)/i;
 
-// Only this transient stage sees query parameters. FE-007 can inspect q/query here.
-export function inspectUrl(raw: string): { url: URL; isSearchResultPage: boolean } | null {
+export const MAX_SEARCH_QUERY = 500; // Local collection bound, not a server DTO contract.
+export function searchEngine(url: URL): 'google' | 'naver' | null {
+  if (/^(?:www\.)?google\.(?:com|co\.kr|co\.uk|co\.jp|[a-z]{2})$/i.test(url.hostname) && url.pathname === '/search') return 'google';
+  if (/^(?:search|m\.search)\.naver\.com$/i.test(url.hostname) && url.pathname === '/search.naver') return 'naver';
+  return null;
+}
+export function validSearchQuery(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && [...value].length <= MAX_SEARCH_QUERY && value === value.replace(/\s+/g, ' ').trim() && !/[\u0000-\u001f\u007f]/.test(value);
+}
+// Only this transient stage sees the complete query parameters.
+export function inspectUrl(raw: string): { url: URL; isSearchResultPage: boolean; searchQuery: string | null } | null {
   try {
     const url = new URL(raw);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
@@ -13,9 +22,10 @@ export function inspectUrl(raw: string): { url: URL; isSearchResultPage: boolean
     if (/^(?:www\.|m\.)?(?:youtube\.com|youtu\.be|vimeo\.com|twitch\.tv|soundcloud\.com|open\.spotify\.com)$/i.test(url.hostname)) return null;
     // Catch token-style fragments before discarding them.
     if (/(?:access_token|id_token|password|authorization|code)=/i.test(url.hash)) return null;
-    const google = /^(?:www\.)?google\.(?:com|co\.kr|co\.uk|co\.jp|[a-z]{2})$/i.test(url.hostname) && url.pathname === '/search';
-    const naver = /^(?:search|m\.search)\.naver\.com$/i.test(url.hostname) && /\/search\.naver$/.test(url.pathname);
-    return { url, isSearchResultPage: google || naver };
+    const engine = searchEngine(url);
+    const values = engine ? url.searchParams.getAll(engine === 'google' ? 'q' : 'query') : [];
+    const query = values.length === 1 ? values[0].replace(/\s+/g, ' ').trim() : null;
+    return { url, isSearchResultPage: engine !== null, searchQuery: validSearchQuery(query) ? query : null };
   } catch { return null; }
 }
 export function normalizeUrl(raw: string): string | null {
@@ -29,9 +39,9 @@ export function normalizeUrl(raw: string): string | null {
 export async function describeUrl(raw: string) {
   const inspected = inspectUrl(raw);
   if (!inspected) return null;
-  const { url, isSearchResultPage } = inspected;
+  const { url, isSearchResultPage, searchQuery } = inspected;
   url.hash = '';
   const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(url.href));
   const identity = [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, '0')).join('');
-  return { normalizedUrl: normalizeUrl(raw)!, domain: url.hostname, identity, isSearchResultPage };
+  return { normalizedUrl: normalizeUrl(raw)!, domain: url.hostname, identity, isSearchResultPage, searchQuery };
 }
