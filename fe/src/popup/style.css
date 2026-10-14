@@ -1,0 +1,9 @@
+body { width: 390px; margin: 0; font: 14px/1.5 system-ui, sans-serif; color: #222; background: #fff; }
+main { padding: 18px; }
+h1 { font-size: 18px; }
+label, textarea, code { display: block; margin: 8px 0; }
+textarea { box-sizing: border-box; width: 100%; min-height: 70px; font: inherit; }
+button { margin: 5px 8px 5px 0; padding: 7px 10px; }
+code { overflow-wrap: anywhere; }
+pre { max-height: 350px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+[role="alert"] { color: #a52222; }
