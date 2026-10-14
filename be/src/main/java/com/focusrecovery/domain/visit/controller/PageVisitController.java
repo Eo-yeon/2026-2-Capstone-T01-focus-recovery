@@ -58,8 +58,14 @@ public class PageVisitController {
 			- activeDurationMs는 필수이며 1000ms(1초) 이상이어야 합니다. 유효 방문 판정은 FE가 하고 서버는 최소 체류시간만 다시 검증합니다.
 			- content는 FE가 추출한 본문이며 최대 5,000자입니다. 초과하면 서버가 자르지 않고 400을 반환합니다.
 			- visitedAt은 밀리초까지 저장되며, 응답은 UTC ISO 8601(밀리초) 형식입니다.
+
+			**탐색 구간 자동 생성 (응답 형식은 변경 없음)**
+			- 새 방문이 저장(201)되면 같은 트랜잭션에서 분석 구간을 만듭니다. 구간은 같은 세션의 연속된 방문 5개(sequence 순)이며 한 칸씩 이동합니다(Window Size=5, Stride=1).
+			- 방문 1~4개까지는 구간이 없고, sequence 5에서 구간 1=[1~5], 6에서 구간 2=[2~6], 7에서 구간 3=[3~7]이 생깁니다. 구간 번호(windowIndex)는 세션별로 1부터 매깁니다.
+			- 앞선 sequence가 빠져 있으면 그 뒤 구간은 보류하고, 빠진 방문이 도착하면 밀린 구간을 한꺼번에 만듭니다. 예) 1,2,4,5,6 저장 후 3이 오면 [1~5], [2~6] 생성.
+			- 재전송(200), 409, 400 응답에서는 구간이 생성되거나 바뀌지 않습니다. 종료된 세션에는 구간이 생기지 않습니다.
 			""")
-	@ApiResponse(responseCode = "201", description = "새 방문 저장")
+	@ApiResponse(responseCode = "201", description = "새 방문 저장 (필요한 탐색 구간도 함께 생성)")
 	@ApiResponse(responseCode = "200", description = "같은 방문 재전송: 저장된 방문 반환")
 	@ApiResponse(responseCode = "400", description = "잘못된 UUID, 필수값 누락, 음수, activeDurationMs 누락·1000ms 미만, 본문(content) 5,000자 초과, "
 		+ "정규화되지 않은 주소(http/https가 아닌 스킴, 호스트 없음·대문자, 기본 포트, 인증정보, Query·Fragment 포함, URL 문법 오류), "
