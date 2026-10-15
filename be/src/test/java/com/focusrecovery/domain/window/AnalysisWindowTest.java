@@ -1,6 +1,10 @@
 package com.focusrecovery.domain.window;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doCallRealMethod;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -16,6 +20,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 
 import org.junit.jupiter.api.AfterEach;
@@ -25,10 +31,13 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
+import org.springframework.test.util.AopTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
@@ -36,6 +45,7 @@ import com.focusrecovery.domain.session.entity.WorkSession;
 import com.focusrecovery.domain.session.repository.WorkSessionRepository;
 import com.focusrecovery.domain.visit.repository.PageVisitRepository;
 import com.focusrecovery.domain.window.repository.AnalysisWindowRepository;
+import com.focusrecovery.domain.window.service.AnalysisWindowService;
 
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -56,6 +66,10 @@ class AnalysisWindowTest {
 
 	@Autowired
 	private AnalysisWindowRepository analysisWindowRepository;
+
+	// 기본은 실제 메서드를 그대로 호출한다. 구간 저장 실패 복구 테스트에서만 오류를 주입한다
+	@MockitoSpyBean
+	private AnalysisWindowService analysisWindowService;
 
 	private UUID sessionId;
 
@@ -191,6 +205,55 @@ class AnalysisWindowTest {
 
 		assertThat(pageVisitRepository.count()).isEqualTo(5);
 		assertThat(windows(sessionId)).isEqualTo(Map.of(1, List.of(1, 3, 4, 7, 9)));
+	}
+
+	// 요청마다 실제 트랜잭션이 커밋·롤백되도록 테스트 자체에는 트랜잭션을 걸지 않는다
+	@Test
+	void 구간_저장_후_예외로_롤백되면_같은_visitId_재시도로_복구된다() throws Exception {
+		for (int sequence = 1; sequence <= 4; sequence++) {
+			saveVisit(sessionId, sequence).andExpect(status().isCreated());
+		}
+		String visitId = UUID.randomUUID().toString();
+		AtomicBoolean injected = new AtomicBoolean();
+		AtomicReference<String> countsInTransaction = new AtomicReference<>();
+		// 스파이는 트랜잭션 프록시 안쪽에 있으므로 스텁 설정 호출이 MANDATORY 검사를 거치지 않도록 대상 객체에 건다
+		AnalysisWindowService spy = AopTestUtils.getUltimateTargetObject(analysisWindowService);
+		doAnswer(invocation -> {
+			invocation.callRealMethod();
+			// 같은 요청 트랜잭션 안에서 구간과 구성 방문이 실제로 flush 됐는지 기록한다
+			countsInTransaction.set(jdbcTemplate.queryForObject(
+				"select concat((select count(*) from analysis_window), '/', (select count(*) from window_visit))", String.class));
+			if (injected.compareAndSet(false, true)) {
+				throw new DataIntegrityViolationException("주입된 구간 저장 실패");
+			}
+			return null;
+		}).when(spy).createWindows(any(), any());
+
+		assertThatThrownBy(() -> saveVisit(sessionId, visitId, 5))
+			.hasRootCauseInstanceOf(DataIntegrityViolationException.class)
+			.hasRootCauseMessage("주입된 구간 저장 실패");
+
+		assertThat(injected).isTrue();
+		assertThat(countsInTransaction.get()).isEqualTo("1/5");
+		assertThat(pageVisitRepository.existsById(UUID.fromString(visitId))).isFalse();
+		assertThat(pageVisitRepository.count()).isEqualTo(4);
+		assertThat(analysisWindowRepository.count()).isZero();
+		assertThat(jdbcTemplate.queryForObject("select count(*) from window_visit", Integer.class)).isZero();
+
+		doCallRealMethod().when(spy).createWindows(any(), any());
+		saveVisit(sessionId, visitId, 5).andExpect(status().isCreated()).andExpect(jsonPath("$.visitId").value(visitId));
+
+		assertThat(pageVisitRepository.count()).isEqualTo(5);
+		assertThat(analysisWindowRepository.count()).isEqualTo(1);
+		assertThat(jdbcTemplate.queryForObject("select count(*) from window_visit", Integer.class)).isEqualTo(5);
+		assertThat(windows(sessionId)).isEqualTo(Map.of(1, List.of(1, 2, 3, 4, 5)));
+		List<Map<String, Object>> before = windowRows(sessionId);
+
+		saveVisit(sessionId, visitId, 5).andExpect(status().isOk()).andExpect(jsonPath("$.visitId").value(visitId));
+
+		assertThat(pageVisitRepository.count()).isEqualTo(5);
+		assertThat(analysisWindowRepository.count()).isEqualTo(1);
+		assertThat(windowRows(sessionId)).isEqualTo(before);
 	}
 
 	@Test

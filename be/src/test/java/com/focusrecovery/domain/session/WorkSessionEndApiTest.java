@@ -369,10 +369,12 @@ class WorkSessionEndApiTest {
 		assertThat(responses.get(0).getStatus()).isEqualTo(200);
 		List<MockHttpServletResponse> saves = responses.subList(1, responses.size());
 		long created = saves.stream().filter(r -> r.getStatus() == 201).count();
+		// sequence를 순서 없이 동시에 보내므로 구간이 먼저 생기면 앞선 번호는 VISIT_SEQUENCE_OUT_OF_ORDER로 거절될 수 있다(저장 안 됨)
 		for (MockHttpServletResponse response : saves) {
 			if (response.getStatus() != 201) {
 				assertThat(response.getStatus()).isEqualTo(409);
-				assertThat((String) JsonPath.read(response.getContentAsString(), "$.code")).isEqualTo("SESSION_ENDED");
+				assertThat((String) JsonPath.read(response.getContentAsString(), "$.code"))
+					.isIn("SESSION_ENDED", "VISIT_SEQUENCE_OUT_OF_ORDER");
 			}
 		}
 		assertThat(pageVisitRepository.count()).isEqualTo(created);
