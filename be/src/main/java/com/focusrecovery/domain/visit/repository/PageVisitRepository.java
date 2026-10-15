@@ -20,7 +20,9 @@ public interface PageVisitRepository extends JpaRepository<PageVisit, UUID> {
 	boolean existsBySessionIdAndSequence(UUID sessionId, int sequence);
 
 	// 구간 구성에는 ID와 순서만 필요하므로 content 등 큰 컬럼을 읽지 않는다
-	List<VisitSequence> findBySessionIdAndSequenceGreaterThanEqualOrderBySequence(UUID sessionId, int sequence);
+	List<VisitSequence> findBySessionIdAndSequenceGreaterThanOrderBySequence(UUID sessionId, int sequence);
+
+	Optional<VisitSequence> findByVisitId(UUID visitId);
 
 	interface VisitSequence {
 		UUID getVisitId();

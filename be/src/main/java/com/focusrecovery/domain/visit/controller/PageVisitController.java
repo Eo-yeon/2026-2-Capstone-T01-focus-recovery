@@ -60,9 +60,14 @@ public class PageVisitController {
 			- visitedAt은 밀리초까지 저장되며, 응답은 UTC ISO 8601(밀리초) 형식입니다.
 
 			**탐색 구간 자동 생성 (응답 형식은 변경 없음)**
-			- 새 방문이 저장(201)되면 같은 트랜잭션에서 분석 구간을 만듭니다. 구간은 같은 세션의 연속된 방문 5개(sequence 순)이며 한 칸씩 이동합니다(Window Size=5, Stride=1).
-			- 방문 1~4개까지는 구간이 없고, sequence 5에서 구간 1=[1~5], 6에서 구간 2=[2~6], 7에서 구간 3=[3~7]이 생깁니다. 구간 번호(windowIndex)는 세션별로 1부터 매깁니다.
-			- 앞선 sequence가 빠져 있으면 그 뒤 구간은 보류하고, 빠진 방문이 도착하면 밀린 구간을 한꺼번에 만듭니다. 예) 1,2,4,5,6 저장 후 3이 오면 [1~5], [2~6] 생성.
+			- 새 방문이 저장(201)되면 같은 트랜잭션에서 분석 구간을 만듭니다. 구간은 같은 세션에 저장된 유효 방문을 sequence 오름차순으로 정렬해 5개씩 묶고 한 칸씩 이동합니다(Window Size=5, Stride=1).
+			- sequence는 FE가 방문 후보 발생 순서로 매기는 번호이며, 제외된 후보의 번호는 비어 있는 것이 정상입니다. 서버는 숫자 연속성을 검사하지 않고 빠진 번호를 기다리지 않습니다.
+			  예) 1,3,4,5,6 저장 시 구간 1=[1,3,4,5,6], 이후 8 저장 시 구간 2=[3,4,5,6,8]. 유효 방문 1~4개까지는 구간이 없습니다.
+			- 구간 번호(windowIndex)는 sequence와 별개로 세션별 구간 생성 순서대로 1, 2, 3…입니다.
+			- FE는 앞선 방문의 저장 성공(ACK)을 확인한 뒤 다음 방문을 보냅니다. 첫 구간이 생기기 전에는 도착 순서와 관계없이 sequence 순으로 정렬해 구간을 만듭니다.
+			- 이미 만든 구간은 다시 구성하지 않습니다. 구간이 생긴 뒤 마지막 구간의 끝 방문보다 작은 sequence의 새 방문은 409 VISIT_SEQUENCE_OUT_OF_ORDER이며 방문과 구간 모두 저장·변경되지 않습니다.
+			  예) 구간 [1,3,4,7,9] 생성 후 새 방문 5는 409, 10은 201(다음 구간 [3,4,7,9,10]). 이미 저장된 같은 방문의 재전송은 sequence와 관계없이 200입니다.
+			- 오류 판정 순서: 같은 방문 재전송(200) → VISIT_ID_CONFLICT → VISIT_SEQUENCE_CONFLICT → SESSION_ENDED → VISIT_SEQUENCE_OUT_OF_ORDER.
 			- 재전송(200), 409, 400 응답에서는 구간이 생성되거나 바뀌지 않습니다. 종료된 세션에는 구간이 생기지 않습니다.
 			""")
 	@ApiResponse(responseCode = "201", description = "새 방문 저장 (필요한 탐색 구간도 함께 생성)")
@@ -77,14 +82,17 @@ public class PageVisitController {
 		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
 			{"code": "SESSION_NOT_FOUND", "message": "작업 세션을 찾을 수 없습니다.", "fieldErrors": []}""")))
 	@ApiResponse(responseCode = "409", description = "SESSION_ENDED: 종료된 세션에 새 방문 저장 / "
-		+ "VISIT_ID_CONFLICT: 같은 visitId에 다른 원본 정보 / VISIT_SEQUENCE_CONFLICT: 같은 세션의 sequence에 다른 visitId",
+		+ "VISIT_ID_CONFLICT: 같은 visitId에 다른 원본 정보 / VISIT_SEQUENCE_CONFLICT: 같은 세션의 sequence에 다른 visitId / "
+		+ "VISIT_SEQUENCE_OUT_OF_ORDER: 마지막 탐색 구간의 끝 방문보다 작은 sequence의 새 방문",
 		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = {
 			@ExampleObject(name = "SESSION_ENDED", value = """
 				{"code": "SESSION_ENDED", "message": "종료된 작업 세션입니다.", "fieldErrors": []}"""),
 			@ExampleObject(name = "VISIT_ID_CONFLICT", value = """
 				{"code": "VISIT_ID_CONFLICT", "message": "같은 방문 ID로 다른 방문 정보가 전달되었습니다.", "fieldErrors": []}"""),
 			@ExampleObject(name = "VISIT_SEQUENCE_CONFLICT", value = """
-				{"code": "VISIT_SEQUENCE_CONFLICT", "message": "같은 세션의 방문 순서가 이미 다른 방문에 사용되었습니다.", "fieldErrors": []}""")
+				{"code": "VISIT_SEQUENCE_CONFLICT", "message": "같은 세션의 방문 순서가 이미 다른 방문에 사용되었습니다.", "fieldErrors": []}"""),
+			@ExampleObject(name = "VISIT_SEQUENCE_OUT_OF_ORDER", value = """
+				{"code": "VISIT_SEQUENCE_OUT_OF_ORDER", "message": "마지막 탐색 구간보다 앞선 순서의 새 방문은 저장할 수 없습니다.", "fieldErrors": []}""")
 		}))
 	@PostMapping
 	public ResponseEntity<PageVisitResponse> save(

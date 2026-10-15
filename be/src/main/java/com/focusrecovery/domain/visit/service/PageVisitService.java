@@ -69,6 +69,7 @@ public class PageVisitService {
 		if (session.getStatus() == WorkSessionStatus.ENDED) {
 			throw sessionEnded();
 		}
+		analysisWindowService.checkOrder(candidate.getSessionId(), candidate.getSequence());
 		pageVisitRepository.saveAndFlush(candidate);
 		analysisWindowService.createWindows(candidate.getSessionId(), Instant.now().truncatedTo(ChronoUnit.MILLIS));
 		return new SaveResult(PageVisitResponse.from(candidate), true);

@@ -15,6 +15,7 @@ import jakarta.persistence.ElementCollection;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
+import jakarta.persistence.OrderBy;
 import jakarta.persistence.PostLoad;
 import jakarta.persistence.PostPersist;
 import jakarta.persistence.Table;
@@ -51,6 +52,7 @@ public class AnalysisWindow implements Persistable<UUID> {
 	private Instant createdAt;
 
 	@ElementCollection
+	@OrderBy("position")
 	@CollectionTable(name = "window_visit", joinColumns = @JoinColumn(name = "window_id"))
 	private List<WindowVisit> visits = new ArrayList<>();
 
@@ -61,7 +63,7 @@ public class AnalysisWindow implements Persistable<UUID> {
 	protected AnalysisWindow() {
 	}
 
-	// visitIds는 같은 세션의 연속된 방문을 sequence 순서로 담는다
+	// visitIds는 같은 세션의 방문을 sequence 오름차순으로 담는다(번호 공백 허용)
 	public static AnalysisWindow of(UUID sessionId, int windowIndex, List<UUID> visitIds, Instant createdAt) {
 		AnalysisWindow window = new AnalysisWindow();
 		window.windowId = UUID.randomUUID();
@@ -81,6 +83,18 @@ public class AnalysisWindow implements Persistable<UUID> {
 	@PostPersist
 	void markNotNew() {
 		isNew = false;
+	}
+
+	public int getWindowIndex() {
+		return windowIndex;
+	}
+
+	public UUID getEndVisitId() {
+		return endVisitId;
+	}
+
+	public List<UUID> getVisitIds() {
+		return visits.stream().map(WindowVisit::visitId).toList();
 	}
 
 	@Override

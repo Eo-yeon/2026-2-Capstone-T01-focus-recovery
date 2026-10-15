@@ -26,6 +26,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.http.MediaType;
+import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
@@ -106,91 +107,184 @@ class AnalysisWindowTest {
 		assertThat(windowRows(sessionId)).isEqualTo(before);
 	}
 
+	// 변경: 예전에는 1,2,4,5,6에서 3을 기다렸다. sequence는 방문 후보 순서라 제외된 후보 번호가 비는 것이 정상이므로 기다리지 않는다
 	@Test
-	void 앞선_방문이_누락되면_보류했다가_도착하면_밀린_구간을_모두_생성한다() throws Exception {
-		for (int sequence : new int[] {1, 2, 4, 5, 6}) {
+	void 제외된_후보의_번호_공백이_있어도_유효_방문_5개로_구간을_만든다() throws Exception {
+		for (int sequence : new int[] {1, 3, 4, 5}) {
 			saveVisit(sessionId, sequence).andExpect(status().isCreated());
 		}
 		assertThat(windows(sessionId)).isEmpty();
 
-		saveVisit(sessionId, 3).andExpect(status().isCreated());
+		saveVisit(sessionId, 6).andExpect(status().isCreated());
+		assertThat(windows(sessionId)).isEqualTo(Map.of(1, List.of(1, 3, 4, 5, 6)));
 
-		assertThat(windows(sessionId)).isEqualTo(Map.of(1, List.of(1, 2, 3, 4, 5), 2, List.of(2, 3, 4, 5, 6)));
+		saveVisit(sessionId, 8).andExpect(status().isCreated());
+		assertThat(windows(sessionId)).isEqualTo(Map.of(1, List.of(1, 3, 4, 5, 6), 2, List.of(3, 4, 5, 6, 8)));
+
+		saveVisit(sessionId, 12).andExpect(status().isCreated());
+		assertThat(windows(sessionId)).containsEntry(3, List.of(4, 5, 6, 8, 12)).hasSize(3);
 	}
 
 	@Test
-	void 도착_순서와_무관하게_sequence_순서로_구성한다() throws Exception {
-		for (int sequence : new int[] {8, 3, 6, 1, 7, 5, 2, 4}) {
+	void 번호_공백이_있어도_재전송하면_200이고_구간은_그대로다() throws Exception {
+		List<String> visitIds = new ArrayList<>();
+		for (int sequence : new int[] {2, 5, 6, 9, 10, 13}) {
+			String visitId = UUID.randomUUID().toString();
+			visitIds.add(visitId);
+			saveVisit(sessionId, visitId, sequence).andExpect(status().isCreated());
+		}
+		List<Map<String, Object>> before = windowRows(sessionId);
+		assertThat(windows(sessionId)).isEqualTo(Map.of(1, List.of(2, 5, 6, 9, 10), 2, List.of(5, 6, 9, 10, 13)));
+
+		saveVisit(sessionId, visitIds.get(5), 13).andExpect(status().isOk());
+		saveVisit(sessionId, visitIds.get(0), 2).andExpect(status().isOk());
+
+		assertThat(windowRows(sessionId)).isEqualTo(before);
+	}
+
+	// 변경: 예전에는 어떤 도착 순서든 최종 구간이 같았다. 첫 구간 전까지는 sequence로 정렬해 쓰고,
+	// 구간이 생긴 뒤 그 끝보다 앞선 새 방문은 기존 구간을 다시 쓰지 않도록 409 VISIT_SEQUENCE_OUT_OF_ORDER로 거절한다
+	@Test
+	void 첫_구간_이후_마지막_구간보다_앞선_새_방문은_409이고_아무것도_저장하지_않는다() throws Exception {
+		String visit3 = UUID.randomUUID().toString();
+		for (int sequence : new int[] {7, 9, 1, 4}) {
 			saveVisit(sessionId, sequence).andExpect(status().isCreated());
 		}
+		saveVisit(sessionId, visit3, 3).andExpect(status().isCreated());
+		assertThat(windows(sessionId)).isEqualTo(Map.of(1, List.of(1, 3, 4, 7, 9)));
+		List<Map<String, Object>> before = windowRows(sessionId);
 
-		assertThat(windows(sessionId)).isEqualTo(expectedWindows(8));
+		saveVisit(sessionId, 5)
+			.andExpect(status().isConflict())
+			.andExpect(jsonPath("$.code").value("VISIT_SEQUENCE_OUT_OF_ORDER"));
+		assertThat(pageVisitRepository.count()).isEqualTo(5);
+		assertThat(windowRows(sessionId)).isEqualTo(before);
+
+		saveVisit(sessionId, 10).andExpect(status().isCreated());
+		assertThat(windows(sessionId)).isEqualTo(Map.of(1, List.of(1, 3, 4, 7, 9), 2, List.of(3, 4, 7, 9, 10)));
+
+		saveVisit(sessionId, visit3, 3).andExpect(status().isOk()).andExpect(jsonPath("$.sequence").value(3));
+		assertThat(windows(sessionId)).hasSize(2);
+	}
+
+	@Test
+	void 순서_오류보다_ID_sequence_충돌과_종료_오류를_먼저_판정한다() throws Exception {
+		String visit3 = UUID.randomUUID().toString();
+		for (int sequence : new int[] {1, 4, 7, 9}) {
+			saveVisit(sessionId, sequence).andExpect(status().isCreated());
+		}
+		saveVisit(sessionId, visit3, 3).andExpect(status().isCreated());
+
+		mockMvc.perform(post("/api/sessions/{sessionId}/visits", sessionId)
+				.contentType(MediaType.APPLICATION_JSON)
+				.content(visitBody(visit3, 3).replace("\"title\": \"제목\"", "\"title\": \"다른 제목\"")))
+			.andExpect(status().isConflict())
+			.andExpect(jsonPath("$.code").value("VISIT_ID_CONFLICT"));
+		saveVisit(sessionId, 4)
+			.andExpect(status().isConflict())
+			.andExpect(jsonPath("$.code").value("VISIT_SEQUENCE_CONFLICT"));
+		mockMvc.perform(post("/api/sessions/{sessionId}/end", sessionId)).andExpect(status().isOk());
+		saveVisit(sessionId, 2)
+			.andExpect(status().isConflict())
+			.andExpect(jsonPath("$.code").value("SESSION_ENDED"));
+		saveVisit(sessionId, visit3, 3).andExpect(status().isOk());
+
+		assertThat(pageVisitRepository.count()).isEqualTo(5);
+		assertThat(windows(sessionId)).isEqualTo(Map.of(1, List.of(1, 3, 4, 7, 9)));
 	}
 
 	@Test
 	void 구간에는_같은_세션의_방문만_들어간다() throws Exception {
 		UUID otherSessionId = newSession();
-		for (int sequence = 1; sequence <= 6; sequence++) {
-			saveVisit(sessionId, sequence).andExpect(status().isCreated());
-			saveVisit(otherSessionId, sequence).andExpect(status().isCreated());
+		for (int sequence = 1; sequence <= 12; sequence++) {
+			saveVisit(sequence % 2 == 0 ? sessionId : otherSessionId, sequence).andExpect(status().isCreated());
 		}
 
-		assertThat(windows(sessionId)).isEqualTo(expectedWindows(6));
-		assertThat(windows(otherSessionId)).isEqualTo(expectedWindows(6));
+		assertThat(windows(sessionId)).isEqualTo(Map.of(1, List.of(2, 4, 6, 8, 10), 2, List.of(4, 6, 8, 10, 12)));
+		assertThat(windows(otherSessionId)).isEqualTo(Map.of(1, List.of(1, 3, 5, 7, 9), 2, List.of(3, 5, 7, 9, 11)));
 	}
 
+	// 계약대로 세션마다 순서대로 보내되 여러 세션의 저장은 동시에 일어난다
 	@RepeatedTest(3)
-	void 동시에_저장해도_구간이_누락_중복되거나_번호가_충돌하지_않는다() throws Exception {
-		UUID otherSessionId = newSession();
-		List<Integer> sequences = new ArrayList<>(IntStream.rangeClosed(1, 12).boxed().toList());
+	void 여러_세션이_동시에_저장해도_세션별_구간이_정확하다() throws Exception {
+		List<UUID> sessionIds = List.of(sessionId, newSession(), newSession(), newSession());
+		List<Integer> sequences = List.of(1, 2, 4, 7, 8, 9, 11, 15, 16, 20);
+
+		runConcurrently(sessionIds.size(), i -> {
+			for (int sequence : sequences) {
+				saveVisit(sessionIds.get(i), sequence).andExpect(status().isCreated());
+			}
+			return null;
+		});
+
+		for (UUID id : sessionIds) {
+			assertThat(windows(id)).isEqualTo(expectedWindows(sequences));
+		}
+	}
+
+	// 같은 세션에 순서 없이 동시에 보내는 것은 계약 밖이다. 201로 저장된 방문은 모두 sequence 순서대로 구간에 들어가고,
+	// 거절된 방문은 VISIT_SEQUENCE_OUT_OF_ORDER이며 저장되지 않아야 한다(조용히 분석에서 빠지는 방문 없음)
+	@RepeatedTest(3)
+	void 같은_세션에_동시에_저장해도_저장된_방문은_모두_구간에_들어간다() throws Exception {
+		List<Integer> sequences = new ArrayList<>(IntStream.rangeClosed(1, 16).map(i -> i * 2).boxed().toList());
 		Collections.shuffle(sequences);
 
-		List<Integer> statuses = runConcurrently(24, i -> (i % 2 == 0
-			? saveVisit(sessionId, sequences.get(i / 2))
-			: saveVisit(otherSessionId, sequences.get(i / 2))).andReturn().getResponse().getStatus());
+		List<MockHttpServletResponse> responses = runConcurrently(sequences.size(),
+			i -> saveVisit(sessionId, sequences.get(i)).andReturn().getResponse());
 
-		assertThat(statuses).containsOnly(201);
-		assertThat(windows(sessionId)).isEqualTo(expectedWindows(12));
-		assertThat(windows(otherSessionId)).isEqualTo(expectedWindows(12));
+		List<Integer> saved = new ArrayList<>();
+		for (int i = 0; i < responses.size(); i++) {
+			if (responses.get(i).getStatus() == 201) {
+				saved.add(sequences.get(i));
+			} else {
+				assertThat(responses.get(i).getStatus()).isEqualTo(409);
+				assertThat(responses.get(i).getContentAsString()).contains("VISIT_SEQUENCE_OUT_OF_ORDER");
+			}
+		}
+		Collections.sort(saved);
+		assertThat(pageVisitRepository.count()).isEqualTo(saved.size());
+		assertThat(windows(sessionId)).isEqualTo(expectedWindows(saved));
+		assertThat(windows(sessionId).values().stream().flatMap(List::stream).distinct().sorted().toList()).isEqualTo(saved);
 	}
 
 	@Test
 	void 같은_방문을_동시에_재전송해도_구간은_한_번만_생성된다() throws Exception {
-		for (int sequence = 1; sequence <= 4; sequence++) {
+		for (int sequence : new int[] {1, 2, 4, 5}) {
 			saveVisit(sessionId, sequence).andExpect(status().isCreated());
 		}
 		String visitId = UUID.randomUUID().toString();
 
 		List<Integer> statuses = runConcurrently(8,
-			i -> saveVisit(sessionId, visitId, 5).andReturn().getResponse().getStatus());
+			i -> saveVisit(sessionId, visitId, 7).andReturn().getResponse().getStatus());
 
 		assertThat(statuses).containsOnlyOnce(201).filteredOn(s -> s != 201).containsOnly(200);
-		assertThat(windows(sessionId)).isEqualTo(expectedWindows(5));
+		assertThat(windows(sessionId)).isEqualTo(Map.of(1, List.of(1, 2, 4, 5, 7)));
 	}
 
 	@Test
 	void 종료된_세션에는_새_방문과_구간이_생성되지_않는다() throws Exception {
-		for (int sequence = 1; sequence <= 4; sequence++) {
+		for (int sequence : new int[] {1, 3, 4, 6, 7}) {
 			saveVisit(sessionId, sequence).andExpect(status().isCreated());
 		}
+		List<Map<String, Object>> before = windowRows(sessionId);
 		mockMvc.perform(post("/api/sessions/{sessionId}/end", sessionId)).andExpect(status().isOk());
 
-		saveVisit(sessionId, 5)
+		saveVisit(sessionId, 9)
 			.andExpect(status().isConflict())
 			.andExpect(jsonPath("$.code").value("SESSION_ENDED"));
 
-		assertThat(windows(sessionId)).isEmpty();
-		assertThat(pageVisitRepository.count()).isEqualTo(4);
+		assertThat(windowRows(sessionId)).isEqualTo(before);
+		assertThat(windows(sessionId)).isEqualTo(Map.of(1, List.of(1, 3, 4, 6, 7)));
+		assertThat(pageVisitRepository.count()).isEqualTo(5);
 	}
 
-	private static Map<Integer, List<Integer>> expectedWindows(int visitCount) {
+	private static Map<Integer, List<Integer>> expectedWindows(List<Integer> sortedSequences) {
 		Map<Integer, List<Integer>> expected = new LinkedHashMap<>();
-		for (int index = 1; index + 4 <= visitCount; index++) {
-			expected.put(index, IntStream.rangeClosed(index, index + 4).boxed().toList());
+		for (int start = 0; start + 5 <= sortedSequences.size(); start++) {
+			expected.put(start + 1, sortedSequences.subList(start, start + 5));
 		}
 		return expected;
 	}
-
 	private List<Map<String, Object>> windowRows(UUID sessionId) {
 		return jdbcTemplate.queryForList("""
 			select w.window_id, w.window_index, w.window_size, w.start_visit_id, w.end_visit_id, w.created_at,
@@ -263,9 +357,13 @@ class AnalysisWindowTest {
 	private ResultActions saveVisit(UUID sessionId, String visitId, int sequence) throws Exception {
 		return mockMvc.perform(post("/api/sessions/{sessionId}/visits", sessionId)
 			.contentType(MediaType.APPLICATION_JSON)
-			.content("""
-				{"visitId": "%s", "sequence": %d, "browserTabKey": "tab-1", "normalizedUrl": "https://example.com/%d", \
-				"domain": "example.com", "title": "제목", "content": "본문", "activeDurationMs": 1000, \
-				"visitedAt": "2026-10-13T01:23:45.678Z"}""".formatted(visitId, sequence, sequence)));
+			.content(visitBody(visitId, sequence)));
+	}
+
+	private static String visitBody(String visitId, int sequence) {
+		return """
+			{"visitId": "%s", "sequence": %d, "browserTabKey": "tab-1", "normalizedUrl": "https://example.com/%d", \
+			"domain": "example.com", "title": "제목", "content": "본문", "activeDurationMs": 1000, \
+			"visitedAt": "2026-10-13T01:23:45.678Z"}""".formatted(visitId, sequence, sequence);
 	}
 }
