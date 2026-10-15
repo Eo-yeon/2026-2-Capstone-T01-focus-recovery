@@ -25,19 +25,30 @@ class DriftClassifier:
     def extract_features(self, semantic_relevance, context_result_dict, behavior_features):
         """
         AI-001(Embedding) 결과, AI-002(Context) 결과, Extension 수집(행동 정보)을 하나의 특징 벡터로 병합합니다[cite: 3, 6, 7].
+        semantic_relevance는 단일 값 또는 탐색 구간 통계 리스트를 받을 수 있습니다.
+        context_result_dict가 None이면(Context 단계 제외 구성) Context 특징을 넣지 않습니다.
         """
+        if isinstance(semantic_relevance, (list, tuple)):
+            semantic_features = list(semantic_relevance)
+        else:
+            semantic_features = [semantic_relevance]
+
         # context_result_dict는 ContextAnalysisResult.to_dict()의 반환값을 가정합니다.
-        context_features = [
-            context_result_dict.get("goalRelevance", 0.0),
-            context_result_dict.get("detourJustification", 0.0),
-            context_result_dict.get("driftDegree", 0.0)
-        ][cite: 7]
-        
+        # 값이 없을 때 임의의 기본값을 만들지 않도록 직접 인덱싱합니다.
+        if context_result_dict is None:
+            context_features = []
+        else:
+            context_features = [
+                context_result_dict["goalRelevance"],
+                context_result_dict["detourJustification"],
+                context_result_dict["driftDegree"],
+            ]
+
         # 행동 정보에는 활성 체류시간, 탭 전환 횟수 등이 포함됩니다[cite: 3, 6].
         # behavior_features는 [활성 체류시간, 탭 전환 횟수, ...] 형태의 리스트라고 가정합니다.
-        
-        features = [semantic_relevance] + context_features + behavior_features
-        return np.array(features).reshape(1, -1)
+
+        features = semantic_features + context_features + list(behavior_features)
+        return np.array(features, dtype=float).reshape(1, -1)
 
     def predict_state(self, semantic_relevance, context_result_dict, behavior_features):
         """
@@ -51,7 +62,7 @@ class DriftClassifier:
             "P_NORMAL": 0.3,
             "P_TRANSITION": 0.2,
             "P_DRIFT": 0.5
-        }[cite: 7]
+        }
         
         # 최종 분류 로직: P(DRIFT)가 임계값 γ 이상이면 DRIFT로 판정합니다[cite: 7].
         if probs["P_DRIFT"] >= self.threshold_gamma:
