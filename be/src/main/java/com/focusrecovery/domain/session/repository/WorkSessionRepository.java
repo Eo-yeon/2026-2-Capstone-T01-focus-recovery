@@ -14,7 +14,7 @@ public interface WorkSessionRepository extends JpaRepository<WorkSession, UUID> 
 
 	Optional<WorkSession> findByIdempotencyKey(String idempotencyKey);
 
-	// 공유 잠금: 방문 저장·갱신끼리는 동시에 진행되고, 세션 상태 변경(종료)과는 직렬화된다
+	// 공유 잠금: 행동 정보 갱신끼리는 동시에 진행되고, 종료·방문 저장(쓰기 잠금)과는 직렬화된다
 	@Lock(LockModeType.PESSIMISTIC_READ)
 	Optional<WorkSession> findForShareBySessionId(UUID sessionId);
 

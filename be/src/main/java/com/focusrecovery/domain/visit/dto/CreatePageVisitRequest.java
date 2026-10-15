@@ -26,7 +26,7 @@ public record CreatePageVisitRequest(
 	@Pattern(regexp = Uuids.REGEX, message = "방문 ID가 올바른 UUID 형식이 아닙니다.")
 	String visitId,
 
-	@Schema(description = "세션 내 방문 순서 (1부터)", example = "1", minimum = "1", requiredMode = Schema.RequiredMode.REQUIRED)
+	@Schema(description = "세션 내 방문 후보 발생 순서 (1부터, FE 발급). 제외된 후보 번호는 비어 있을 수 있음", example = "1", minimum = "1", requiredMode = Schema.RequiredMode.REQUIRED)
 	@NotNull(message = "방문 순서를 입력해 주세요.")
 	@Min(value = 1, message = "방문 순서는 1 이상이어야 합니다.")
 	Integer sequence,

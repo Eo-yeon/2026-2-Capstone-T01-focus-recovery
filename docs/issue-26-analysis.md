@@ -1,6 +1,16 @@
 # Issue #26 방문 순서 분석 및 구현 기록
 
-## 확인 기준
+## 최신 main 반영 (2026-10-15)
+
+사용자의 충돌 해결·Push 요청에 따라 공식 `upstream/main`의 `332874e`를 작업 브랜치에 병합했다. PR #24는 최초 분석 이후 `5cd3e22`, `b1c628c`로 변경된 뒤 main에 병합됐다. **아래 최초 분석의 연속 번호 강제·미병합 상태는 당시 `d61eb8b` 기준의 기록이며 현재 BE 동작이 아니다.**
+
+최신 BE는 저장된 방문을 sequence 오름차순으로 묶으며 번호 공백을 기다리지 않는다. 이미 생성된 Window는 변경하지 않고, 마지막 Window의 끝보다 작은 번호의 신규 방문은 `409 VISIT_SEQUENCE_OUT_OF_ORDER`로 거절한다. 기존 visitId의 같은 원본 재전송은 먼저 처리하므로 과거 번호여도 200이며, 같은 ID의 sequence 등 원본 변경은 충돌이다. 롤백 후 같은 visitId 재시도 테스트도 main에 추가됐다.
+
+사용자가 선택한 A안 FE 구현은 유지했다. 연속 번호도 최신 BE가 허용하는 오름차순 번호이므로 Window 구성과 호환되며, 앞선 후보를 기다리는 방식은 뒤늦은 방문이 순서 오류로 거절되는 것을 방지한다. 실제 HTTP 전송에는 여전히 앞선 방문 ACK 후 다음 방문 전송이 필요하다. main의 BE·AI 변경은 그대로 반영했고 충돌한 명세 및 자동 병합 후 모순된 설명만 조정했다. 이번 작업에서 BE 코드를 별도로 수정하지 않았다.
+
+병합 후 `npm run typecheck`, `npm test`(212개), `npm run build`, `npm run test:browser`(Chrome for Testing 151.0.7922.34), `git diff --check`를 다시 실행해 통과했다. BE·AI 코드는 upstream/main과 차이가 없음을 확인했으며 BE 통합 테스트는 재실행하지 않았다.
+
+## 최초 분석 확인 기준
 
 - [Issue #26](https://github.com/SKHU-AI-Projects-Archive/2026-2-Capstone-T01-focus-recovery/issues/26)의 본문·완료 조건·협의 요구를 확인했다. 조회 시 댓글은 없었다.
 - 공식 `upstream/main`: `167999223faf78fc1c8363d5af89e79db7026584`. 시작 HEAD와 같았고 미커밋 변경은 없었다.
@@ -73,7 +83,7 @@ Chrome에서 관찰하지 못한 과거 방문, 현재 frame과 달라 이미 �
 
 신규 단위 테스트는 20개(순서 계약 18개, Background adapter 2개)다. 5·6·7개 유효 방문, 같은 URL 재방문, 1·3개 연속 제외, 열린 영구 제외 탭의 후속 방문 차단 방지, 여러 탭의 역순 유효/종료 판정, 앞선 pending 제외, 검색 제외 복구, 후발 민감 DOM, reload·SPA, 지연 본문, 재조회/재전송 원본 안정성, Worker 및 구버전 checkpoint 복구, 한도 도달, 종료 후 지연 이벤트를 포함한다.
 
-Window 테스트는 FE 출력이 PR #24의 연속 번호·크기 5·stride 1 조건에 맞는지 확인하는 계약 테스트다. 실제 BE DB에 Window를 생성하는 통합 테스트가 아니다. 브라우저 테스트의 Google·Naver 응답은 기존처럼 합성 fixture이며 실제 검색 서비스의 DOM 검증을 의미하지 않는다.
+Window 테스트는 FE 출력이 선택된 연속 번호 정책과 크기 5·stride 1 조건에 맞는지 확인하는 계약 테스트다. 최신 BE는 번호 공백도 허용하며 FE가 제공하는 연속 번호는 그 허용 범위에 포함된다. 실제 BE DB에 Window를 생성하는 통합 테스트가 아니다. 브라우저 테스트의 Google·Naver 응답은 기존처럼 합성 fixture이며 실제 검색 서비스의 DOM 검증을 의미하지 않는다.
 
 ## 수정 파일별 영향
 

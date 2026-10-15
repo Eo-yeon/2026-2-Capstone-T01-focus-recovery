@@ -7,7 +7,7 @@ const search: PageSnapshot = { ...page(), isSearchResultPage: true, normalizedUr
 let collector: Collector;
 const observe = (tab: number, time: number, snapshot = page()) => collector.observe(tab, collector.state.tabs[tab].documentId, collector.state.session!.sessionId, snapshot, undefined, time);
 const ready = () => collector.status(collector.current(collector.state.foregroundTabId ?? -1)?.activeSince ?? 0).readyVisits;
-// Contract check only: BE owns actual Window creation. Require the same contiguous prefix as PR #24.
+// FE contract check only: BE also accepts gaps; these finalized inputs stay contiguous and ordered.
 function windowIds(visits: PageVisit[]): string[][] {
   expect(visits.map(v => v.sequence)).toEqual(visits.map((_, i) => i + 1));
   return visits.slice(4).map((_, i) => visits.slice(i, i + 5).map(v => v.visitId));

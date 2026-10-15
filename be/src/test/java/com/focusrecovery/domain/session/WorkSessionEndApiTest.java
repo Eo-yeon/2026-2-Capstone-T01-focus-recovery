@@ -38,6 +38,7 @@ import com.focusrecovery.domain.session.entity.WorkSessionStatus;
 import com.focusrecovery.domain.session.repository.WorkSessionRepository;
 import com.focusrecovery.domain.visit.entity.PageVisit;
 import com.focusrecovery.domain.visit.repository.PageVisitRepository;
+import com.focusrecovery.domain.window.repository.AnalysisWindowRepository;
 import com.jayway.jsonpath.JsonPath;
 
 @SpringBootTest
@@ -56,8 +57,12 @@ class WorkSessionEndApiTest {
 	@Autowired
 	private PageVisitRepository pageVisitRepository;
 
+	@Autowired
+	private AnalysisWindowRepository analysisWindowRepository;
+
 	@BeforeEach
 	void setUp() {
+		analysisWindowRepository.deleteAll();
 		pageVisitRepository.deleteAll();
 		workSessionRepository.deleteAll();
 	}
@@ -65,6 +70,7 @@ class WorkSessionEndApiTest {
 	// 다른 테스트 클래스가 세션을 지울 때 외래키에 걸리지 않도록 방문 기록을 남기지 않는다
 	@AfterEach
 	void tearDown() {
+		analysisWindowRepository.deleteAll();
 		pageVisitRepository.deleteAll();
 	}
 
@@ -363,10 +369,12 @@ class WorkSessionEndApiTest {
 		assertThat(responses.get(0).getStatus()).isEqualTo(200);
 		List<MockHttpServletResponse> saves = responses.subList(1, responses.size());
 		long created = saves.stream().filter(r -> r.getStatus() == 201).count();
+		// sequence를 순서 없이 동시에 보내므로 구간이 먼저 생기면 앞선 번호는 VISIT_SEQUENCE_OUT_OF_ORDER로 거절될 수 있다(저장 안 됨)
 		for (MockHttpServletResponse response : saves) {
 			if (response.getStatus() != 201) {
 				assertThat(response.getStatus()).isEqualTo(409);
-				assertThat((String) JsonPath.read(response.getContentAsString(), "$.code")).isEqualTo("SESSION_ENDED");
+				assertThat((String) JsonPath.read(response.getContentAsString(), "$.code"))
+					.isIn("SESSION_ENDED", "VISIT_SEQUENCE_OUT_OF_ORDER");
 			}
 		}
 		assertThat(pageVisitRepository.count()).isEqualTo(created);
