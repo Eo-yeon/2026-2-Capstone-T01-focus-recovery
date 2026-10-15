@@ -54,7 +54,8 @@ describe('session and visit state', () => {
     observe(); expect(collector.status(1000).visits).toHaveLength(0);
     collector.navigate(1, 'doc2', 'b', 'new', 2000); observe(1, 'doc2', page('b'), 3000);
     collector.navigate(1, 'doc1', 'a', 'new', 4000); observe(1, 'doc1', page(), 5000);
-    expect(collector.status(5000).visits.map(visit => visit.sequence)).toEqual([2, 3]);
+    collector.stop(5000);
+    expect(collector.status(5000).readyVisits.map(visit => visit.sequence)).toEqual([1, 2]);
   });
   it('does not collect before a session or after stop; ignores delayed previous-session messages', () => {
     collector.navigate(1, 'doc1', 'a', 'new', 0);
@@ -109,9 +110,10 @@ describe('session and visit state', () => {
     expect(original.activeDurationMs).toBe(2100);
   });
   it('creates new visits for full navigation and back/forward, even to a known URL or BFCache document id', () => {
-    collector.start('공개 문서 찾기', 0); collector.navigate(1, 'doc1', 'a', 'new', 0); observe();
+    collector.start('공개 문서 찾기', 0); collector.foreground(1, 0); collector.navigate(1, 'doc1', 'a', 'new', 0); observe();
     collector.navigate(1, 'doc2', 'b', 'new', 2000); observe(1, 'doc2', page('b'), 3000);
     collector.navigate(1, 'doc1', 'a', 'new', 4000); observe(1, 'doc1', page(), 5000);
+    collector.stop(5000);
     expect(collector.state.candidates.map(v => v.sequence)).toEqual([1, 2, 3]);
     expect(new Set(collector.state.candidates.map(v => v.visitId)).size).toBe(3);
     expect(new Set(collector.state.candidates.map(v => v.browserTabKey)).size).toBe(1);
@@ -129,7 +131,8 @@ describe('session and visit state', () => {
     observe(1, 'doc1', page('b'), 1500); expect(collector.state.candidates).toHaveLength(1);
     observe(1, 'doc1', page('b', bodyB), 2000); observe(1, 'doc1', page('b', bodyB), 3000);
     expect(collector.state.candidates).toHaveLength(2);
-    expect(collector.current(1)?.sequence).toBe(2);
+    expect(collector.current(1)?.sequence).toBeNull(); // Open preview has no server sequence yet.
+    expect(collector.status(3000).readyVisits.map(v => v.sequence)).toEqual([1]);
     expect(collector.status(3000).visits.map(v => v.normalizedUrl)).toEqual(['https://example.com/post', 'https://example.com/post']);
   });
   it('detects content-before-history updates using the frozen document baseline', () => {
@@ -171,8 +174,8 @@ describe('session and visit state', () => {
   it('recovers ids, sequences, duration and session after worker rehydration', () => {
     collector.start('공개 문서 찾기', 0); collector.foreground(1, 0); collector.navigate(1, 'doc1', 'a', 'new', 0); observe();
     const state = structuredClone(collector.state); collector = new Collector(state, () => 'newId');
-    expect(collector.status(2000).visits[0]).toMatchObject({ visitId: state.candidates[0].visitId, sequence: 1, activeDurationMs: 2000 });
-    collector.navigate(2, 'doc2', 'b', 'new', 2000); expect(collector.current(2)?.sequence).toBe(2);
+    expect(collector.status(2000).visits[0]).toMatchObject({ visitId: state.candidates[0].visitId, sequence: null, activeDurationMs: 2000 });
+    collector.navigate(2, 'doc2', 'b', 'new', 2000); expect(collector.current(2)?.sequence).toBeNull();
   });
   it('stops safely at bounded development storage capacity', () => {
     collector.start('공개 문서 찾기', 0);
@@ -180,11 +183,13 @@ describe('session and visit state', () => {
     expect(collector.state.candidates).toHaveLength(MAX_CANDIDATES); expect(collector.state.capacityReached).toBe(true);
     expect(collector.state.foregroundTabId).toBeNull();
   });
-  it('serializes simultaneous tabs, allows excluded sequence gaps, and survives operation failure', async () => {
+  it('serializes candidate creation across simultaneous tabs without allocating server sequences, and survives failure', async () => {
     collector.start('공개 문서 찾기', 0); const queue = serialExecutor();
     const events = Array.from({ length: 20 }, (_, i) => queue(async () => { await Promise.resolve(); collector.navigate(i, `doc${i}`, i === 3 ? null : 'a', 'new', 0); }));
     await Promise.all(events);
-    expect(collector.state.candidates.map(v => v.sequence)).toEqual(Array.from({ length: 20 }, (_, i) => i + 1));
+    expect(new Set(collector.state.candidates.map(v => v.visitId)).size).toBe(20);
+    expect(collector.state.candidates.every(v => v.sequence === null)).toBe(true);
+    expect(collector.state.nextSequence).toBe(1);
     expect(collector.state.candidates[3].state).toBe('excluded');
     await expect(queue(async () => { throw new Error('test'); })).rejects.toThrow();
     await expect(queue(async () => 42)).resolves.toBe(42);

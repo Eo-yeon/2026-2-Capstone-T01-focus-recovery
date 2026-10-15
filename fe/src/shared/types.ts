@@ -34,7 +34,8 @@ export interface PageSnapshot {
 export interface VisitCandidate {
   visitId: string;
   sessionId: string;
-  sequence: number;
+  sequence: number | null; // Assigned once, in candidate creation order after finalization.
+  finalized: boolean;
   browserTabKey: string;
   visitedAt: string;
   state: 'pending' | 'valid' | 'excluded';
@@ -52,6 +53,7 @@ export interface TabState {
   candidateId: string;
 }
 export interface CollectionState {
+  sequenceVersion: 1;
   session: LocalSession | null;
   nextSequence: number;
   tabs: Record<number, TabState>;
@@ -67,7 +69,8 @@ export type PopupMessage = { type: 'status' } | { type: 'start'; goalText: strin
 export interface DevStatus {
   session: LocalSession | null;
   candidates: Omit<VisitCandidate, 'snapshot' | 'activeSince'>[];
-  visits: PageVisit[];
+  visits: (Omit<PageVisit, 'sequence'> & { sequence: number | null })[];
+  readyVisits: PageVisit[]; // Only these have immutable, contiguous server sequences.
   capacityReached: boolean;
 }
 export interface Reply {

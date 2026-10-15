@@ -51,7 +51,8 @@ describe('search candidate lifecycle', () => {
   it('creates new visits on full back/forward search navigation with the same normalized URL', () => {
     observe(search(), 1000); collector.navigate(1, 'next', 'b', 'new', 1100); observe(search('b', '우주', '행성'), 2100);
     collector.navigate(1, 'doc', 'a', 'new', 2200); observe(search(), 3200);
-    expect(collector.status(3200).visits.map(v => v.sequence)).toEqual([1, 2, 3]);
+    collector.stop(3200);
+    expect(collector.status(3200).readyVisits.map(v => v.sequence)).toEqual([1, 2, 3]);
     expect(new Set(collector.status(3200).visits.map(v => v.visitId)).size).toBe(3);
   });
   it('ignores query-only and UI changes, then creates a SPA visit for query plus actual short result change', () => {
@@ -73,11 +74,15 @@ describe('search candidate lifecycle', () => {
   });
   it('restores search evidence and the pending lifecycle through worker restart', () => {
     observe(search(), 500); const saved = structuredClone(collector.state); collector = new Collector(saved, () => 'new');
-    observe(search(), 1000); expect(collector.status(1000).visits[0]).toMatchObject({ visitId: saved.candidates[0].visitId, sequence: 1, searchQuery: 'JWT' });
+    observe(search(), 1000); expect(collector.status(1000).visits[0]).toMatchObject({ visitId: saved.candidates[0].visitId, sequence: null, searchQuery: 'JWT' });
+    collector.stop(1000);
+    expect(collector.status(1000).readyVisits[0]).toMatchObject({ visitId: saved.candidates[0].visitId, sequence: 1 });
   });
-  it('allocates unique sequence numbers for concurrent search tabs', async () => {
+  it('keeps concurrent search candidates in creation order without premature sequence allocation', async () => {
     const queue = serialExecutor(); const id = collector.state.session!.sessionId;
     await Promise.all([2, 3].map(tab => queue(async () => { collector.navigate(tab, `doc${tab}`, 'b', 'new', 1000); collector.observe(tab, `doc${tab}`, id, search('b'), undefined, 1000); })));
-    expect(collector.state.candidates.map(v => v.sequence)).toEqual([1, 2, 3]);
+    expect(collector.state.candidates.map(v => v.browserTabKey)).toHaveLength(3);
+    expect(new Set(collector.state.candidates.map(v => v.visitId)).size).toBe(3);
+    expect(collector.state.candidates.map(v => v.sequence)).toEqual([null, null, null]);
   });
 });

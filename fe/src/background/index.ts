@@ -10,7 +10,7 @@ const ready = (async () => {
   await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
   await chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
   const saved = await chrome.storage.session.get('collection');
-  if (saved.collection) collector.state = saved.collection as CollectionState;
+  if (saved.collection) collector.restore(saved.collection as CollectionState);
   // Browser restart/extension reload loses session storage: require a new explicit start.
   else await chrome.storage.local.remove('activeSession');
 })();

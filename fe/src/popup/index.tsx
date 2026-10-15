@@ -47,7 +47,7 @@ function App() {
     <button disabled={busy} onClick={() => void request({ type: 'status' })}>상태 새로고침</button>
     <button disabled={busy || Boolean(status?.session)} onClick={() => { setInspect(false); void request({ type: 'clear' }); }}>로컬 기록 삭제</button>
     <label><input type="checkbox" checked={inspect} onChange={event => setInspect(event.target.checked)} /> 수집 데이터 표시 (본문이 화면에 나타납니다)</label>
-    {inspect && <pre>{JSON.stringify({ candidates: status?.candidates, visits: status?.visits }, null, 2)}</pre>}
+    {inspect && <pre>{JSON.stringify({ candidates: status?.candidates, visits: status?.visits, readyVisits: status?.readyVisits }, null, 2)}</pre>}
   </main>;
 }
 createRoot(document.getElementById('root')!).render(<App />);
