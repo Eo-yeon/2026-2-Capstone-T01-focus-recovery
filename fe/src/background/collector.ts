@@ -4,10 +4,29 @@ import { validSearchQuery } from '../shared/url';
 import { resumeActiveTime, settleActiveTime } from './active-time';
 export const MAX_CANDIDATES = 200;
 export function emptyState(): CollectionState {
-  return { session: null, nextSequence: 1, tabs: {}, candidates: [], foregroundTabId: null, capacityReached: false };
+  return { sequenceVersion: 1, session: null, nextSequence: 1, tabs: {}, candidates: [], foregroundTabId: null, capacityReached: false };
 }
 export class Collector {
-  constructor(public state = emptyState(), private uuid = () => crypto.randomUUID() as string) {}
+  constructor(public state = emptyState(), private uuid = () => crypto.randomUUID() as string) {
+    this.restore(state);
+  }
+  restore(state: CollectionState): void {
+    this.state = state;
+    // Legacy checkpoints were local-only: retain IDs/content, discard candidate sequence gaps.
+    if (state.sequenceVersion !== 1) {
+      const openIds = new Set(state.session ? Object.values(state.tabs).map(tab => tab.candidateId) : []);
+      this.state = { ...state, sequenceVersion: 1, nextSequence: 1, candidates: state.candidates.map(candidate => ({ ...candidate, sequence: null, finalized: !openIds.has(candidate.visitId) || (candidate.state === 'excluded' && candidate.reason !== 'unavailable-content') })) };
+      if (state.capacityReached) for (const key of Object.keys(state.tabs)) this.pause(Number(key), Date.now(), true);
+      this.assignSequences();
+    }
+  }
+  private assignSequences(): void {
+    // An open candidate can still recover or be excluded; never let later visits overtake it.
+    for (const candidate of this.state.candidates) {
+      if (!candidate.finalized) break;
+      if (candidate.state === 'valid' && candidate.sequence === null) candidate.sequence = this.state.nextSequence++;
+    }
+  }
   start(goalText: string, now: number): void {
     if (this.state.session) throw new Error('이미 활성 세션이 있습니다.');
     const trimmed = goalText.trim();
@@ -34,13 +53,21 @@ export class Collector {
     candidate.reason = reason;
     candidate.activeSince = null;
     delete candidate.snapshot;
+    if (reason !== 'unavailable-content') {
+      candidate.finalized = true;
+      this.assignSequences();
+    }
   }
   private pause(tabId: number, now: number, final = false): void {
     const candidate = this.current(tabId);
-    if (!candidate) return;
+    if (!candidate || candidate.finalized) return;
     settleActiveTime(candidate, now);
     this.validate(candidate);
     if (final && candidate.state === 'pending') this.exclude(candidate, candidate.snapshot ? (!this.hasContent(candidate.snapshot) ? 'short-content' : 'short-duration') : 'unavailable-content');
+    if (final) {
+      candidate.finalized = true;
+      this.assignSequences();
+    }
   }
   foreground(tabId: number | null, now: number): void {
     const old = this.state.foregroundTabId;
@@ -48,7 +75,7 @@ export class Collector {
     this.state.foregroundTabId = tabId;
     if (tabId !== null && this.state.session) {
       const candidate = this.current(tabId);
-      if (candidate && !this.state.tabs[tabId]?.navigationFailed) resumeActiveTime(candidate, now);
+      if (candidate && !candidate.finalized && !this.state.tabs[tabId]?.navigationFailed) resumeActiveTime(candidate, now);
     }
   }
   navigate(tabId: number, documentId: string, identity: string | null, kind: 'new' | 'reload' | 'existing' | 'spa', now: number): void {
@@ -69,11 +96,12 @@ export class Collector {
     if (this.state.candidates.length >= MAX_CANDIDATES) {
       this.state.capacityReached = true;
       this.foreground(null, now);
+      for (const key of Object.keys(this.state.tabs)) this.pause(Number(key), now, true);
       return;
     }
     const visitId = this.uuid();
     const candidate: VisitCandidate = {
-      visitId, sessionId: this.state.session.sessionId, sequence: this.state.nextSequence++,
+      visitId, sessionId: this.state.session.sessionId, sequence: null, finalized: false,
       browserTabKey: old?.browserTabKey ?? this.uuid(), visitedAt: new Date(now).toISOString(),
       state: 'pending', activeDurationMs: 0, activeSince: this.state.foregroundTabId === tabId ? now : null,
     };
@@ -86,6 +114,7 @@ export class Collector {
     const tab = this.state.tabs[tabId];
     if (!tab || tab.documentId !== documentId || tab.navigationFailed) return;
     let candidate = this.current(tabId)!;
+    if (candidate.finalized) return;
     if (reason === 'dom-policy' || reason === 'url-policy' || reason === 'search-pending' || (snapshot?.isSearchResultPage && !this.hasContent(snapshot))) {
       if (candidate.state !== 'valid' || reason === 'dom-policy' || reason === 'url-policy') this.exclude(candidate, reason ?? 'search-pending');
       return;
@@ -141,10 +170,11 @@ export class Collector {
   }
   status(now: number): DevStatus {
     if (this.state.session && this.state.foregroundTabId !== null) this.foreground(this.state.foregroundTabId, now);
-    const visits: PageVisit[] = this.state.candidates.filter(candidate => candidate.state === 'valid' && candidate.snapshot).map(candidate => {
+    const visits: DevStatus['visits'] = this.state.candidates.filter(candidate => candidate.state === 'valid' && candidate.snapshot).map(candidate => {
       const { identity: _, organicResultCount: __, ...snapshot } = candidate.snapshot!;
       return { ...snapshot, visitId: candidate.visitId, sessionId: candidate.sessionId, sequence: candidate.sequence, browserTabKey: candidate.browserTabKey, visitedAt: candidate.visitedAt, searchQuery: snapshot.searchQuery ?? null, activeDurationMs: candidate.activeDurationMs, tabSwitchCount: null, behaviorVersion: null };
     });
-    return { session: this.state.session, capacityReached: this.state.capacityReached, visits, candidates: this.state.candidates.map(({ snapshot: _, activeSince: __, ...candidate }) => candidate) };
+    const readyVisits = visits.filter((visit): visit is PageVisit => visit.sequence !== null);
+    return { session: this.state.session, capacityReached: this.state.capacityReached, visits, readyVisits, candidates: this.state.candidates.map(({ snapshot: _, activeSince: __, ...candidate }) => candidate) };
   }
 }

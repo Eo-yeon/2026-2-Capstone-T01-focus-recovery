@@ -61,7 +61,7 @@ npm run dev
 
 ## 수집 및 방문 정책
 
-`src/background/collector.ts`가 후보·유효 방문·제외 상태를 관리하고 Background의 단일 비동기 직렬 실행기가 이벤트 처리와 checkpoint 저장을 순서대로 수행합니다. `visitId` 및 세션 내 `browserTabKey`는 UUID v4이며 `sequence`는 후보 생성 시 증가합니다. 제외된 후보의 번호는 재사용하지 않습니다.
+`src/background/collector.ts`가 후보·유효 방문·제외 상태를 관리하고 Background의 단일 비동기 직렬 실행기가 이벤트 처리와 checkpoint 저장을 순서대로 수행합니다. `visitId` 및 세션 내 `browserTabKey`는 UUID v4입니다. Issue #26부터 후보 배열의 생성 순서를 유지하고, 앞에서부터 판정이 종료된 후보 중 유효 방문에만 `sequence`를 1부터 연속 부여합니다. 복구 불가능한 제외는 즉시 판정을 종료하고, 나머지는 문서/SPA 교체·탭 닫기·세션 종료·수집 한도 도달로 종료하며, 새로고침·탭 전환은 기존 방문을 유지합니다. 열린 후보는 검색 결과 복구나 민감 DOM 제외가 가능하므로 뒤의 방문보다 늦게 유효해져도 원래 순서를 보장하도록 기다립니다.
 
 | 상황 | 처리 |
 | --- | --- |
@@ -96,11 +96,13 @@ SPA 본문은 32자 조각이 이전/현재 본문에 포함되는 양방향 비
 
 ## 데이터 상태 및 BE 계약 경계
 
-`VisitCandidate`는 `pending | valid | excluded`입니다. 제외 시 본문 payload를 지우고 이유와 식별 정보만 유지합니다. popup에는 후보 상태 요약과 유효 방문 `PageVisit` 배열을 구분해 표시합니다. BE 전송 데이터는 아직 만들지 않습니다.
+`VisitCandidate`는 `pending | valid | excluded`와 판정 종료 여부 `finalized`를 가집니다. 제외 시 본문 payload를 지우고 이유와 식별 정보만 유지합니다. popup의 로컬 미리보기 `visits`는 유효하지만 순서 미확정인 방문(`sequence: null`)도 표시합니다. `readyVisits: PageVisit[]`에는 앞선 후보가 모두 종료되어 서버 전송 순서가 확정된 방문만 포함됩니다. 확정된 번호·visitId·방문 원본은 유지되며 제외 후보는 번호를 소비하지 않습니다. 앞선 열린 탭 때문에 `readyVisits`가 지연될 수 있습니다. 실제 HTTP 요청과 ACK 큐는 아직 구현하지 않습니다.
+
+Worker checkpoint에는 `sequenceVersion: 1`을 저장합니다. 이전 개발용 checkpoint는 기존 ID·본문·체류시간·후보 순서를 보존해 복구하고 과거 후보 번호를 새 정책으로 변환합니다. 이전 버전은 서버 전송을 하지 않았으므로 이미 전송된 번호를 변경하는 마이그레이션이 아닙니다. 브라우저/확장 reload 후에는 기존대로 session storage를 복구하지 않고 명시적 새 시작을 요구합니다.
 
 | 유효 `PageVisit` 필드 | 값 |
 | --- | --- |
-| `visitId`, `sessionId`, `sequence`, `browserTabKey` | FE UUID v4, 현재 로컬 세션 UUID, 후보 순서, 세션 내 탭 UUID |
+| `visitId`, `sessionId`, `sequence`, `browserTabKey` | FE UUID v4, 현재 로컬 세션 UUID, 확정 유효 방문 순서(미리보기는 null 가능), 세션 내 탭 UUID |
 | `normalizedUrl`, `domain`, `title`, `content` | 정책 통과한 정규화 URL, hostname, 제한된 제목/주요 본문 |
 | `visitedAt`, `activeDurationMs` | 후보 관찰 UTC ISO 시각, 누적 최소 활성시간(ms) |
 | `isSearchResultPage`, `searchQuery` | 검색 방문은 `true`와 실제 URL 검색어, 일반 HTML은 `false`와 `null` |
