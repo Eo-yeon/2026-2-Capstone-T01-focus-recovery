@@ -26,6 +26,7 @@ import com.focusrecovery.domain.visit.dto.VisitBehaviorResponse;
 import com.focusrecovery.domain.visit.entity.PageVisit;
 import com.focusrecovery.domain.visit.exception.VisitNotFoundException;
 import com.focusrecovery.domain.visit.repository.PageVisitRepository;
+import com.focusrecovery.domain.window.service.AnalysisWindowService;
 import com.focusrecovery.global.exception.ConflictException;
 
 @Service
@@ -34,12 +35,14 @@ public class PageVisitService {
 	private final WorkSessionRepository workSessionRepository;
 	private final PageVisitRepository pageVisitRepository;
 	private final TransactionTemplate transactionTemplate;
+	private final AnalysisWindowService analysisWindowService;
 
 	public PageVisitService(WorkSessionRepository workSessionRepository, PageVisitRepository pageVisitRepository,
-		TransactionTemplate transactionTemplate) {
+		TransactionTemplate transactionTemplate, AnalysisWindowService analysisWindowService) {
 		this.workSessionRepository = workSessionRepository;
 		this.pageVisitRepository = pageVisitRepository;
 		this.transactionTemplate = transactionTemplate;
+		this.analysisWindowService = analysisWindowService;
 	}
 
 	public record SaveResult(PageVisitResponse visit, boolean created) {
@@ -55,8 +58,9 @@ public class PageVisitService {
 		}
 	}
 
+	// 구간 생성을 세션 단위로 직렬화하려고 처음부터 세션 쓰기 잠금을 잡는다(종료와 같은 세션→방문 순서, 공유→쓰기 전환 없음)
 	private SaveResult saveOrReplay(PageVisit candidate) {
-		WorkSession session = workSessionRepository.findForShareBySessionId(candidate.getSessionId())
+		WorkSession session = workSessionRepository.findForUpdateBySessionId(candidate.getSessionId())
 			.orElseThrow(SessionNotFoundException::new);
 		Optional<SaveResult> replay = replayOrConflict(candidate);
 		if (replay.isPresent()) {
@@ -65,7 +69,9 @@ public class PageVisitService {
 		if (session.getStatus() == WorkSessionStatus.ENDED) {
 			throw sessionEnded();
 		}
+		analysisWindowService.checkOrder(candidate.getSessionId(), candidate.getSequence());
 		pageVisitRepository.saveAndFlush(candidate);
+		analysisWindowService.createWindows(candidate.getSessionId(), Instant.now().truncatedTo(ChronoUnit.MILLIS));
 		return new SaveResult(PageVisitResponse.from(candidate), true);
 	}
 

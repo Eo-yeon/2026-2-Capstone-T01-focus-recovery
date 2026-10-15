@@ -1,5 +1,6 @@
 package com.focusrecovery.domain.visit.repository;
 
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -17,6 +18,17 @@ import jakarta.persistence.LockModeType;
 public interface PageVisitRepository extends JpaRepository<PageVisit, UUID> {
 
 	boolean existsBySessionIdAndSequence(UUID sessionId, int sequence);
+
+	// 구간 구성에는 ID와 순서만 필요하므로 content 등 큰 컬럼을 읽지 않는다
+	List<VisitSequence> findBySessionIdAndSequenceGreaterThanOrderBySequence(UUID sessionId, int sequence);
+
+	Optional<VisitSequence> findByVisitId(UUID visitId);
+
+	interface VisitSequence {
+		UUID getVisitId();
+
+		int getSequence();
+	}
 
 	@Lock(LockModeType.PESSIMISTIC_WRITE)
 	Optional<PageVisit> findForUpdateByVisitIdAndSessionId(UUID visitId, UUID sessionId);
