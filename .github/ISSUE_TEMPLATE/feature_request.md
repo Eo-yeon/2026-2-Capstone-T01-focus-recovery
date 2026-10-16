@@ -3,7 +3,7 @@ name: Feature request
 about: 기능 이슈 템플릿
 title: ''
 labels: ''
-assignees: hyeon-marina
+assignees: ''
 
 ---
 
