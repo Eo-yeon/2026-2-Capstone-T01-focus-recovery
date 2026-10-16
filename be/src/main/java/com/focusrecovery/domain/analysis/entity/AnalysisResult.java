@@ -71,6 +71,9 @@ public class AnalysisResult implements Persistable<UUID> {
 	@Column(name = "requested_at", columnDefinition = "DATETIME(3)", nullable = false, updatable = false)
 	private Instant requestedAt;
 
+	@Column(name = "started_at", columnDefinition = "DATETIME(3)")
+	private Instant startedAt;
+
 	@Column(name = "analyzed_at", columnDefinition = "DATETIME(3)")
 	private Instant analyzedAt;
 
@@ -98,8 +101,9 @@ public class AnalysisResult implements Persistable<UUID> {
 		return analysis;
 	}
 
-	public void start() {
+	public void start(Instant startedAt) {
 		processingStatus = AnalysisStatus.RUNNING;
+		this.startedAt = startedAt;
 	}
 
 	public void finish(AiAnalysisOutcome outcome, Instant completedAt) {
@@ -187,6 +191,10 @@ public class AnalysisResult implements Persistable<UUID> {
 
 	public Instant getRequestedAt() {
 		return requestedAt;
+	}
+
+	public Instant getStartedAt() {
+		return startedAt;
 	}
 
 	public Instant getAnalyzedAt() {
