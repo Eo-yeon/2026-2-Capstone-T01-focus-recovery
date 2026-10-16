@@ -80,7 +80,7 @@ describe('session and visit state', () => {
     collector.start('공개 문서 찾기', 0); collector.foreground(1, 0); collector.navigate(1, 'doc1', 'a', 'new', 0);
     observe(1, 'doc1', page(), 999); expect(collector.status(999).visits).toHaveLength(0);
     observe(); expect(collector.status(1000).visits).toHaveLength(1);
-    expect(collector.status(1000).visits[0]).toMatchObject({ activeDurationMs: 1000, searchQuery: null, tabSwitchCount: null, behaviorVersion: null });
+    expect(collector.status(1000).visits[0]).toMatchObject({ activeDurationMs: 1000, searchQuery: null, tabSwitchCount: 0, behaviorVersion: 2 });
     expect(collector.status(1000).visits[0]).not.toHaveProperty('identity');
   });
   it('excludes short content and short active time on document departure', () => {
@@ -174,7 +174,8 @@ describe('session and visit state', () => {
   it('recovers ids, sequences, duration and session after worker rehydration', () => {
     collector.start('공개 문서 찾기', 0); collector.foreground(1, 0); collector.navigate(1, 'doc1', 'a', 'new', 0); observe();
     const state = structuredClone(collector.state); collector = new Collector(state, () => 'newId');
-    expect(collector.status(2000).visits[0]).toMatchObject({ visitId: state.candidates[0].visitId, sequence: null, activeDurationMs: 2000 });
+    collector.reconcileForeground(1, 2000);
+    expect(collector.status(2000).visits[0]).toMatchObject({ visitId: state.candidates[0].visitId, sequence: null, activeDurationMs: 1000 });
     collector.navigate(2, 'doc2', 'b', 'new', 2000); expect(collector.current(2)?.sequence).toBeNull();
   });
   it('stops safely at bounded development storage capacity', () => {

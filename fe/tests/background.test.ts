@@ -55,6 +55,227 @@ describe('background Chrome adapter', () => {
     expect(memory.collection.candidates[0].state).toBe('valid');
     return { sessionId, clock, snapshot, candidate: structuredClone(memory.collection.candidates[0]) };
   }
+  async function reloadWorker() {
+    vi.resetModules();
+    for (const group of [api.runtime, api.tabs, api.windows, api.webNavigation, api.permissions]) {
+      for (const value of Object.values(group) as any[]) if (value?.listeners) value.listeners.length = 0;
+    }
+    await import('../src/background/index');
+  }
+  it.each(['blur', 'minimize'])('pauses on %s and resumes without counting a tab switch', async mode => {
+    const { clock } = await validVisit();
+    clock.mockReturnValue(12000);
+    api.windows.getAll.mockResolvedValue([{ id: 1, focused: mode === 'minimize', state: mode === 'minimize' ? 'minimized' : 'normal' }]);
+    if (mode === 'blur') api.windows.onFocusChanged.listeners[0](-1);
+    else api.windows.onBoundsChanged.listeners[0]({ id: 1, state: 'minimized' });
+    await message({ type: 'status' });
+    clock.mockReturnValue(20000);
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 2000, tabSwitchCount: 0 });
+    api.windows.getAll.mockResolvedValue([{ id: 1, focused: true, state: 'normal' }]);
+    api.windows.onFocusChanged.listeners[0](1);
+    await message({ type: 'status' });
+    clock.mockReturnValue(21000);
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 3000, tabSwitchCount: 0 });
+  });
+  it('keeps rapid A → B → A activations even when the live query already reports A', async () => {
+    const { clock } = await validVisit();
+    clock.mockReturnValue(12000);
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
+    clock.mockReturnValue(13000);
+    api.tabs.onActivated.listeners[0]({ tabId: 1, windowId: 1 });
+    api.tabs.onActivated.listeners[0]({ tabId: 1, windowId: 1 });
+    const visit = (await message({ type: 'status' })).status!.visits[0];
+    expect(visit).toMatchObject({ activeDurationMs: 2000, tabSwitchCount: 1 });
+    expect(memory.collection.candidates).toHaveLength(1);
+  });
+  it('ignores an activation in an unfocused window and deduplicates cross-window focus/activation', async () => {
+    const { clock } = await validVisit();
+    clock.mockReturnValue(12000);
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 2 });
+    await message({ type: 'status' });
+    expect(memory.collection.candidates[0].tabSwitchCount).toBe(0);
+    api.windows.onFocusChanged.listeners[0](-1);
+    api.windows.getAll.mockResolvedValue([{ id: 1, focused: false }, { id: 2, focused: true, state: 'normal' }]);
+    api.tabs.query.mockResolvedValue([{ id: 2 }]);
+    api.windows.onFocusChanged.listeners[0](2);
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 2 });
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 2000, tabSwitchCount: 1 });
+    clock.mockReturnValue(20000);
+    api.windows.onFocusChanged.listeners[0](-1);
+    await message({ type: 'status' });
+    expect(memory.collection.candidates[0].tabSwitchCount).toBe(1);
+  });
+  it.each([true, false])('handles close/activation ordering and finalizes the departing behavior (activation first: %s)', async activationFirst => {
+    const { clock } = await validVisit();
+    clock.mockReturnValue(12000);
+    api.tabs.query.mockResolvedValue([{ id: 2 }]);
+    if (activationFirst) api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
+    api.tabs.onRemoved.listeners[0](1);
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
+    const status = (await message({ type: 'status' })).status!;
+    expect(status.readyVisits[0]).toMatchObject({ activeDurationMs: 2000, tabSwitchCount: 1, sequence: 1 });
+    expect(memory.collection.tabs[1]).toBeUndefined();
+  });
+  it('settles at event arrival time even when a Chrome query delays processing', async () => {
+    const { clock } = await validVisit();
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    api.tabs.query.mockImplementationOnce(async () => { entered(); await gate; return [{ id: 2 }]; });
+    clock.mockReturnValue(12000);
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
+    await started;
+    clock.mockReturnValue(20000);
+    release();
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 2000, tabSwitchCount: 1 });
+  });
+  it('recovers on a real activation without inferring activity since the last checkpoint', async () => {
+    const { clock } = await validVisit();
+    clock.mockReturnValue(15000);
+    api.tabs.query.mockResolvedValue([{ id: 2 }]);
+    await reloadWorker();
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 1000, tabSwitchCount: 1 });
+  });
+  it.each(['blur', 'minimize', 'query-failure'])('reconciles %s during worker recovery without charging an unknown gap', async mode => {
+    const { clock } = await validVisit();
+    clock.mockReturnValue(20000);
+    if (mode === 'query-failure') api.windows.getAll.mockRejectedValueOnce(new Error('synthetic query failure'));
+    else api.windows.getAll.mockResolvedValue([{ id: 1, focused: mode === 'minimize', state: mode === 'minimize' ? 'minimized' : 'normal' }]);
+    await reloadWorker();
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 1000, tabSwitchCount: 0 });
+    expect(memory.collection.foregroundTabId).toBeNull();
+  });
+  it('pauses recovery when the browser reports multiple focused windows', async () => {
+    const { clock } = await validVisit();
+    clock.mockReturnValue(20000);
+    api.windows.getAll.mockResolvedValue([{ id: 1, focused: true, state: 'normal' }, { id: 2, focused: true, state: 'normal' }]);
+    await reloadWorker();
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 1000, tabSwitchCount: 0 });
+    expect(memory.collection.foregroundTabId).toBeNull();
+  });
+  it('restores the same active visit and freezes its final behavior after stop and restart', async () => {
+    const { clock } = await validVisit();
+    clock.mockReturnValue(15000);
+    await reloadWorker();
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 1000, tabSwitchCount: 0 });
+    clock.mockReturnValue(16000);
+    const stopped = (await message({ type: 'stop' })).status!;
+    expect(stopped.readyVisits[0]).toMatchObject({ activeDurationMs: 2000, tabSwitchCount: 0 });
+    clock.mockReturnValue(20000);
+    await reloadWorker();
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
+    expect((await message({ type: 'status' })).status).toEqual(stopped);
+  });
+  it('does not resume when a tab is selected inside a minimized window', async () => {
+    const { clock } = await validVisit();
+    clock.mockReturnValue(12000);
+    api.windows.onBoundsChanged.listeners[0]({ id: 1, state: 'minimized', focused: false });
+    await message({ type: 'status' });
+    clock.mockReturnValue(13000);
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
+    clock.mockReturnValue(20000);
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 2000, tabSwitchCount: 0 });
+    expect(memory.collection.foregroundTabId).toBeNull();
+  });
+  it('resumes an authorized selected document after a transient frame query failure', async () => {
+    const { clock } = await validVisit();
+    clock.mockReturnValue(12000);
+    api.webNavigation.getFrame.mockRejectedValueOnce(new Error('synthetic query failure'));
+    await message({ type: 'context' }, pageSender);
+    clock.mockReturnValue(13000);
+    await message({ type: 'context' }, pageSender);
+    clock.mockReturnValue(14000);
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 3000, tabSwitchCount: 0 });
+  });
+  it('keeps per-window selections in event order across focus and activation interleaving', async () => {
+    const { clock } = await validVisit();
+    frame = { documentId: 'document2', url: 'https://example.com/other' };
+    const other = { ...pageSender, tab: { id: 2 }, documentId: frame.documentId, url: frame.url };
+    await message({ type: 'context' }, other);
+    await message({ type: 'snapshot', sessionId: memory.collection.session.sessionId, snapshot: { ...await describeUrl(frame.url), title: '문서', content: 'x'.repeat(50) } }, other);
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 2 });
+    await message({ type: 'status' }); // A selection in an unfocused window is not a foreground switch.
+    clock.mockReturnValue(12000);
+    api.windows.onFocusChanged.listeners[0](2);
+    clock.mockReturnValue(13000);
+    api.tabs.onActivated.listeners[0]({ tabId: 3, windowId: 2 });
+    clock.mockReturnValue(14000);
+    api.windows.onFocusChanged.listeners[0](1);
+    clock.mockReturnValue(15000);
+    const visits = (await message({ type: 'status' })).status!.visits;
+    expect(visits[0]).toMatchObject({ activeDurationMs: 3000, tabSwitchCount: 1 });
+    expect(visits[1]).toMatchObject({ activeDurationMs: 1000, tabSwitchCount: 1 });
+  });
+  it('does not insert the latest selected tab before replaying post-restart activations', async () => {
+    const { clock } = await validVisit();
+    for (const tabId of [2, 3]) {
+      frame = { documentId: `document${tabId}`, url: `https://example.com/page${tabId}` };
+      const sender = { ...pageSender, tab: { id: tabId }, documentId: frame.documentId, url: frame.url };
+      await message({ type: 'context' }, sender);
+      await message({ type: 'snapshot', sessionId: memory.collection.session.sessionId, snapshot: { ...await describeUrl(frame.url), title: '문서', content: 'x'.repeat(50) } }, sender);
+    }
+    await reloadWorker();
+    api.tabs.query.mockResolvedValue([{ id: 3 }]);
+    clock.mockReturnValue(12000);
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
+    clock.mockReturnValue(13000);
+    api.tabs.onActivated.listeners[0]({ tabId: 3, windowId: 1 });
+    clock.mockReturnValue(14000);
+    const visits = (await message({ type: 'status' })).status!.visits;
+    expect(visits.map(v => v.tabSwitchCount)).toEqual([1, 1, 0]);
+    expect(visits.map(v => v.activeDurationMs)).toEqual([1000, 1000, 1000]);
+  });
+  it('preserves rapid cross-window focus events even when live focus has already returned', async () => {
+    const { clock } = await validVisit();
+    api.tabs.query.mockImplementation(async ({ windowId }: { windowId?: number }) => [{ id: windowId === 2 ? 2 : 1 }]);
+    clock.mockReturnValue(12000);
+    api.windows.onFocusChanged.listeners[0](2);
+    clock.mockReturnValue(13000);
+    api.windows.onFocusChanged.listeners[0](1);
+    const status = (await message({ type: 'status' })).status!;
+    expect(status.visits[0]).toMatchObject({ activeDurationMs: 2000, tabSwitchCount: 1 });
+  });
+  it('does not backdate a live browser query from a delayed content registration', async () => {
+    const { clock } = await validVisit();
+    let release!: () => void;
+    let entered!: () => void;
+    const querying = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    api.webNavigation.getFrame.mockImplementationOnce(async () => { entered(); await gate; return frame; });
+    clock.mockReturnValue(12000);
+    const context = message({ type: 'context' }, pageSender);
+    await querying;
+    clock.mockReturnValue(13000);
+    api.tabs.query.mockResolvedValue([{ id: 2 }]);
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
+    release();
+    await context;
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 3000, tabSwitchCount: 1 });
+  });
+  it('ignores a delayed leave from the replaced document without pausing the new visit', async () => {
+    const { clock } = await validVisit();
+    clock.mockReturnValue(12000);
+    frame = { documentId: 'new-document', url: 'https://example.com/other' };
+    const sender = { ...pageSender, documentId: frame.documentId, url: frame.url };
+    await message({ type: 'context' }, sender);
+    await message({ type: 'leave', sessionId: memory.collection.session.sessionId }, pageSender);
+    clock.mockReturnValue(13000);
+    await message({ type: 'snapshot', sessionId: memory.collection.session.sessionId, snapshot: { ...await describeUrl(frame.url), title: '문서', content: 'x'.repeat(50) } }, sender);
+    const status = (await message({ type: 'status' })).status!;
+    expect(status.visits[1]).toMatchObject({ activeDurationMs: 1000 });
+    expect(memory.collection.foregroundTabId).toBe(1);
+  });
+  it('reconciles focus when the first post-restart event only closes a background tab', async () => {
+    const { clock } = await validVisit();
+    clock.mockReturnValue(20000);
+    api.windows.getAll.mockResolvedValue([{ id: 1, focused: false, state: 'normal' }]);
+    await reloadWorker();
+    api.tabs.onRemoved.listeners[0](2);
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 1000, tabSwitchCount: 0 });
+    expect(memory.collection.foregroundTabId).toBeNull();
+  });
   it.each([undefined, 'documentB', 'document1'])('preserves A when B fails with error document id %s', async documentId => {
     const { sessionId, candidate } = await validVisit();
     frame.errorOccurred = true;
@@ -84,11 +305,11 @@ describe('background Chrome adapter', () => {
     const { sessionId, candidate } = await validVisit();
     if (target === 'windows') api.windows.getAll.mockRejectedValueOnce(new Error('synthetic query failure'));
     else api.tabs.query.mockRejectedValueOnce(new Error('synthetic query failure'));
-    api.tabs.onActivated.listeners[0]({ tabId: 1 });
+    api.windows.onBoundsChanged.listeners[0]({ id: 1, focused: true, state: 'normal' });
     expect((await message({ type: 'status' })).status?.session?.sessionId).toBe(sessionId);
     expect(memory.collection.foregroundTabId).toBeNull();
     expect(memory.collection.candidates[0].snapshot).toEqual(candidate.snapshot);
-    api.tabs.onActivated.listeners[0]({ tabId: 1 });
+    api.windows.onBoundsChanged.listeners[0]({ id: 1, focused: true, state: 'normal' });
     expect((await message({ type: 'status' })).status?.session?.sessionId).toBe(sessionId);
     expect(memory.collection.foregroundTabId).toBe(1);
   });
@@ -155,6 +376,7 @@ describe('background Chrome adapter', () => {
     frame = { documentId: 'document2', url: 'https://example.com/other' };
     api.tabs.query.mockResolvedValue([{ id: 2 }]);
     const other = { ...pageSender, tab: { id: 2 }, documentId: frame.documentId, url: frame.url };
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
     await message({ type: 'context' }, other);
     clock.mockReturnValue(12000);
     await message({ type: 'snapshot', sessionId, snapshot: { ...snapshot, ...await describeUrl(frame.url) } }, other);
@@ -284,7 +506,7 @@ describe('background Chrome adapter', () => {
     await Promise.all([first, second]);
     const ids = memory.collection.candidates.map((c: any) => c.visitId);
     api.tabs.query.mockResolvedValue([{ id: 2 }]);
-    api.tabs.onActivated.listeners[0]({ tabId: 2 });
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
     await message({ type: 'status' });
     const payload = async (url: string) => ({ ...await describeUrl(url), title: '공개 문서', content: 'x'.repeat(50) });
     clock.mockReturnValue(11000);
@@ -294,7 +516,7 @@ describe('background Chrome adapter', () => {
     expect(memory.collection.candidates[1]).toMatchObject({ state: 'valid', finalized: true, sequence: null });
     clock.mockReturnValue(12000);
     api.tabs.query.mockResolvedValue([{ id: 1 }]);
-    api.tabs.onActivated.listeners[0]({ tabId: 1 });
+    api.tabs.onActivated.listeners[0]({ tabId: 1, windowId: 1 });
     await message({ type: 'status' });
     clock.mockReturnValue(13000);
     await message({ type: 'snapshot', sessionId, snapshot: await payload(frames[1].url) }, pageSender);

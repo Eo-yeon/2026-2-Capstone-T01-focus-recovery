@@ -6,11 +6,17 @@ import type { CollectionState, Reply } from '../shared/types';
 
 const enqueue = serialExecutor();
 const collector = new Collector();
+let needsForegroundRecovery = false;
+let focusedWindowId: number | null | undefined;
+const activeWindowTabs = new Map<number, number>();
 const ready = (async () => {
   await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
   await chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
   const saved = await chrome.storage.session.get('collection');
-  if (saved.collection) collector.restore(saved.collection as CollectionState);
+  if (saved.collection) {
+    collector.restore(saved.collection as CollectionState);
+    needsForegroundRecovery = true;
+  }
   // Browser restart/extension reload loses session storage: require a new explicit start.
   else await chrome.storage.local.remove('activeSession');
 })();
@@ -21,11 +27,18 @@ async function persist() {
   if (collector.state.session) await chrome.storage.local.set({ activeSession: collector.state.session });
   else await chrome.storage.local.remove('activeSession');
 }
-function dispatch<T>(operation: () => Promise<T>): Promise<T> {
+function dispatch<T>(operation: (now: number) => Promise<T>, foregroundEvent = false): Promise<T> {
+  const now = Date.now();
   return enqueue(async () => {
     try {
       await ready;
-      const result = await operation();
+      if (needsForegroundRecovery) {
+        needsForegroundRecovery = false;
+        // No checkpoint proves what happened during suspension, even for matching endpoints.
+        collector.reconcileForeground(null, now);
+        if (!foregroundEvent) await refreshForeground(now);
+      }
+      const result = await operation(now);
       await persist();
       return result;
     } catch (error) {
@@ -41,21 +54,48 @@ function dispatch<T>(operation: () => Promise<T>): Promise<T> {
     }
   });
 }
-function event(operation: () => Promise<unknown>) {
+function event(operation: (now: number) => Promise<unknown>, foregroundEvent = false) {
   // Never log raw URLs, payloads, goals or platform error messages.
-  void dispatch(operation).catch(() => undefined);
+  void dispatch(operation, foregroundEvent).catch(() => undefined);
 }
 async function readBrowserState<T>(query: () => Promise<T>): Promise<T | undefined> {
   // Only browser state queries are recoverable here; storage and unknown errors escape.
   try { return await query(); }
   catch { return undefined; }
 }
-async function refreshForeground() {
+async function readFocusedWindow(): Promise<number | null | undefined> {
   const windows = await readBrowserState(() => chrome.windows.getAll());
-  const focused = windows?.find(window => window.focused && window.state !== 'minimized');
-  const tabs = focused?.id === undefined ? [] : await readBrowserState(() => chrome.tabs.query({ active: true, windowId: focused.id }));
-  // Unknown focus is a pause, never an assumed active tab.
-  collector.foreground(tabs?.[0]?.id ?? null, Date.now());
+  if (windows === undefined) return undefined;
+  const focused = windows.filter(window => window.focused && window.state !== 'minimized');
+  return focused.length > 1 ? undefined : focused[0]?.id ?? null;
+}
+async function refreshForeground(now: number) {
+  collector.foreground(null, now);
+  const windowId = focusedWindowId = await readFocusedWindow();
+  const tabs = windowId == null ? [] : await readBrowserState(() => chrome.tabs.query({ active: true, windowId }));
+  const tabId = tabs?.[0]?.id ?? null;
+  if (tabs === undefined) focusedWindowId = undefined;
+  if (windowId != null && tabId !== null) activeWindowTabs.set(windowId, tabId);
+  // Queries describe their completion time, never an earlier queued event's foreground.
+  collector.foreground(tabId, Math.max(now, Date.now()));
+}
+async function resumeDocument(tabId: number, now: number) {
+  if (focusedWindowId === undefined) await refreshForeground(now);
+  else if (focusedWindowId !== null && collector.state.foregroundTabId === null && activeWindowTabs.get(focusedWindowId) === tabId) collector.foreground(tabId, now);
+}
+async function focusWindow(windowId: number, tabId: number | undefined, now: number) {
+  focusedWindowId = windowId === chrome.windows.WINDOW_ID_NONE || windowId === -1 ? null : windowId;
+  collector.foreground(null, now);
+  if (focusedWindowId === null) return;
+  if (tabId !== undefined) collector.foreground(tabId, now);
+  else {
+    const tabs = await readBrowserState(() => chrome.tabs.query({ active: true, windowId }));
+    const observed = tabs?.[0]?.id;
+    if (observed !== undefined) {
+      activeWindowTabs.set(windowId, observed);
+      collector.foreground(observed, Math.max(now, Date.now()));
+    }
+  }
 }
 async function hasPermission(raw: string) {
   try { return await chrome.permissions.contains({ origins: [`${new URL(raw).origin}/*`] }); }
@@ -89,16 +129,16 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
   const popup = sender.url === chrome.runtime.getURL('popup.html');
   const tabId = sender.tab?.id;
   if (popup ? !isPopupMessage(message) : !isContentMessage(message) || tabId === undefined || sender.frameId !== 0 || !sender.documentId || sender.documentLifecycle !== 'active') return false;
-  void dispatch(async (): Promise<Reply> => {
+  void dispatch(async (now): Promise<Reply> => {
     if (popup && isPopupMessage(message)) {
       if (message.type === 'start') {
-        try { collector.start(message.goalText, Date.now()); }
+        try { collector.start(message.goalText, now); }
         catch { return { ok: false, error: '활성 세션이 있거나 목표가 5~150자 범위를 벗어났습니다.' }; }
-        await refreshForeground();
+        await refreshForeground(now);
         await syncScripts();
         await broadcast();
       } else if (message.type === 'stop') {
-        collector.stop(Date.now());
+        collector.stop(now);
         await broadcast();
       } else if (message.type === 'clear') {
         if (collector.state.session) return { ok: false, error: '세션 종료 후 기록을 지워 주세요.' };
@@ -107,33 +147,34 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
         await syncScripts();
         await broadcast();
       }
-      return { ok: true, status: collector.status(Date.now()) };
+      return { ok: true, status: collector.status(now) };
     }
     if (tabId === undefined || !sender.documentId || !isContentMessage(message)) return { ok: false };
     if (!collector.state.session || collector.state.capacityReached) return { ok: true, sessionId: null };
     if (message.type !== 'context' && message.sessionId !== collector.state.session.sessionId) return { ok: true, sessionId: null };
     const frame = await readBrowserState(() => chrome.webNavigation.getFrame({ tabId, frameId: 0 }));
-    if (!frame || frame.documentId !== sender.documentId || !await hasPermission(frame.url)) {
-      if (collector.state.foregroundTabId === tabId) collector.foreground(null, Date.now());
+    if (frame && frame.documentId !== sender.documentId) return { ok: true, sessionId: null };
+    if (!frame || !await hasPermission(frame.url)) {
+      if (collector.state.foregroundTabId === tabId) collector.foreground(null, now);
       return { ok: true, sessionId: null };
     }
     if (frame.errorOccurred) {
       const url = await describeUrl(frame.url);
-      collector.navigationError(tabId, frame.documentId, url?.identity ?? null, Date.now());
-      if (collector.state.foregroundTabId === tabId && !collector.state.tabs[tabId]?.navigationFailed) collector.foreground(null, Date.now());
+      collector.navigationError(tabId, frame.documentId, url?.identity ?? null, now);
+      if (collector.state.foregroundTabId === tabId && !collector.state.tabs[tabId]?.navigationFailed) collector.foreground(null, now);
       return { ok: true, sessionId: null };
     }
     if (message.type === 'context') {
       const url = await describeUrl(frame.url);
-      collector.navigate(tabId, sender.documentId, url?.identity ?? null, 'existing', Date.now());
-      await refreshForeground();
+      collector.navigate(tabId, sender.documentId, url?.identity ?? null, 'existing', now);
+      await resumeDocument(tabId, now);
     } else if (message.type === 'leave') {
-      collector.leave(tabId, sender.documentId, Date.now());
+      collector.leave(tabId, sender.documentId, now);
     } else {
       const expected = await describeUrl(frame.url);
       const snapshot = message.snapshot;
       if (snapshot && (!expected || Object.keys(expected).some(key => key === 'searchQuery' ? expected.searchQuery !== (snapshot.searchQuery ?? null) : expected[key as keyof typeof expected] !== snapshot[key as keyof typeof expected]))) return { ok: false };
-      collector.observe(tabId, sender.documentId, message.sessionId, snapshot, message.reason, Date.now());
+      collector.observe(tabId, sender.documentId, message.sessionId, snapshot, message.reason, now);
     }
     return { ok: true, sessionId: collector.state.session?.sessionId ?? null };
   }).then(sendResponse).catch(() => {
@@ -143,19 +184,19 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
 });
 chrome.webNavigation.onCommitted.addListener(details => {
   if (details.frameId !== 0) return;
-  event(async () => {
+  event(async now => {
     if (!collector.state.session) return;
     const frame = await readBrowserState(() => chrome.webNavigation.getFrame({ tabId: details.tabId, frameId: 0 }));
     if (!frame) {
-      if (collector.state.foregroundTabId === details.tabId) collector.foreground(null, Date.now());
+      if (collector.state.foregroundTabId === details.tabId) collector.foreground(null, now);
       return;
     }
     if (frame.documentId !== details.documentId) return;
     const allowed = await hasPermission(details.url);
     const url = allowed ? await describeUrl(details.url) : null;
-    collector.navigate(details.tabId, details.documentId, url?.identity ?? null, details.transitionType === 'reload' ? 'reload' : 'new', Date.now());
-    if (frame.errorOccurred) collector.navigationError(details.tabId, frame.documentId, url?.identity ?? null, Date.now());
-    await refreshForeground();
+    collector.navigate(details.tabId, details.documentId, url?.identity ?? null, details.transitionType === 'reload' ? 'reload' : 'new', now);
+    if (frame.errorOccurred) collector.navigationError(details.tabId, frame.documentId, url?.identity ?? null, now);
+    await resumeDocument(details.tabId, now);
     await chrome.tabs.sendMessage(details.tabId, { type: 'capture' }).catch(() => undefined);
   });
 });
@@ -165,12 +206,31 @@ chrome.webNavigation.onHistoryStateUpdated.addListener(details => {
     if (collector.state.session) await chrome.tabs.sendMessage(details.tabId, { type: 'capture' }).catch(() => undefined);
   });
 });
-chrome.tabs.onActivated.addListener(() => event(async () => { await refreshForeground(); await broadcast(); }));
-chrome.windows.onFocusChanged.addListener(() => event(async () => { await refreshForeground(); await broadcast(); }));
-chrome.windows.onBoundsChanged.addListener(() => event(refreshForeground));
-chrome.tabs.onRemoved.addListener(tabId => event(async () => { collector.removeTab(tabId, Date.now()); }));
+chrome.tabs.onActivated.addListener(info => {
+  activeWindowTabs.set(info.windowId, info.tabId);
+  event(async now => {
+    if (focusedWindowId === undefined) focusedWindowId = await readFocusedWindow();
+    if (info.windowId === focusedWindowId) collector.foreground(info.tabId, now);
+    await broadcast();
+  }, true);
+});
+chrome.windows.onFocusChanged.addListener(windowId => {
+  // Capture the known selection before later activation events change the per-window cache.
+  const tabId = activeWindowTabs.get(windowId);
+  event(async now => { await focusWindow(windowId, tabId, now); await broadcast(); }, true);
+});
+chrome.windows.onBoundsChanged.addListener(window => event(async now => {
+  if (window.id === focusedWindowId && window.state === 'minimized') {
+    focusedWindowId = null;
+    collector.foreground(null, now);
+  } else if (focusedWindowId === undefined || window.focused) await refreshForeground(now);
+}, true));
+chrome.tabs.onRemoved.addListener(tabId => {
+  for (const [windowId, active] of activeWindowTabs) if (active === tabId) activeWindowTabs.delete(windowId);
+  event(async now => { collector.removeTab(tabId, now); });
+});
 chrome.webNavigation.onErrorOccurred.addListener(details => {
-  if (details.frameId === 0) event(async () => {
+  if (details.frameId === 0) event(async now => {
     const tab = collector.state.tabs[details.tabId];
     if (!collector.state.session || !details.documentId || tab?.documentId !== details.documentId) return;
     const url = await describeUrl(details.url);
@@ -178,13 +238,13 @@ chrome.webNavigation.onErrorOccurred.addListener(details => {
     const frame = await readBrowserState(() => chrome.webNavigation.getFrame({ tabId: details.tabId, frameId: 0 }));
     if (!frame?.errorOccurred || frame.documentId !== details.documentId) return;
     const currentUrl = await describeUrl(frame.url);
-    if (currentUrl?.identity === url.identity) collector.navigationError(details.tabId, details.documentId, url.identity, Date.now());
+    if (currentUrl?.identity === url.identity) collector.navigationError(details.tabId, details.documentId, url.identity, now);
   });
 });
 chrome.permissions.onAdded.addListener(() => event(syncScripts));
-chrome.permissions.onRemoved.addListener(() => event(async () => {
+chrome.permissions.onRemoved.addListener(() => event(async now => {
   // Revocation is privacy-sensitive: stop and erase all in-memory samples.
-  collector.stop(Date.now());
+  collector.stop(now);
   collector.state = emptyState();
   await syncScripts();
   await broadcast();

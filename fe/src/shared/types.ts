@@ -4,7 +4,12 @@ export interface LocalSession {
   startedAt: string;
   source: 'development-local';
 }
-export interface PageVisit {
+export interface VisitBehavior {
+  activeDurationMs: number;
+  tabSwitchCount: number;
+  behaviorVersion: number;
+}
+export interface PageVisit extends VisitBehavior {
   visitId: string;
   sessionId: string;
   sequence: number;
@@ -16,9 +21,6 @@ export interface PageVisit {
   visitedAt: string;
   isSearchResultPage: boolean;
   searchQuery: string | null;
-  activeDurationMs: number;
-  tabSwitchCount: null; // Unmeasured, never fabricate zero.
-  behaviorVersion: null; // FE-005/006 will define snapshot updates.
 }
 export type ExclusionReason = 'url-policy' | 'dom-policy' | 'search-pending' | 'short-content' | 'short-duration' | 'unavailable-content' | 'navigation-error';
 export interface PageSnapshot {
@@ -31,7 +33,7 @@ export interface PageSnapshot {
   searchQuery?: string | null; // Absent on older ordinary HTML messages.
   organicResultCount?: number; // Internal extraction evidence; omitted from PageVisit.
 }
-export interface VisitCandidate {
+export interface VisitCandidate extends VisitBehavior {
   visitId: string;
   sessionId: string;
   sequence: number | null; // Assigned once, in candidate creation order after finalization.
@@ -41,8 +43,8 @@ export interface VisitCandidate {
   state: 'pending' | 'valid' | 'excluded';
   reason?: ExclusionReason;
   snapshot?: PageSnapshot;
-  activeDurationMs: number;
   activeSince: number | null;
+  activeTimeCursor: number; // Last clock boundary; a backwards wall clock cannot recount time.
 }
 export interface TabState {
   browserTabKey: string;
@@ -50,6 +52,7 @@ export interface TabState {
   identity: string | null;
   currentIdentity: string | null;
   navigationFailed?: boolean;
+  documentLeft?: boolean;
   candidateId: string;
 }
 export interface CollectionState {
@@ -59,6 +62,8 @@ export interface CollectionState {
   tabs: Record<number, TabState>;
   candidates: VisitCandidate[];
   foregroundTabId: number | null;
+  lastActiveTabId: number | null;
+  lastActiveVisitId: string | null; // Retained across blur/close until the next actual tab is known.
   capacityReached: boolean;
 }
 export type ContentMessage =
@@ -68,7 +73,7 @@ export type ContentMessage =
 export type PopupMessage = { type: 'status' } | { type: 'start'; goalText: string } | { type: 'stop' } | { type: 'clear' } | { type: 'sync-permissions' };
 export interface DevStatus {
   session: LocalSession | null;
-  candidates: Omit<VisitCandidate, 'snapshot' | 'activeSince'>[];
+  candidates: Omit<VisitCandidate, 'snapshot' | 'activeSince' | 'activeTimeCursor'>[];
   visits: (Omit<PageVisit, 'sequence'> & { sequence: number | null })[];
   readyVisits: PageVisit[]; // Only these have immutable, contiguous server sequences.
   capacityReached: boolean;
