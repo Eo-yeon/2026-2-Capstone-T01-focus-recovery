@@ -13,6 +13,7 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import com.focusrecovery.domain.analysis.service.AnalysisRequestService;
 import com.focusrecovery.domain.session.dto.EndWorkSessionRequest;
 import com.focusrecovery.domain.session.entity.WorkSession;
 import com.focusrecovery.domain.session.entity.WorkSessionStatus;
@@ -36,13 +37,16 @@ public class PageVisitService {
 	private final PageVisitRepository pageVisitRepository;
 	private final TransactionTemplate transactionTemplate;
 	private final AnalysisWindowService analysisWindowService;
+	private final AnalysisRequestService analysisRequestService;
 
 	public PageVisitService(WorkSessionRepository workSessionRepository, PageVisitRepository pageVisitRepository,
-		TransactionTemplate transactionTemplate, AnalysisWindowService analysisWindowService) {
+		TransactionTemplate transactionTemplate, AnalysisWindowService analysisWindowService,
+		AnalysisRequestService analysisRequestService) {
 		this.workSessionRepository = workSessionRepository;
 		this.pageVisitRepository = pageVisitRepository;
 		this.transactionTemplate = transactionTemplate;
 		this.analysisWindowService = analysisWindowService;
+		this.analysisRequestService = analysisRequestService;
 	}
 
 	public record SaveResult(PageVisitResponse visit, boolean created) {
@@ -71,7 +75,9 @@ public class PageVisitService {
 		}
 		analysisWindowService.checkOrder(candidate.getSessionId(), candidate.getSequence());
 		pageVisitRepository.saveAndFlush(candidate);
-		analysisWindowService.createWindows(candidate.getSessionId(), Instant.now().truncatedTo(ChronoUnit.MILLIS));
+		Instant now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+		analysisWindowService.createWindows(candidate.getSessionId(), now);
+		analysisRequestService.requestReadyWindows(candidate.getSessionId(), now);
 		return new SaveResult(PageVisitResponse.from(candidate), true);
 	}
 
@@ -100,8 +106,12 @@ public class PageVisitService {
 			throw sessionEnded();
 		}
 
+		Instant now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
 		boolean applied = applyBehavior(visit, request.activeDurationMs(), request.tabSwitchCount(),
-			request.behaviorVersion(), Instant.now().truncatedTo(ChronoUnit.MILLIS));
+			request.behaviorVersion(), now);
+		if (applied) {
+			analysisRequestService.requestWindowsEndingAt(sessionId, visitId, now);
+		}
 		return VisitBehaviorResponse.of(visit, applied);
 	}
 

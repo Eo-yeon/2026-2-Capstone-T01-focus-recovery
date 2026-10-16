@@ -1,0 +1,21 @@
+CREATE TABLE analysis_result (
+    analysis_id       CHAR(36)     NOT NULL,
+    window_id         CHAR(36)     NOT NULL,
+    processing_status VARCHAR(20)  NOT NULL,
+    result            VARCHAR(20)  NULL,
+    p_normal          DOUBLE       NULL,
+    p_transition      DOUBLE       NULL,
+    p_drift           DOUBLE       NULL,
+    context_used      BOOLEAN      NULL,
+    context_result    JSON         NULL,
+    input_snapshot    JSON         NULL,
+    feature_snapshot  JSON         NULL,
+    model_versions    JSON         NULL,
+    requested_at      DATETIME(3)  NOT NULL,
+    analyzed_at       DATETIME(3)  NULL,
+    completed_at      DATETIME(3)  NULL,
+    error_code        VARCHAR(100) NULL,
+    PRIMARY KEY (analysis_id),
+    CONSTRAINT uq_analysis_result_window UNIQUE (window_id),
+    CONSTRAINT fk_analysis_result_window FOREIGN KEY (window_id) REFERENCES analysis_window (window_id)
+);
