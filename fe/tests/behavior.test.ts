@@ -1,3 +1,4 @@
+import { serverSession } from './session-fixture';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { Collector } from '../src/background/collector';
 import type { PageSnapshot, VisitBehavior } from '../src/shared/types';
@@ -15,7 +16,7 @@ const behavior = (tab: number): VisitBehavior => {
 beforeEach(() => {
   let id = 0;
   collector = new Collector(undefined, () => `id-${++id}`);
-  collector.start('공개 문서 조사하기', 0);
+  collector.start(serverSession('공개 문서 조사하기', 0));
   collector.foreground(1, 0);
   open(1);
 });

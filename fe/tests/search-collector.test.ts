@@ -1,3 +1,4 @@
+import { serverSession } from './session-fixture';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { Collector } from '../src/background/collector';
 import { isSearchContentChange } from '../src/shared/content-change';
@@ -8,7 +9,7 @@ let collector: Collector;
 const observe = (snapshot: PageSnapshot | null, now: number, reason?: 'unavailable-content' | 'search-pending') => collector.observe(1, collector.state.tabs[1].documentId, collector.state.session!.sessionId, snapshot, reason, now);
 beforeEach(() => {
   let id = 0; collector = new Collector(undefined, () => `id-${++id}`);
-  collector.start('공개 문서 조사하기', 0); collector.foreground(1, 0); collector.navigate(1, 'doc', 'a', 'new', 0);
+  collector.start(serverSession('공개 문서 조사하기', 0)); collector.foreground(1, 0); collector.navigate(1, 'doc', 'a', 'new', 0);
 });
 describe('search candidate lifecycle', () => {
   it('validates a short organic result at exactly 1 second; hides internal evidence in PageVisit', () => {

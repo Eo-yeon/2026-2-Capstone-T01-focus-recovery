@@ -1,8 +1,10 @@
-export interface LocalSession {
-  sessionId: string;
+import type { WorkSessionResponse } from '../api/types';
+export type ServerSession = WorkSessionResponse & { source: 'server' };
+export interface PendingSessionStart {
+  idempotencyKey: string;
   goalText: string;
-  startedAt: string;
-  source: 'development-local';
+  apiBaseUrl: string;
+  response?: WorkSessionResponse;
 }
 export interface VisitBehavior {
   activeDurationMs: number;
@@ -57,7 +59,7 @@ export interface TabState {
 }
 export interface CollectionState {
   sequenceVersion: 1;
-  session: LocalSession | null;
+  session: ServerSession | null;
   nextSequence: number;
   tabs: Record<number, TabState>;
   candidates: VisitCandidate[];
@@ -72,7 +74,8 @@ export type ContentMessage =
   | { type: 'leave'; sessionId: string };
 export type PopupMessage = { type: 'status' } | { type: 'start'; goalText: string } | { type: 'stop' } | { type: 'clear' } | { type: 'sync-permissions' };
 export interface DevStatus {
-  session: LocalSession | null;
+  session: ServerSession | null;
+  pendingStart?: { goalText: string };
   candidates: Omit<VisitCandidate, 'snapshot' | 'activeSince' | 'activeTimeCursor'>[];
   visits: (Omit<PageVisit, 'sequence'> & { sequence: number | null })[];
   readyVisits: PageVisit[]; // Only these have immutable, contiguous server sequences.

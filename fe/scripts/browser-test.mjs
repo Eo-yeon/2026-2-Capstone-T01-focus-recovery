@@ -1,13 +1,35 @@
 import { chromium } from 'playwright';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { build } from 'vite';
 
 const bodyA = 'JWT 문서에서 토큰 검증 방법과 Spring Security 인증 처리 절차를 설명합니다. 안전한 공개 기술 문서의 의미 있는 본문입니다.';
 const bodyB = '우주 탐사선은 먼 행성의 대기와 암석을 연구합니다. 천문학자들이 수집한 관측 자료로 태양계 형성 과정을 분석하는 과학 기사입니다.';
-const server = createServer((req, res) => {
+const sessions = new Map();
+const apiRequests = [];
+let loseResponse = true;
+const server = createServer(async (req, res) => {
+  if (req.url === '/api/sessions' && req.method === 'POST') {
+    let body = ''; for await (const chunk of req) body += chunk;
+    const { goalText } = JSON.parse(body);
+    const key = req.headers['idempotency-key'];
+    assert.match(key, /^[a-f0-9-]{36}$/);
+    apiRequests.push({ key, goalText });
+    let session = sessions.get(key);
+    res.setHeader('Content-Type', 'application/json');
+    if (session && session.goalText !== goalText) { res.writeHead(422); res.end('{}'); return; }
+    if (!session) {
+      session = { sessionId: randomUUID(), goalText, startedAt: new Date().toISOString(), status: 'ACTIVE', endedAt: null };
+      sessions.set(key, session);
+    }
+    if (loseResponse) { loseResponse = false; req.socket.destroy(); return; }
+    await new Promise(resolve => setTimeout(resolve, 300));
+    res.writeHead(201); res.end(JSON.stringify(session)); return;
+  }
   const path = new URL(req.url, 'http://localhost').pathname;
   const body = path === '/b' ? bodyB : path === '/short' ? '짧은 본문' : bodyA;
   const sensitive = path === '/sensitive' ? '<form><input type="password" value="PRIVATE_PASSWORD"><textarea>PRIVATE_INPUT</textarea></form>' : '';
@@ -20,11 +42,15 @@ const root = await mkdtemp(join(tmpdir(), 'focus-recovery-browser-'));
 let context;
 try {
   const extension = join(root, 'extension');
-  await cp(resolve('dist'), extension, { recursive: true });
+  // Build against the random local API fixture without modifying dist/.
+  process.env.VITE_API_BASE_URL = `http://localhost:${server.address().port}`;
+  await build({ configFile: resolve('vite.config.ts'), build: { outDir: extension } });
+  await build({ configFile: resolve('vite.content.config.ts'), build: { outDir: extension } });
   const manifest = JSON.parse(await readFile(join(extension, 'manifest.json'), 'utf8'));
   // The unattended test profile pre-grants only its synthetic fixture host.
   // The shipped manifest still uses optional per-site permissions.
-  manifest.host_permissions = ['http://127.0.0.1/*', 'https://www.google.com/*', 'https://search.naver.com/*'];
+  assert.deepEqual(manifest.host_permissions, ['http://localhost/*'], 'build grants only the API host');
+  manifest.host_permissions.push('http://127.0.0.1/*', 'https://www.google.com/*', 'https://search.naver.com/*');
   await writeFile(join(extension, 'manifest.json'), JSON.stringify(manifest));
   context = await chromium.launchPersistentContext(join(root, 'profile'), {
     channel: 'chromium', headless: !process.env.HEADED,
@@ -57,8 +83,24 @@ try {
   assert.equal((await status()).candidates.length, 0, 'no collection before session');
   await popup.bringToFront();
   await popup.getByLabel(/최초 작업 목표/).fill('공개 문서 조사하기');
-  await popup.getByRole('button', { name: '로컬 세션 시작' }).click();
-  await popup.getByText('활성 로컬 세션', { exact: false }).waitFor();
+  await popup.getByRole('button', { name: '작업 세션 시작', exact: true }).click();
+  await popup.getByRole('button', { name: '같은 요청 재시도', exact: true }).waitFor();
+  assert.equal((await status()).session, null, 'lost API response never starts local collection');
+  assert.equal((await status()).candidates.length, 0);
+  assert.equal(sessions.size, 1, 'server committed before losing response');
+  const pendingCdp = await context.newCDPSession(page);
+  await pendingCdp.send('ServiceWorker.enable'); await pendingCdp.send('ServiceWorker.stopAllWorkers');
+  await pendingCdp.detach();
+  await popup.reload();
+  await popup.getByRole('button', { name: '같은 요청 재시도', exact: true }).click();
+  const duplicate = await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'start', goalText: '공개 문서 조사하기' }));
+  assert.equal(duplicate.ok, false, 'in-flight start is blocked');
+  await popup.getByText('서버 세션으로 수집 중', { exact: false }).waitFor();
+  assert.equal(apiRequests.length, 2); assert.equal(sessions.size, 1);
+  assert.equal(apiRequests[0].key, apiRequests[1].key, 'worker restart replays the same durable key');
+  assert.equal((await status()).session.sessionId, sessions.values().next().value.sessionId);
+  assert.equal(await popup.getByText(/서버 종료 API는 미연동/).isVisible(), true);
+  console.log('PASS: HTTP session creation, lost response, same-key retry after worker restart, duplicate guard, server session ID, local-only stop notice');
   await page.bringToFront();
   async function until(check, label) {
     for (let i = 0; i < 50; i++) {
@@ -211,6 +253,7 @@ try {
   assert.deepEqual(result.readyVisits.slice(0, searchReady.length), searchReady, 'exclusions do not renumber published visits');
   await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'stop' }));
   const stopped = await status();
+  assert.equal([...sessions.values()].every(session => session.status === 'ACTIVE'), true, 'local stop does not claim server termination');
   assert.equal(stopped.readyVisits.length, stopped.visits.length, 'stop finalizes every valid visit');
   assert.deepEqual(stopped.readyVisits.map(v => v.sequence), stopped.readyVisits.map((_, i) => i + 1), 'excluded candidates never consume server sequences');
   assert.equal(stopped.candidates.some(c => c.state === 'excluded'), true, 'exclusion cases were actually exercised');

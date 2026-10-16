@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { SERVER_SESSION_ID, serverSession } from './session-fixture';
 import { describeUrl } from '../src/shared/url';
 import type { Reply } from '../src/shared/types';
 function chromeEvent() {
@@ -40,9 +41,17 @@ beforeEach(async () => {
     scripting: { getRegisteredContentScripts: vi.fn(async () => []), unregisterContentScripts: vi.fn(async () => undefined), registerContentScripts: vi.fn(async () => undefined), executeScript: vi.fn(async () => undefined) },
     webNavigation: { getFrame: vi.fn(async () => frame), onCommitted: chromeEvent(), onHistoryStateUpdated: chromeEvent(), onErrorOccurred: chromeEvent() },
   };
+  vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify({ ...serverSession(JSON.parse(init.body as string).goalText), sessionId: SERVER_SESSION_ID }), { status: 201 })));
   vi.stubGlobal('chrome', api);
   await import('../src/background/index');
 });
+  async function reloadWorker() {
+    vi.resetModules();
+    for (const group of [api.runtime, api.tabs, api.windows, api.webNavigation, api.permissions]) {
+      for (const value of Object.values(group) as any[]) if (value?.listeners) value.listeners.length = 0;
+    }
+    await import('../src/background/index');
+  }
 describe('background Chrome adapter', () => {
   async function validVisit() {
     const clock = vi.spyOn(Date, 'now').mockReturnValue(10000);
@@ -54,13 +63,6 @@ describe('background Chrome adapter', () => {
     await message({ type: 'snapshot', sessionId, snapshot }, pageSender);
     expect(memory.collection.candidates[0].state).toBe('valid');
     return { sessionId, clock, snapshot, candidate: structuredClone(memory.collection.candidates[0]) };
-  }
-  async function reloadWorker() {
-    vi.resetModules();
-    for (const group of [api.runtime, api.tabs, api.windows, api.webNavigation, api.permissions]) {
-      for (const value of Object.values(group) as any[]) if (value?.listeners) value.listeners.length = 0;
-    }
-    await import('../src/background/index');
   }
   it.each(['blur', 'minimize'])('pauses on %s and resumes without counting a tab switch', async mode => {
     const { clock } = await validVisit();
@@ -612,5 +614,186 @@ describe('background search verification', () => {
     const original = (await message({ type: 'status' })).status!.visits[0];
     vi.resetModules(); api.runtime.onMessage.listeners.length = 0; await import('../src/background/index');
     expect((await message({ type: 'status' })).status!.visits[0]).toEqual(original);
+  });
+});
+
+
+describe('server session integration and durable recovery', () => {
+  const goalText = '공개 문서 조사하기';
+  const start = (goal = goalText) => message({ type: 'start', goalText: goal });
+  it('uses the server ID/time/status and stores it before scripts start', async () => {
+    const payload = { ...serverSession(goalText, 123456789), sessionId: SERVER_SESSION_ID };
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify(payload), { status: 201 }));
+    api.scripting.registerContentScripts.mockImplementation(async () => {
+      expect(memory.collection.session).toMatchObject(payload);
+      expect(local.activeSession.sessionId).toBe(SERVER_SESSION_ID);
+    });
+    expect((await start()).status?.session).toEqual({ ...payload, source: 'server' });
+    expect(local.pendingSessionStart).toBeUndefined();
+    expect((await message({ type: 'context' }, pageSender)).sessionId).toBe(SERVER_SESSION_ID);
+  });
+  it('blocks concurrent starts at arrival even if the first request fails', async () => {
+    let fail!: (reason: Error) => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    vi.mocked(fetch).mockImplementationOnce(() => { entered(); return new Promise((_, reject) => { fail = reject; }); });
+    const first = start(); await waiting;
+    expect((await start()).error).toContain('처리 중');
+    expect(memory.collection?.session ?? null).toBeNull();
+    expect(api.scripting.registerContentScripts).not.toHaveBeenCalled();
+    fail(new Error('PRIVATE_NETWORK_ERROR'));
+    expect((await first).ok).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect((await message({ type: 'status' })).status?.session).toBeNull();
+  });
+  it('does not backdate queued collection events into the API wait', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(10000);
+    let respond!: (value: Response) => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    vi.mocked(fetch).mockImplementationOnce(() => { entered(); return new Promise(resolve => { respond = resolve; }); });
+    const first = start(); await waiting;
+    clock.mockReturnValue(11000);
+    const context = message({ type: 'context' }, pageSender);
+    clock.mockReturnValue(15000);
+    respond(new Response(JSON.stringify(serverSession(goalText)), { status: 201 }));
+    await first; await context;
+    expect(memory.collection.candidates[0].visitedAt).toBe(new Date(15000).toISOString());
+    expect(memory.collection.candidates[0].activeDurationMs).toBe(0);
+  });
+  it.each(['network', 'json', 'fields', '500', '422'])('keeps the same key and goal after %s, including worker restart', async failure => {
+    if (failure === 'network') vi.mocked(fetch).mockRejectedValueOnce(new Error('PRIVATE'));
+    else vi.mocked(fetch).mockResolvedValueOnce(new Response(failure === 'fields' ? '{}' : '{', { status: failure === '500' ? 500 : failure === '422' ? 422 : 201 }));
+    const failed = await start();
+    expect(failed.ok).toBe(false); expect(failed.status?.session).toBeNull();
+    const pending = structuredClone(local.pendingSessionStart);
+    expect(pending.idempotencyKey).toMatch(/^[a-f0-9-]{36}$/);
+    expect(api.scripting.registerContentScripts).not.toHaveBeenCalled();
+    await reloadWorker();
+    const state = (await message({ type: 'status' })).status!;
+    expect(state.pendingStart?.goalText).toBe(goalText);
+    expect((await start('다른 작업 목표')).ok).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect((await start()).ok).toBe(true);
+    const keys = vi.mocked(fetch).mock.calls.map(([, init]) => (init?.headers as Record<string, string>)['Idempotency-Key']);
+    expect(keys).toEqual([pending.idempotencyKey, pending.idempotencyKey]);
+  });
+  it('retains a timed-out request through browser restart and local clear', async () => {
+    vi.useFakeTimers();
+    vi.mocked(fetch).mockImplementationOnce(() => new Promise(() => undefined));
+    const result = start();
+    await vi.advanceTimersByTimeAsync(10000);
+    expect((await result).ok).toBe(false);
+    vi.useRealTimers();
+    const pending = structuredClone(local.pendingSessionStart);
+    memory = {}; api.storage.session = area(memory);
+    await reloadWorker();
+    await message({ type: 'clear' }); await message({ type: 'stop' });
+    expect(local.pendingSessionStart).toEqual(pending);
+    expect((await message({ type: 'status' })).status?.session).toBeNull();
+    expect((await start()).ok).toBe(true);
+    expect(vi.mocked(fetch).mock.calls[1][1]?.headers).toMatchObject({ 'Idempotency-Key': pending.idempotencyKey });
+  });
+  it('releases a first 400 rejection so the goal can be corrected', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response('PRIVATE', { status: 400 }));
+    expect((await start()).ok).toBe(false);
+    expect(local.pendingSessionStart).toBeUndefined();
+    expect((await start('새로운 작업 목표')).ok).toBe(true);
+    const keys = vi.mocked(fetch).mock.calls.map(([, init]) => (init?.headers as Record<string, string>)['Idempotency-Key']);
+    expect(keys[0]).not.toBe(keys[1]);
+  });
+  it('does not release an uncertain request after a later 400', async () => {
+    vi.mocked(fetch).mockRejectedValueOnce(new Error('lost response'));
+    await start(); const key = local.pendingSessionStart.idempotencyKey;
+    vi.mocked(fetch).mockResolvedValueOnce(new Response('', { status: 400 }));
+    await start(); expect(local.pendingSessionStart.idempotencyKey).toBe(key);
+  });
+  it('does not send anything when the write before HTTP fails', async () => {
+    await message({ type: 'status' });
+    api.storage.local.set.mockRejectedValueOnce(new Error('PRIVATE_STORAGE_ERROR'));
+    expect((await start()).ok).toBe(false);
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await message({ type: 'status' })).status?.session).toBeNull();
+  });
+  it.each(['response', 'checkpoint', 'metadata', 'cleanup'])('recovers after %s storage failure without creating a second session', async phase => {
+    const baseSet = api.storage.local.set.getMockImplementation();
+    const baseRemove = api.storage.local.remove.getMockImplementation();
+    if (phase === 'response' || phase === 'metadata') api.storage.local.set.mockImplementationOnce(baseSet).mockImplementationOnce(async (value: any) => {
+      if (phase === 'response' || value.activeSession) throw new Error('storage failure');
+      await baseSet(value);
+    });
+    if (phase === 'metadata') {
+      api.storage.local.set.mockReset();
+      api.storage.local.set.mockImplementation(async (value: any) => {
+        if (value.activeSession) throw new Error('storage failure');
+        await baseSet(value);
+      });
+    }
+    if (phase === 'checkpoint') api.storage.session.set.mockRejectedValueOnce(new Error('storage failure'));
+    if (phase === 'cleanup') api.storage.local.remove.mockImplementation(async (key: string) => {
+      if (key === 'pendingSessionStart') throw new Error('storage failure');
+      await baseRemove(key);
+    });
+    expect((await start()).ok).toBe(false);
+    const key = local.pendingSessionStart.idempotencyKey;
+    api.storage.local.set.mockImplementation(baseSet); api.storage.local.remove.mockImplementation(baseRemove);
+    await reloadWorker();
+    expect((await message({ type: 'status' })).status?.session).toBeNull();
+    expect((await start()).status?.session?.sessionId).toBe(SERVER_SESSION_ID);
+    const keys = vi.mocked(fetch).mock.calls.map(([, init]) => (init?.headers as Record<string, string>)['Idempotency-Key']);
+    expect(keys.every(value => value === key)).toBe(true);
+    expect(keys).toHaveLength(phase === 'response' ? 2 : 1);
+  });
+  it('recovers a worker killed after sending but before receiving a response', async () => {
+    const key = crypto.randomUUID();
+    local.pendingSessionStart = { idempotencyKey: key, goalText, apiBaseUrl: 'http://localhost:8080' };
+    await reloadWorker();
+    expect((await message({ type: 'status' })).status?.pendingStart).toEqual({ goalText });
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await start()).ok).toBe(true);
+    expect(vi.mocked(fetch).mock.calls[0][1]?.headers).toMatchObject({ 'Idempotency-Key': key });
+  });
+  it('requires explicit recovery after a crash between activation checkpoint and pending cleanup', async () => {
+    await start();
+    local.pendingSessionStart = { idempotencyKey: crypto.randomUUID(), goalText, apiBaseUrl: 'http://localhost:8080', response: serverSession(goalText) };
+    await reloadWorker();
+    const state = (await message({ type: 'status' })).status!;
+    expect(state.session).toBeNull(); expect(state.pendingStart).toEqual({ goalText });
+    expect((await message({ type: 'context' }, pageSender)).sessionId).toBeNull();
+    expect((await start()).ok).toBe(true); expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('blocks recovery against a different server and rejects a corrupt pending record', async () => {
+    local.pendingSessionStart = { idempotencyKey: crypto.randomUUID(), goalText, apiBaseUrl: 'https://another-server.example' };
+    await reloadWorker(); expect((await start()).ok).toBe(false); expect(fetch).not.toHaveBeenCalled();
+    local.pendingSessionStart.idempotencyKey = 'invalid';
+    await reloadWorker(); expect((await start()).ok).toBe(false); expect(fetch).not.toHaveBeenCalled();
+    expect(local.pendingSessionStart).toBeDefined();
+  });
+  it('refuses an ENDED replay and retains the request for investigation', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ ...serverSession(goalText), status: 'ENDED', endedAt: '2026-10-16T00:00:00.000Z' }), { status: 201 }));
+    expect((await start()).error).toContain('이미 종료');
+    expect((await message({ type: 'context' }, pageSender)).sessionId).toBeNull();
+    expect(local.pendingSessionStart.response.status).toBe('ENDED');
+  });
+  it('does not let mandatory API permission authorize collection or script registration', async () => {
+    api.permissions.getAll.mockResolvedValue({ origins: ['http://localhost/*', 'https://example.com/*'] });
+    api.tabs.query.mockResolvedValue([{ id: 1, url: 'http://localhost:9090/private' }]);
+    await start();
+    expect(api.scripting.registerContentScripts).toHaveBeenCalledWith([expect.objectContaining({ matches: ['https://example.com/*'] })]);
+    expect(api.scripting.executeScript).not.toHaveBeenCalled();
+    frame.url = 'http://localhost:9090/private';
+    expect((await message({ type: 'context' }, pageSender)).sessionId).toBeNull();
+  });
+  it('rejects invalid goals before HTTP and normalizes Java whitespace', async () => {
+    expect((await start(' 1234 ')).ok).toBe(false); expect(fetch).not.toHaveBeenCalled();
+    await start('\u001c公開문서 조사하기\u3000');
+    expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1]?.body as string).goalText).toBe('公開문서 조사하기');
+    expect((await start()).ok).toBe(false); expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('refuses an upgrade checkpoint from a development-local session', async () => {
+    await start();
+    memory.collection.session.source = 'development-local';
+    await reloadWorker();
+    expect((await message({ type: 'status' })).status?.session).toBeNull();
   });
 });
