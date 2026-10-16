@@ -115,7 +115,8 @@ describe('finalized valid visit sequence contract', () => {
     collector = new Collector(structuredClone(collector.state));
     expect(ready()).toEqual(original);
     collector.foreground(2, 2000); collector.navigate(2, 'next', 'a', 'new', 2000); observe(2, 3000); collector.stop(3000);
-    expect(ready()[0]).toEqual(original[0]);
+    expect(ready()[0]).toEqual({ ...original[0], tabSwitchCount: 1, behaviorVersion: original[0].behaviorVersion + 1 });
+    expect(original[0].tabSwitchCount).toBe(0); // Previously issued snapshot remains a stable retry payload.
     expect(ready().map(v => v.sequence)).toEqual([1, 2]);
     expect(new Set(ready().map(v => v.sequence)).size).toBe(2);
   });

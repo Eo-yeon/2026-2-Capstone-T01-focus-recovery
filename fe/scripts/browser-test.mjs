@@ -70,6 +70,8 @@ try {
   }
   let result = await until(state => state.visits.length === 1, 'active document becomes valid');
   const first = result.visits[0];
+  assert.equal(first.tabSwitchCount, 0, 'initial foreground is not a tab switch');
+  assert.equal(Number.isSafeInteger(first.behaviorVersion) && first.behaviorVersion > 0, true, 'measured behavior has a version');
   assert.equal(first.content.includes('OMITTED_NAV'), false);
   assert.match(first.visitId, /^[a-f0-9-]{36}$/);
   await page.reload();
@@ -77,6 +79,7 @@ try {
   result = await until(state => state.visits[0]?.activeDurationMs > first.activeDurationMs, 'reload resumes');
   assert.equal(result.visits[0].visitId, first.visitId);
   assert.equal(result.candidates.length, 1);
+  assert.equal(result.visits[0].tabSwitchCount, 0, 'reload is not a tab switch');
   await page.goto(`${origin}/b`);
   result = await until(state => state.visits.length === 2, 'new document');
   assert.notEqual(result.visits[1].visitId, first.visitId);
@@ -97,15 +100,25 @@ try {
   await page.evaluate(() => { document.querySelector('article').insertAdjacentHTML('beforeend', '<p>댓글 펼치기</p>'); });
   await new Promise(resolve => setTimeout(resolve, 500));
   assert.equal((await status()).visits.length, 6, 'UI mutation does not duplicate');
+  const beforeSecond = (await status()).visits.at(-1);
+  assert.equal(beforeSecond.tabSwitchCount, 0, 'full navigation/history/SPA are not tab switches');
   const second = await context.newPage();
   await second.goto(`${origin}/b`); await second.bringToFront();
   result = await until(state => state.visits.length === 7, 'second tab');
+  const departing = result.visits.find(v => v.visitId === beforeSecond.visitId);
+  assert.equal(departing.tabSwitchCount, 1, 'A → B increments A');
+  assert.equal(departing.behaviorVersion > beforeSecond.behaviorVersion, true);
+  const secondVisit = result.visits.at(-1);
   const sequence = result.readyVisits.map(visit => visit.sequence);
   assert.equal(new Set(sequence).size, sequence.length);
   assert.deepEqual(sequence, sequence.map((_, i) => i + 1));
   await page.bringToFront();
   await new Promise(resolve => setTimeout(resolve, 400));
-  assert.equal((await status()).visits.length, 7, 'returning to existing tab reuses visit');
+  result = await status();
+  assert.equal(result.visits.length, 7, 'returning to existing tab reuses visit');
+  assert.equal(result.visits.find(v => v.visitId === secondVisit.visitId).tabSwitchCount, 1, 'B → A increments B');
+  assert.equal(secondVisit.tabSwitchCount, 0, 'old behavior snapshot is unchanged');
+  assert.equal(result.visits.find(v => v.visitId === beforeSecond.visitId).tabSwitchCount, 1, 'return does not increment A again');
   const beforeFailure = await status();
   const protectedVisits = beforeFailure.visits.map(({ visitId, content }) => ({ visitId, content }));
   const protectedReady = beforeFailure.readyVisits;
@@ -227,6 +240,37 @@ try {
   await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'stop' }));
   result = await status();
   assert.deepEqual(result.readyVisits.map(v => [v.visitId, v.sequence]), [[earlierId, 1], [laterId, 2]], 'creation order wins over validation and finalization order');
+  // Headless Chrome can report every window as focused; native focus needs visible windows.
+  if (process.env.HEADED) {
+    // Exercise native Chrome window events as well as the mocked adapter order tests.
+    await page.goto(`${origin}/a`); await page.bringToFront();
+    await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'start', goalText: '다중 창 활성시간 검증하기' }));
+    result = await until(state => state.visits.length === 1, 'first window visit');
+    const windowAVisit = result.visits[0];
+    const windowA = await popup.evaluate(() => chrome.windows.getCurrent().then(window => window.id));
+    const windowB = await popup.evaluate(url => chrome.windows.create({ url, focused: true, type: 'normal' }), `${origin}/b`);
+    result = await until(state => state.visits.length === 2, 'second window visit');
+    const windowBVisit = result.visits[1];
+    assert.equal(result.visits[0].tabSwitchCount, 1, 'switching Chrome windows counts A once');
+    await popup.evaluate(windowId => chrome.windows.update(windowId, { focused: true }), windowA);
+    result = await until(state => state.visits[1].tabSwitchCount === 1, 'window B departure');
+    assert.equal(result.visits[0].visitId, windowAVisit.visitId);
+    assert.equal(result.visits[1].visitId, windowBVisit.visitId);
+    assert.equal(result.visits[0].tabSwitchCount, 1, 'focus and tab events do not double count A');
+    await popup.evaluate(windowId => chrome.windows.remove(windowId), windowB.id);
+    await popup.evaluate(windowId => chrome.windows.update(windowId, { state: 'minimized' }), windowA);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    const minimized = await status();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    result = await status();
+    assert.equal(result.visits[0].activeDurationMs, minimized.visits[0].activeDurationMs, 'native window minimization pauses active time');
+    assert.equal(result.visits[0].tabSwitchCount, 1, 'minimization without a replacement window is not a tab switch');
+    await popup.evaluate(windowId => chrome.windows.update(windowId, { state: 'normal', focused: true }), windowA);
+    result = await until(state => state.visits[0].activeDurationMs > minimized.visits[0].activeDurationMs, 'native window restoration resumes');
+    assert.equal(result.visits[0].tabSwitchCount, 1, 'restoration does not add a switch');
+    await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'stop' }));
+    console.log('PASS: native multi-window focus/minimize/restore');
+  } else console.log('SKIP: native multi-window focus/minimize/restore requires HEADED=1');
   console.log(`PASS: real MV3 load, popup, messaging, session gate, extraction, reload, back/forward, SPA, tabs, sequence, navigation failure/tab-close race, worker restart, sensitive/short exclusion, synthetic Google/Naver organic results, search SPA/reload/history/tabs/recovery/zero results, stop (${context.browser()?.version() ?? 'Chromium'})`);
 } finally {
   await context?.close();

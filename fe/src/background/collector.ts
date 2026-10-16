@@ -4,7 +4,7 @@ import { validSearchQuery } from '../shared/url';
 import { resumeActiveTime, settleActiveTime } from './active-time';
 export const MAX_CANDIDATES = 200;
 export function emptyState(): CollectionState {
-  return { sequenceVersion: 1, session: null, nextSequence: 1, tabs: {}, candidates: [], foregroundTabId: null, capacityReached: false };
+  return { sequenceVersion: 1, session: null, nextSequence: 1, tabs: {}, candidates: [], foregroundTabId: null, lastActiveTabId: null, lastActiveVisitId: null, capacityReached: false };
 }
 export class Collector {
   constructor(public state = emptyState(), private uuid = () => crypto.randomUUID() as string) {
@@ -12,6 +12,14 @@ export class Collector {
   }
   restore(state: CollectionState): void {
     this.state = state;
+    // Older local-only checkpoints never measured switches or issued behavior versions.
+    for (const candidate of state.candidates) {
+      candidate.tabSwitchCount ??= 0;
+      candidate.behaviorVersion ??= candidate.activeDurationMs > 0 ? 1 : 0;
+      candidate.activeTimeCursor ??= candidate.activeSince ?? Date.parse(candidate.visitedAt);
+    }
+    state.lastActiveTabId ??= state.foregroundTabId;
+    state.lastActiveVisitId ??= state.lastActiveTabId === null ? null : this.current(state.lastActiveTabId)?.visitId ?? null;
     // Legacy checkpoints were local-only: retain IDs/content, discard candidate sequence gaps.
     if (state.sequenceVersion !== 1) {
       const openIds = new Set(state.session ? Object.values(state.tabs).map(tab => tab.candidateId) : []);
@@ -73,19 +81,42 @@ export class Collector {
     const old = this.state.foregroundTabId;
     if (old !== null) this.pause(old, now);
     this.state.foregroundTabId = tabId;
-    if (tabId !== null && this.state.session) {
+    if (tabId !== null && this.state.session && !this.state.capacityReached) {
+      if (this.state.lastActiveTabId !== null && this.state.lastActiveTabId !== tabId) {
+        const previous = this.state.candidates.find(candidate => candidate.visitId === this.state.lastActiveVisitId);
+        // A close can finalize the visit before Chrome announces its replacement tab.
+        if (previous && previous.state !== 'excluded') {
+          previous.tabSwitchCount++;
+          previous.behaviorVersion++;
+        }
+      }
+      this.state.lastActiveTabId = tabId;
       const candidate = this.current(tabId);
-      if (candidate && !candidate.finalized && !this.state.tabs[tabId]?.navigationFailed) resumeActiveTime(candidate, now);
+      this.state.lastActiveVisitId = candidate?.visitId ?? null;
+      if (candidate && !candidate.finalized && !this.state.tabs[tabId]?.navigationFailed && !this.state.tabs[tabId]?.documentLeft) resumeActiveTime(candidate, now);
     }
+  }
+  reconcileForeground(tabId: number | null, now: number): void {
+    const old = this.state.foregroundTabId;
+    if (old !== null) {
+      const candidate = this.current(old);
+      // Matching endpoints do not prove continuous focus across an unobserved worker gap.
+      if (candidate && candidate.activeSince !== null) this.pause(old, candidate.activeSince);
+    }
+    this.foreground(tabId, now);
   }
   navigate(tabId: number, documentId: string, identity: string | null, kind: 'new' | 'reload' | 'existing' | 'spa', now: number): void {
     if (!this.state.session || this.state.capacityReached) return;
     const old = this.state.tabs[tabId];
-    if (old?.documentId === documentId && kind !== 'spa') return;
+    if (old?.documentId === documentId && kind !== 'spa') {
+      if (kind === 'existing') delete old.documentLeft;
+      return;
+    }
     if (old && kind === 'reload' && identity !== null && old.currentIdentity === identity) {
       this.pause(tabId, now);
       old.documentId = documentId;
       delete old.navigationFailed;
+      delete old.documentLeft;
       if (this.state.foregroundTabId === tabId) {
         const candidate = this.current(tabId);
         if (candidate) resumeActiveTime(candidate, now);
@@ -103,16 +134,18 @@ export class Collector {
     const candidate: VisitCandidate = {
       visitId, sessionId: this.state.session.sessionId, sequence: null, finalized: false,
       browserTabKey: old?.browserTabKey ?? this.uuid(), visitedAt: new Date(now).toISOString(),
-      state: 'pending', activeDurationMs: 0, activeSince: this.state.foregroundTabId === tabId ? now : null,
+      state: 'pending', activeDurationMs: 0, tabSwitchCount: 0, behaviorVersion: 0,
+      activeSince: this.state.foregroundTabId === tabId ? now : null, activeTimeCursor: now,
     };
     this.state.tabs[tabId] = { browserTabKey: candidate.browserTabKey, documentId, identity, currentIdentity: identity, candidateId: visitId };
     this.state.candidates.push(candidate);
+    if (this.state.foregroundTabId === tabId) this.state.lastActiveVisitId = visitId;
     if (!identity) this.exclude(candidate, 'url-policy');
   }
   observe(tabId: number, documentId: string, sessionId: string, snapshot: PageSnapshot | null, reason: ExclusionReason | undefined, now: number): void {
     if (this.state.session?.sessionId !== sessionId || this.state.capacityReached) return;
     const tab = this.state.tabs[tabId];
-    if (!tab || tab.documentId !== documentId || tab.navigationFailed) return;
+    if (!tab || tab.documentId !== documentId || tab.navigationFailed || tab.documentLeft) return;
     let candidate = this.current(tabId)!;
     if (candidate.finalized) return;
     if (reason === 'dom-policy' || reason === 'url-policy' || reason === 'search-pending' || (snapshot?.isSearchResultPage && !this.hasContent(snapshot))) {
@@ -147,7 +180,10 @@ export class Collector {
     this.validate(candidate);
   }
   leave(tabId: number, documentId: string, now: number): void {
-    if (this.state.tabs[tabId]?.documentId === documentId) this.pause(tabId, now);
+    if (this.state.tabs[tabId]?.documentId === documentId) {
+      this.pause(tabId, now);
+      this.state.tabs[tabId].documentLeft = true;
+    }
   }
   navigationError(tabId: number, documentId: string | undefined, identity: string | null, now: number): void {
     const tab = this.state.tabs[tabId];
@@ -167,14 +203,16 @@ export class Collector {
     for (const key of Object.keys(this.state.tabs)) this.pause(Number(key), now, true);
     this.state.session = null;
     this.state.foregroundTabId = null;
+    this.state.lastActiveTabId = null;
+    this.state.lastActiveVisitId = null;
   }
   status(now: number): DevStatus {
     if (this.state.session && this.state.foregroundTabId !== null) this.foreground(this.state.foregroundTabId, now);
     const visits: DevStatus['visits'] = this.state.candidates.filter(candidate => candidate.state === 'valid' && candidate.snapshot).map(candidate => {
       const { identity: _, organicResultCount: __, ...snapshot } = candidate.snapshot!;
-      return { ...snapshot, visitId: candidate.visitId, sessionId: candidate.sessionId, sequence: candidate.sequence, browserTabKey: candidate.browserTabKey, visitedAt: candidate.visitedAt, searchQuery: snapshot.searchQuery ?? null, activeDurationMs: candidate.activeDurationMs, tabSwitchCount: null, behaviorVersion: null };
+      return { ...snapshot, visitId: candidate.visitId, sessionId: candidate.sessionId, sequence: candidate.sequence, browserTabKey: candidate.browserTabKey, visitedAt: candidate.visitedAt, searchQuery: snapshot.searchQuery ?? null, activeDurationMs: candidate.activeDurationMs, tabSwitchCount: candidate.tabSwitchCount, behaviorVersion: candidate.behaviorVersion };
     });
     const readyVisits = visits.filter((visit): visit is PageVisit => visit.sequence !== null);
-    return { session: this.state.session, capacityReached: this.state.capacityReached, visits, readyVisits, candidates: this.state.candidates.map(({ snapshot: _, activeSince: __, ...candidate }) => candidate) };
+    return { session: this.state.session, capacityReached: this.state.capacityReached, visits, readyVisits, candidates: this.state.candidates.map(({ snapshot: _, activeSince: __, activeTimeCursor: ___, ...candidate }) => candidate) };
   }
 }

@@ -74,9 +74,10 @@ describe('search candidate lifecycle', () => {
   });
   it('restores search evidence and the pending lifecycle through worker restart', () => {
     observe(search(), 500); const saved = structuredClone(collector.state); collector = new Collector(saved, () => 'new');
-    observe(search(), 1000); expect(collector.status(1000).visits[0]).toMatchObject({ visitId: saved.candidates[0].visitId, sequence: null, searchQuery: 'JWT' });
-    collector.stop(1000);
-    expect(collector.status(1000).readyVisits[0]).toMatchObject({ visitId: saved.candidates[0].visitId, sequence: 1 });
+    collector.reconcileForeground(1, 1000);
+    observe(search(), 1500); expect(collector.status(1500).visits[0]).toMatchObject({ visitId: saved.candidates[0].visitId, sequence: null, searchQuery: 'JWT', activeDurationMs: 1000 });
+    collector.stop(1500);
+    expect(collector.status(1500).readyVisits[0]).toMatchObject({ visitId: saved.candidates[0].visitId, sequence: 1 });
   });
   it('keeps concurrent search candidates in creation order without premature sequence allocation', async () => {
     const queue = serialExecutor(); const id = collector.state.session!.sessionId;
