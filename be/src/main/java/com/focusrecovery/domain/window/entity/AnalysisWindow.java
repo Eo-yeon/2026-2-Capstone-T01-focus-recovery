@@ -85,6 +85,14 @@ public class AnalysisWindow implements Persistable<UUID> {
 		isNew = false;
 	}
 
+	public UUID getWindowId() {
+		return windowId;
+	}
+
+	public UUID getSessionId() {
+		return sessionId;
+	}
+
 	public int getWindowIndex() {
 		return windowIndex;
 	}
