@@ -25,6 +25,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -283,6 +284,80 @@ class AnalysisQueryApiTest {
 			.andExpect(jsonPath("$.featureSnapshot").value(nullValue()))
 			.andExpect(jsonPath("$.modelVersions").value(nullValue()))
 			.andExpect(jsonPath("$.inputSnapshot.goalText").value(GOAL));
+	}
+
+	@Test
+	void 상세의_JSON_필드는_중첩_구조를_유지한_객체이며_문자열로_이중_인코딩하지_않는다() throws Exception {
+		AnalysisWindow window = createWindows(sessionId, 5).getFirst();
+		AnalysisResult analysis = request(window);
+		analysis.start(Instant.parse("2026-10-16T01:00:01.000Z"));
+		analysis.finish(new AiAnalysisOutcome(null, "DRIFT", 0.1, 0.2, 0.7, true,
+			"{\"contextState\":\"DRIFT\",\"signals\":{\"goalRelevance\":0.2,\"history\":[0.9,{\"step\":2}]},"
+				+ "\"note\":\"{\\\"looks\\\":\\\"like json\\\"}\"}",
+			"{}", "{\"embedding\":{\"name\":\"qwen3\",\"version\":\"0.6b\"}}", Instant.parse("2026-10-16T02:00:00.000Z")),
+			Instant.parse("2026-10-16T02:00:01.000Z"));
+		UUID analysisId = save(analysis);
+
+		String body = mockMvc.perform(get("/api/sessions/{sessionId}/analyses/{analysisId}", sessionId, analysisId))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.contextResult.signals.goalRelevance").value(0.2))
+			.andExpect(jsonPath("$.contextResult.signals.history[1].step").value(2))
+			// 객체 안의 문자열 값은 문자열 그대로 둔다(다시 파싱하지 않음)
+			.andExpect(jsonPath("$.contextResult.note").value("{\"looks\":\"like json\"}"))
+			.andExpect(jsonPath("$.featureSnapshot").isMap())
+			.andExpect(jsonPath("$.featureSnapshot").isEmpty())
+			.andExpect(jsonPath("$.modelVersions.embedding.version").value("0.6b"))
+			.andExpect(jsonPath("$.inputSnapshot.visits[0].position").value(1))
+			.andReturn().getResponse().getContentAsString();
+
+		assertThat(body).contains("\"contextResult\":{", "\"inputSnapshot\":{", "\"modelVersions\":{", "\"featureSnapshot\":{}")
+			.doesNotContain("\"contextResult\":\"", "\"inputSnapshot\":\"", "\"modelVersions\":\"");
+		assertThat(analysisResultRepository.findById(analysisId).orElseThrow().getContextResult())
+			.isEqualTo(analysis.getContextResult());
+	}
+
+	static List<String[]> invalidStoredJson() {
+		List<String[]> cases = new ArrayList<>();
+		for (String field : List.of("contextResult", "inputSnapshot", "featureSnapshot", "modelVersions")) {
+			for (String value : List.of("[\"RAW-SECRET\"]", "\"RAW-SECRET\"", "42", "true")) {
+				cases.add(new String[] {field, value});
+			}
+		}
+		return cases;
+	}
+
+	@ParameterizedTest
+	@MethodSource("invalidStoredJson")
+	void 저장된_JSON의_최상위_값이_객체가_아니면_500이고_원문을_노출하지_않는다(String field, String stored) throws Exception {
+		AnalysisWindow window = createWindows(sessionId, 5).getFirst();
+		UUID analysisId = UUID.randomUUID();
+		String snapshot = "inputSnapshot".equals(field) ? stored : "{\"goalText\":\"" + GOAL + "\"}";
+		AnalysisResult analysis = AnalysisResult.request(analysisId, window.getWindowId(), snapshot, FIXED_REQUESTED_AT);
+		analysis.start(Instant.parse("2026-10-16T01:00:01.000Z"));
+		analysis.finish(new AiAnalysisOutcome(null, "NORMAL", 0.7, 0.2, 0.1, true,
+			"contextResult".equals(field) ? stored : "{}", "featureSnapshot".equals(field) ? stored : null,
+			"modelVersions".equals(field) ? stored : "{\"classifier\":\"rf\"}", Instant.parse("2026-10-16T02:00:00.000Z")),
+			Instant.parse("2026-10-16T02:00:01.000Z"));
+		save(analysis);
+		List<Map<String, Object>> before = analysisRows();
+
+		String body = mockMvc.perform(get("/api/sessions/{sessionId}/analyses/{analysisId}", sessionId, analysisId))
+			.andExpect(status().isInternalServerError())
+			.andExpect(jsonPath("$.code").value("INTERNAL_ERROR"))
+			.andExpect(jsonPath("$.message").value("서버 내부 오류가 발생했습니다."))
+			.andExpect(jsonPath("$.fieldErrors").isEmpty())
+			.andReturn().getResponse().getContentAsString();
+
+		assertThat(body).doesNotContain("RAW-SECRET", field, analysisId.toString(), "Exception");
+		assertThat(analysisRows()).isEqualTo(before);
+		// JSON 컬럼을 읽지 않는 상태·목록 조회와 다른 API는 영향받지 않는다
+		mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", sessionId))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.latestAnalysis.analysisId").value(analysisId.toString()));
+		mockMvc.perform(get("/api/sessions/{sessionId}/analyses", sessionId)).andExpect(status().isOk());
+		mockMvc.perform(get("/api/sessions/{sessionId}/analyses/{analysisId}", sessionId, UUID.randomUUID()))
+			.andExpect(status().isNotFound())
+			.andExpect(jsonPath("$.code").value("ANALYSIS_NOT_FOUND"));
 	}
 
 	@Test

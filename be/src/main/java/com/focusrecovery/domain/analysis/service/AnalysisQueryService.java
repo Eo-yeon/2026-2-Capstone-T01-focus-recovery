@@ -36,14 +36,16 @@ public class AnalysisQueryService {
 	private final AnalysisResultRepository analysisResultRepository;
 	private final AnalysisWindowRepository analysisWindowRepository;
 	private final PageVisitRepository pageVisitRepository;
+	private final StoredJsonReader storedJsonReader;
 
 	public AnalysisQueryService(WorkSessionRepository workSessionRepository,
 		AnalysisResultRepository analysisResultRepository, AnalysisWindowRepository analysisWindowRepository,
-		PageVisitRepository pageVisitRepository) {
+		PageVisitRepository pageVisitRepository, StoredJsonReader storedJsonReader) {
 		this.workSessionRepository = workSessionRepository;
 		this.analysisResultRepository = analysisResultRepository;
 		this.analysisWindowRepository = analysisWindowRepository;
 		this.pageVisitRepository = pageVisitRepository;
+		this.storedJsonReader = storedJsonReader;
 	}
 
 	// 최신 여부는 windowIndex로만 판단한다(완료 시각·응답 도착 순서 무관). 알림은 별도 기능이라 항상 null
@@ -79,7 +81,7 @@ public class AnalysisQueryService {
 		for (int i = 0; i < visitIds.size(); i++) {
 			visits.add(new AnalysisDetailResponse.Visit(i + 1, visitIds.get(i), sequences.get(visitIds.get(i))));
 		}
-		return AnalysisDetailResponse.of(analysis, window, visits);
+		return AnalysisDetailResponse.of(analysis, window, visits, storedJsonReader);
 	}
 
 	private static AnalysisSummaryResponse first(List<AnalysisSummaryResponse> summaries) {

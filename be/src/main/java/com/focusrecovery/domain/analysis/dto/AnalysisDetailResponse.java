@@ -7,14 +7,15 @@ import java.util.UUID;
 import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.annotation.JsonRawValue;
 import com.focusrecovery.domain.analysis.entity.AnalysisResult;
 import com.focusrecovery.domain.analysis.entity.AnalysisStatus;
+import com.focusrecovery.domain.analysis.service.StoredJsonReader;
 import com.focusrecovery.domain.window.entity.AnalysisWindow;
 
 import io.swagger.v3.oas.annotations.media.Schema;
+import tools.jackson.databind.JsonNode;
 
-// JSON 컬럼은 DB에 저장된 JSON 텍스트를 그대로 내보낸다(@JsonRawValue): 문자열로 다시 감싸지 않고 객체 또는 null이 된다
+// JSON 컬럼은 저장된 JSON을 파싱한 객체(JsonNode)로 내보낸다: 문자열로 다시 감싸지 않으며, 객체가 아니면 응답을 만들지 않는다
 @Schema(description = "분석 결과 상세 (AnalysisSummary 필드 + 구간·입력·모델 정보)")
 @JsonInclude(JsonInclude.Include.ALWAYS)
 public record AnalysisDetailResponse(
@@ -41,11 +42,11 @@ public record AnalysisDetailResponse(
 	@Schema(description = "구간 구성 방문 (position 오름차순 5개). 분석 당시 페이지·행동 값은 inputSnapshot에서 확인")
 	List<Visit> visits,
 	@Schema(description = "맥락 모델 실행 여부. 완료 전·실패 시 null", types = {"boolean", "null"}) Boolean contextUsed,
-	@Schema(description = "구조화된 탐색 맥락 분석 결과", types = {"object", "null"}) @JsonRawValue String contextResult,
-	@Schema(description = "BE가 분석 요청 전에 고정한 목표·방문·행동 입력. 이후 행동 갱신으로 바뀌지 않음", types = {"object", "null"})
-	@JsonRawValue String inputSnapshot,
-	@Schema(description = "모델에 입력한 특징값", types = {"object", "null"}) @JsonRawValue String featureSnapshot,
-	@Schema(description = "분석 모델별 버전", types = {"object", "null"}) @JsonRawValue String modelVersions
+	@Schema(description = "구조화된 탐색 맥락 분석 결과. 세부 구조는 AI 계약 확정 전", types = {"object", "null"}, implementation = Object.class) JsonNode contextResult,
+	@Schema(description = "BE가 분석 요청 전에 고정한 목표·방문·행동 입력. 이후 행동 갱신으로 바뀌지 않음", types = {"object", "null"}, implementation = Object.class)
+	JsonNode inputSnapshot,
+	@Schema(description = "모델에 입력한 특징값. 세부 구조는 AI 계약 확정 전", types = {"object", "null"}, implementation = Object.class) JsonNode featureSnapshot,
+	@Schema(description = "분석 모델별 버전. 세부 구조는 AI 계약 확정 전", types = {"object", "null"}, implementation = Object.class) JsonNode modelVersions
 ) {
 
 	public record Visit(
@@ -55,12 +56,17 @@ public record AnalysisDetailResponse(
 	) {
 	}
 
-	public static AnalysisDetailResponse of(AnalysisResult analysis, AnalysisWindow window, List<Visit> visits) {
+	public static AnalysisDetailResponse of(AnalysisResult analysis, AnalysisWindow window, List<Visit> visits,
+		StoredJsonReader json) {
+		UUID id = analysis.getAnalysisId();
 		return new AnalysisDetailResponse(analysis.getAnalysisId(), analysis.getWindowId(), window.getWindowIndex(),
 			analysis.getProcessingStatus(), analysis.getResult(), analysis.getPNormal(), analysis.getPTransition(),
 			analysis.getPDrift(), analysis.getRequestedAt(), analysis.getAnalyzedAt(), analysis.getCompletedAt(),
 			analysis.getErrorCode(), window.getSessionId(), window.getWindowSize(), window.getStartVisitId(),
-			window.getEndVisitId(), visits, analysis.getContextUsed(), analysis.getContextResult(),
-			analysis.getInputSnapshot(), analysis.getFeatureSnapshot(), analysis.getModelVersions());
+			window.getEndVisitId(), visits, analysis.getContextUsed(),
+			json.objectOrNull(analysis.getContextResult(), id, "contextResult"),
+			json.objectOrNull(analysis.getInputSnapshot(), id, "inputSnapshot"),
+			json.objectOrNull(analysis.getFeatureSnapshot(), id, "featureSnapshot"),
+			json.objectOrNull(analysis.getModelVersions(), id, "modelVersions"));
 	}
 }
