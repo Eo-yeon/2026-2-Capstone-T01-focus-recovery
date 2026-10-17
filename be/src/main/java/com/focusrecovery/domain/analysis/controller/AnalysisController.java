@@ -1,0 +1,123 @@
+package com.focusrecovery.domain.analysis.controller;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import com.focusrecovery.domain.analysis.dto.AnalysisDetailResponse;
+import com.focusrecovery.domain.analysis.dto.AnalysisPageResponse;
+import com.focusrecovery.domain.analysis.dto.AnalysisStatusResponse;
+import com.focusrecovery.domain.analysis.service.AnalysisQueryService;
+import com.focusrecovery.global.exception.ErrorResponse;
+import com.focusrecovery.global.util.Pages;
+import com.focusrecovery.global.util.Uuids;
+
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.ExampleObject;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.tags.Tag;
+
+@Tag(name = "AI 분석 결과", description = "탐색 구간 AI 분석 상태·결과 조회 API (조회 전용)")
+@RestController
+@RequestMapping("/api/sessions/{sessionId}")
+public class AnalysisController {
+
+	private static final String INVALID_SESSION_ID = "세션 ID가 올바른 UUID 형식이 아닙니다.";
+	private static final String NOT_FOUND_EXAMPLES = "SESSION_NOT_FOUND: 세션 없음";
+
+	private final AnalysisQueryService analysisQueryService;
+
+	public AnalysisController(AnalysisQueryService analysisQueryService) {
+		this.analysisQueryService = analysisQueryService;
+	}
+
+	@Operation(
+		summary = "최신 분석 상태 조회",
+		description = """
+			FE 주기 조회용입니다. 분석 대기와 실제 판정을 구분합니다. 종료된 세션도 조회할 수 있습니다.
+
+			- latestAnalysis: 저장된 분석 중 windowIndex가 가장 큰 분석입니다(처리 상태 무관). 처리 중·실패면 result와 확률은 null입니다.
+			- latestCompletedAnalysis: COMPLETED 중 windowIndex가 가장 큰 분석입니다.
+			- 최신 여부는 windowIndex로만 판단하며 완료 시각이나 AI 응답 도착 순서와 무관합니다. 분석이 없으면 각각 null입니다.
+			- 마지막 방문의 행동 정보가 준비되지 않은 구간은 아직 분석이 없으므로 latestAnalysis에 나타나지 않습니다.
+			- **alert: 알림 기능은 아직 구현되지 않아 항상 null입니다.**
+			- 조회만 하며 분석·알림을 만들거나 AI를 호출하지 않습니다.
+			""")
+	@ApiResponse(responseCode = "200", description = "조회 성공")
+	@ApiResponse(responseCode = "400", description = "세션 ID가 UUID 형식이 아님",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "INVALID_REQUEST", "message": "세션 ID가 올바른 UUID 형식이 아닙니다.", "fieldErrors": []}""")))
+	@ApiResponse(responseCode = "404", description = NOT_FOUND_EXAMPLES,
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "SESSION_NOT_FOUND", "message": "작업 세션을 찾을 수 없습니다.", "fieldErrors": []}""")))
+	@GetMapping("/analysis-status")
+	public AnalysisStatusResponse status(
+		@Parameter(description = "작업 세션 ID (UUID)", example = "1ba72f77-c166-4e06-88c7-1d6ed919cd9b")
+		@PathVariable String sessionId
+	) {
+		return analysisQueryService.status(Uuids.parse(sessionId, INVALID_SESSION_ID));
+	}
+
+	@Operation(
+		summary = "분석 결과 목록 조회",
+		description = """
+			세션의 분석을 windowIndex 내림차순으로 조회합니다. PENDING·RUNNING·FAILED도 포함하며 실패를 NORMAL로 바꾸지 않습니다.
+			목록 항목에는 inputSnapshot 등 JSON 필드가 없습니다(상세 조회에서 확인). 분석이 없으면 빈 목록입니다.
+			""")
+	@ApiResponse(responseCode = "200", description = "조회 성공")
+	@ApiResponse(responseCode = "400", description = "잘못된 UUID 또는 페이지네이션 값(page 0 이상, size 1~100, page × size가 int 범위 이내)",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "INVALID_REQUEST", "message": "size는 1 이상 100 이하여야 합니다.", "fieldErrors": []}""")))
+	@ApiResponse(responseCode = "404", description = NOT_FOUND_EXAMPLES,
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "SESSION_NOT_FOUND", "message": "작업 세션을 찾을 수 없습니다.", "fieldErrors": []}""")))
+	@GetMapping("/analyses")
+	public AnalysisPageResponse list(
+		@Parameter(description = "작업 세션 ID (UUID)", example = "1ba72f77-c166-4e06-88c7-1d6ed919cd9b")
+		@PathVariable String sessionId,
+		@Parameter(description = "페이지 번호 (0부터)", example = "0")
+		@RequestParam(defaultValue = "0") int page,
+		@Parameter(description = "페이지 크기 (1~100)", example = "20")
+		@RequestParam(defaultValue = "20") int size
+	) {
+		Pages.validate(page, size);
+		return analysisQueryService.list(Uuids.parse(sessionId, INVALID_SESSION_ID), page, size);
+	}
+
+	@Operation(
+		summary = "분석 결과 상세 조회",
+		description = """
+			분석 요약 필드와 구간 구성·분석 당시 입력·맥락·모델 버전을 조회합니다.
+
+			- visits: 구간 구성 방문 5개(position 1~5 순서)의 visitId·sequence입니다.
+			- inputSnapshot: BE가 분석 요청 전에 고정한 목표·방문·행동 입력이며 이후 행동 갱신으로 바뀌지 않습니다.
+			- contextResult·inputSnapshot·featureSnapshot·modelVersions는 JSON 객체 또는 null입니다(문자열 아님).
+			- 다른 세션의 분석은 404 ANALYSIS_NOT_FOUND입니다.
+			""")
+	@ApiResponse(responseCode = "200", description = "조회 성공")
+	@ApiResponse(responseCode = "400", description = "세션 ID 또는 분석 ID가 UUID 형식이 아님",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "INVALID_REQUEST", "message": "분석 ID가 올바른 UUID 형식이 아닙니다.", "fieldErrors": []}""")))
+	@ApiResponse(responseCode = "404", description = "SESSION_NOT_FOUND: 세션 없음 / ANALYSIS_NOT_FOUND: 분석이 없거나 다른 세션 소속",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = {
+			@ExampleObject(name = "SESSION_NOT_FOUND", value = """
+				{"code": "SESSION_NOT_FOUND", "message": "작업 세션을 찾을 수 없습니다.", "fieldErrors": []}"""),
+			@ExampleObject(name = "ANALYSIS_NOT_FOUND", value = """
+				{"code": "ANALYSIS_NOT_FOUND", "message": "해당 세션에서 분석 결과를 찾을 수 없습니다.", "fieldErrors": []}""")
+		}))
+	@GetMapping("/analyses/{analysisId}")
+	public AnalysisDetailResponse detail(
+		@Parameter(description = "작업 세션 ID (UUID)", example = "1ba72f77-c166-4e06-88c7-1d6ed919cd9b")
+		@PathVariable String sessionId,
+		@Parameter(description = "분석 ID (UUID)", example = "5b1f0c2e-8d3a-4c7e-9f21-6a4d2b8e1c90")
+		@PathVariable String analysisId
+	) {
+		return analysisQueryService.detail(Uuids.parse(sessionId, INVALID_SESSION_ID),
+			Uuids.parse(analysisId, "분석 ID가 올바른 UUID 형식이 아닙니다."));
+	}
+}

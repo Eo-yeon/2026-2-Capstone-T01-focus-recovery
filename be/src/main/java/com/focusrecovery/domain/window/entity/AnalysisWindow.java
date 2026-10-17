@@ -97,6 +97,14 @@ public class AnalysisWindow implements Persistable<UUID> {
 		return windowIndex;
 	}
 
+	public int getWindowSize() {
+		return windowSize;
+	}
+
+	public UUID getStartVisitId() {
+		return startVisitId;
+	}
+
 	public UUID getEndVisitId() {
 		return endVisitId;
 	}

@@ -24,6 +24,8 @@ public interface PageVisitRepository extends JpaRepository<PageVisit, UUID> {
 
 	Optional<VisitSequence> findByVisitId(UUID visitId);
 
+	List<VisitSequence> findByVisitIdIn(List<UUID> visitIds);
+
 	interface VisitSequence {
 		UUID getVisitId();
 
