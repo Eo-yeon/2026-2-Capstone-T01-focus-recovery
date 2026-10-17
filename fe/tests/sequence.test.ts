@@ -1,3 +1,4 @@
+import { serverSession } from './session-fixture';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { Collector, MAX_CANDIDATES } from '../src/background/collector';
 import type { CollectionState, PageSnapshot, PageVisit } from '../src/shared/types';
@@ -15,7 +16,7 @@ function windowIds(visits: PageVisit[]): string[][] {
 beforeEach(() => {
   let id = 0;
   collector = new Collector(undefined, () => `id-${++id}`);
-  collector.start('공개 문서 조사하기', 0);
+  collector.start(serverSession('공개 문서 조사하기', 0));
 });
 describe('finalized valid visit sequence contract', () => {
   it.each([5, 6, 7])('offers %i valid visits as contiguous size-5 stride-1 inputs', count => {

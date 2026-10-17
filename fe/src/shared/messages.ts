@@ -1,5 +1,6 @@
 import type { ContentMessage, PopupMessage } from './types';
 import { inspectUrl, normalizeUrl, validSearchQuery } from './url';
+import { normalizeGoal } from './goal';
 const reasons = new Set(['url-policy', 'dom-policy', 'search-pending', 'short-content', 'short-duration', 'unavailable-content']);
 export function isContentMessage(value: unknown): value is ContentMessage {
   if (!value || typeof value !== 'object') return false;
@@ -21,5 +22,5 @@ export function isContentMessage(value: unknown): value is ContentMessage {
 export function isPopupMessage(value: unknown): value is PopupMessage {
   if (!value || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
-  return ['status', 'stop', 'clear', 'sync-permissions'].includes(v.type as string) || (v.type === 'start' && typeof v.goalText === 'string' && v.goalText.length <= 150);
+  return ['status', 'stop', 'clear', 'sync-permissions'].includes(v.type as string) || (v.type === 'start' && typeof v.goalText === 'string' && normalizeGoal(v.goalText).length <= 150);
 }

@@ -9,7 +9,7 @@ try {
   const extension = join(root, 'extension');
   await cp(resolve('dist'), extension, { recursive: true });
   const manifest = JSON.parse(await readFile(join(extension, 'manifest.json'), 'utf8'));
-  manifest.host_permissions = ['https://www.google.com/*', 'https://search.naver.com/*'];
+  manifest.host_permissions = [...(manifest.host_permissions ?? []), 'https://www.google.com/*', 'https://search.naver.com/*'];
   await writeFile(join(extension, 'manifest.json'), JSON.stringify(manifest));
   context = await chromium.launchPersistentContext(join(root, 'profile'), {
     channel: 'chromium', headless: !process.env.HEADED, executablePath: process.env.CHROMIUM_PATH || undefined,
@@ -17,7 +17,8 @@ try {
   });
   let [worker] = context.serviceWorkers(); worker ??= await context.waitForEvent('serviceworker');
   const popup = await context.newPage(); await popup.goto(`chrome-extension://${worker.url().split('/')[2]}/popup.html`);
-  await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'start', goalText: '공개 검색 동작 검증하기' }));
+  const started = await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'start', goalText: '공개 검색 동작 검증하기' }));
+  if (!started.ok) throw new Error('세션 생성에 실패했습니다. 설정한 BE 서버 실행 상태를 확인해 주세요.');
   const page = await context.newPage();
   const status = () => popup.evaluate(() => chrome.runtime.sendMessage({ type: 'status' })).then(reply => reply.status);
   async function inspect(label, expectedQuery) {

@@ -2,6 +2,8 @@ import type { CollectionState, DevStatus, ExclusionReason, PageSnapshot, PageVis
 import { isMajorContentChange, isSearchContentChange } from '../shared/content-change';
 import { validSearchQuery } from '../shared/url';
 import { resumeActiveTime, settleActiveTime } from './active-time';
+import type { WorkSessionResponse } from '../api/types';
+import { isWorkSession } from '../api/session';
 export const MAX_CANDIDATES = 200;
 export function emptyState(): CollectionState {
   return { sequenceVersion: 1, session: null, nextSequence: 1, tabs: {}, candidates: [], foregroundTabId: null, lastActiveTabId: null, lastActiveVisitId: null, capacityReached: false };
@@ -35,13 +37,22 @@ export class Collector {
       if (candidate.state === 'valid' && candidate.sequence === null) candidate.sequence = this.state.nextSequence++;
     }
   }
-  start(goalText: string, now: number): void {
+  start(session: WorkSessionResponse): void {
     if (this.state.session) throw new Error('이미 활성 세션이 있습니다.');
-    const trimmed = goalText.trim();
-    // Match the existing BE request validator, not an invented FE policy.
-    if (trimmed.length < 5 || trimmed.length > 150) throw new Error('현재 BE 구현과 동일하게 목표는 5~150자로 입력해 주세요.');
+    if (!isWorkSession(session) || session.status !== 'ACTIVE') throw new Error('유효한 서버 활성 세션이 필요합니다.');
     this.state = emptyState();
-    this.state.session = { sessionId: this.uuid(), goalText: trimmed, startedAt: new Date(now).toISOString(), source: 'development-local' };
+    this.state.session = { ...session, source: 'server' };
+  }
+  resume(session: WorkSessionResponse): void {
+    if (this.state.candidates.some(candidate => candidate.sessionId !== session.sessionId)) throw new Error('세션과 방문 기록이 일치하지 않습니다.');
+    const paused = this.state;
+    this.start(session);
+    this.state = { ...paused, session: this.state.session };
+  }
+  suspend(now: number): void {
+    for (const key of Object.keys(this.state.tabs)) this.pause(Number(key), now);
+    this.state.session = null;
+    this.state.foregroundTabId = null;
   }
   current(tabId: number): VisitCandidate | undefined {
     return this.state.candidates.find(candidate => candidate.visitId === this.state.tabs[tabId]?.candidateId);
