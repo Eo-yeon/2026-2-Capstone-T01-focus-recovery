@@ -9,6 +9,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.focusrecovery.domain.analysis.service.AnalysisRequestService;
 import com.focusrecovery.domain.session.dto.EndWorkSessionRequest;
 import com.focusrecovery.domain.session.dto.WorkSessionResponse;
 import com.focusrecovery.domain.session.entity.WorkSession;
@@ -23,10 +24,13 @@ public class WorkSessionService {
 
 	private final WorkSessionRepository workSessionRepository;
 	private final PageVisitService pageVisitService;
+	private final AnalysisRequestService analysisRequestService;
 
-	public WorkSessionService(WorkSessionRepository workSessionRepository, PageVisitService pageVisitService) {
+	public WorkSessionService(WorkSessionRepository workSessionRepository, PageVisitService pageVisitService,
+		AnalysisRequestService analysisRequestService) {
 		this.workSessionRepository = workSessionRepository;
 		this.pageVisitService = pageVisitService;
+		this.analysisRequestService = analysisRequestService;
 	}
 
 	// 트랜잭션을 걸지 않는다: 동시 요청으로 유니크 제약이 위반되면 저장 트랜잭션이 끝난 뒤 다시 조회해야 한다
@@ -70,6 +74,8 @@ public class WorkSessionService {
 			pageVisitService.applyFinalBehaviors(sessionId, finalBehaviors, now);
 		}
 		session.end(now);
+		// 세션 종료로 모든 방문의 행동 정보가 확정되므로 아직 분석을 요청하지 않은 구간을 요청한다(수집 명세 8항)
+		analysisRequestService.requestAllWindows(sessionId, now);
 		return WorkSessionResponse.from(session);
 	}
 
