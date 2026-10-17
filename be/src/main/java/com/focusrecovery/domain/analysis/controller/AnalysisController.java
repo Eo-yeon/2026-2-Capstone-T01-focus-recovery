@@ -41,12 +41,23 @@ public class AnalysisController {
 		description = """
 			FE 주기 조회용입니다. 분석 대기와 실제 판정을 구분합니다. 종료된 세션도 조회할 수 있습니다.
 
-			- latestAnalysis: 저장된 분석 중 windowIndex가 가장 큰 분석입니다(처리 상태 무관). 처리 중·실패면 result와 확률은 null입니다.
-			- latestCompletedAnalysis: COMPLETED 중 windowIndex가 가장 큰 분석입니다.
-			- 최신 여부는 windowIndex로만 판단하며 완료 시각이나 AI 응답 도착 순서와 무관합니다. 분석이 없으면 각각 null입니다.
-			- 마지막 방문의 행동 정보가 준비되지 않은 구간은 아직 분석이 없으므로 latestAnalysis에 나타나지 않습니다.
-			- **alert: 알림 기능은 아직 구현되지 않아 항상 null입니다.**
-			- 조회만 하며 분석·알림을 만들거나 AI를 호출하지 않습니다.
+			**latestAnalysis**
+			- 저장된 분석 중 windowIndex가 가장 큰 분석입니다(처리 상태 무관). 처리 중·실패면 result와 확률은 null입니다.
+			- 최신 여부는 windowIndex로만 판단하며 완료 시각이나 AI 응답 도착 순서와 무관합니다. 분석이 없으면 null입니다.
+			- 마지막 방문의 행동 정보가 준비되지 않아 아직 분석 요청이 생성되지 않은 구간은 나타나지 않습니다.
+
+			**latestCompletedAnalysis**
+			- COMPLETED 중 windowIndex가 가장 큰 분석으로, 완료된 분석 중 가장 최신인 **참고 결과**입니다. 없으면 null입니다.
+			- 현재 탐색 상태를 뜻하지 않으며, 알림 표시를 허용한다는 의미도 아닙니다.
+			- FE는 두 분석의 windowIndex를 비교해 서로 다른 구간의 결과인지 구분해야 합니다.
+			  예) latestAnalysis가 구간 4의 RUNNING이고 latestCompletedAnalysis가 구간 3의 DRIFT라면, 구간 3의 결과로 새 알림을 표시하면 안 됩니다.
+			- 두 windowIndex가 같다는 것만으로 알림을 허용하면 안 됩니다. 아직 분석 요청이 생성되지 않은 더 최신 구간이 있을 수 있습니다.
+
+			**alert (알림 표시 기준)**
+			- 실제 알림 표시는 BE가 반환한 alert 후보를 기준으로 합니다. FE는 표시 직전에 세션이 ACTIVE인지와 alertId 중복 여부를 확인합니다.
+			- **알림 기능은 아직 구현되지 않아 alert는 항상 null입니다.** 분석 결과가 DRIFT여도 이 응답만으로 알림을 표시하지 않습니다.
+
+			조회만 하며 분석·알림을 만들거나 AI를 호출하지 않습니다.
 			""")
 	@ApiResponse(responseCode = "200", description = "조회 성공")
 	@ApiResponse(responseCode = "400", description = "세션 ID가 UUID 형식이 아님",
