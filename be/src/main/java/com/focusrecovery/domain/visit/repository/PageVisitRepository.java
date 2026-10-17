@@ -26,10 +26,11 @@ public interface PageVisitRepository extends JpaRepository<PageVisit, UUID> {
 
 	List<VisitSequence> findByVisitIdIn(List<UUID> visitIds);
 
+	// sequence는 NOT NULL 컬럼이지만, 조회 결과를 방어적으로 검사할 수 있도록 언박싱 전 값(Integer)으로 받는다
 	interface VisitSequence {
 		UUID getVisitId();
 
-		int getSequence();
+		Integer getSequence();
 	}
 
 	@Lock(LockModeType.PESSIMISTIC_WRITE)

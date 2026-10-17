@@ -1,10 +1,11 @@
 package com.focusrecovery.domain.analysis.service;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
@@ -24,6 +25,7 @@ import com.focusrecovery.domain.session.repository.WorkSessionRepository;
 import com.focusrecovery.domain.visit.repository.PageVisitRepository;
 import com.focusrecovery.domain.window.entity.AnalysisWindow;
 import com.focusrecovery.domain.window.repository.AnalysisWindowRepository;
+import com.focusrecovery.global.exception.StoredDataException;
 
 // 조회 전용: 분석·알림을 만들거나 AI를 호출하거나 상태를 바꾸지 않는다
 @Service
@@ -74,14 +76,30 @@ public class AnalysisQueryService {
 		AnalysisWindow window = analysisWindowRepository.findById(analysis.getWindowId())
 			.filter(found -> found.getSessionId().equals(sessionId))
 			.orElseThrow(AnalysisNotFoundException::new);
+		return AnalysisDetailResponse.of(analysis, window, windowVisits(analysisId, window), storedJsonReader);
+	}
+
+	// window_visit → page_visit 외래키가 방문 존재를 보장하지만, 조회 결과가 구간 구성과 다르면 누락을 건너뛰거나
+	// sequence를 채우지 않고 저장 데이터 오류(500)로 처리한다. 응답 순서는 구간의 position 순서다
+	private List<AnalysisDetailResponse.Visit> windowVisits(UUID analysisId, AnalysisWindow window) {
 		List<UUID> visitIds = window.getVisitIds();
-		Map<UUID, Integer> sequences = pageVisitRepository.findByVisitIdIn(visitIds).stream()
-			.collect(Collectors.toMap(PageVisitRepository.VisitSequence::getVisitId, PageVisitRepository.VisitSequence::getSequence));
+		List<PageVisitRepository.VisitSequence> found = pageVisitRepository.findByVisitIdIn(visitIds);
+		Map<UUID, Integer> sequences = new HashMap<>();
+		found.forEach(visit -> sequences.put(visit.getVisitId(), visit.getSequence()));
+		if (found.size() != visitIds.size() || !sequences.keySet().equals(new HashSet<>(visitIds))) {
+			throw new StoredDataException("구간 구성 방문과 조회된 방문이 일치하지 않습니다. analysisId=" + analysisId
+				+ " windowId=" + window.getWindowId() + " expected=" + visitIds.size() + " found=" + found.size());
+		}
 		List<AnalysisDetailResponse.Visit> visits = new ArrayList<>();
 		for (int i = 0; i < visitIds.size(); i++) {
-			visits.add(new AnalysisDetailResponse.Visit(i + 1, visitIds.get(i), sequences.get(visitIds.get(i))));
+			Integer sequence = sequences.get(visitIds.get(i));
+			if (sequence == null) {
+				throw new StoredDataException("구간 구성 방문의 sequence가 없습니다. analysisId=" + analysisId
+					+ " visitId=" + visitIds.get(i));
+			}
+			visits.add(new AnalysisDetailResponse.Visit(i + 1, visitIds.get(i), sequence));
 		}
-		return AnalysisDetailResponse.of(analysis, window, visits, storedJsonReader);
+		return visits;
 	}
 
 	private static AnalysisSummaryResponse first(List<AnalysisSummaryResponse> summaries) {

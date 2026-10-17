@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.nullValue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
@@ -66,7 +68,8 @@ class AnalysisQueryApiTest {
 	@Autowired
 	private WorkSessionRepository workSessionRepository;
 
-	@Autowired
+	// 기본은 실제 조회를 한다. 구성 방문 조회 결과가 비정상인 경우만 스텁으로 재현한다(DB 외래키·데이터는 건드리지 않음)
+	@MockitoSpyBean
 	private PageVisitRepository pageVisitRepository;
 
 	@Autowired
@@ -314,6 +317,84 @@ class AnalysisQueryApiTest {
 			.doesNotContain("\"contextResult\":\"", "\"inputSnapshot\":\"", "\"modelVersions\":\"");
 		assertThat(analysisResultRepository.findById(analysisId).orElseThrow().getContextResult())
 			.isEqualTo(analysis.getContextResult());
+	}
+
+	@Test
+	void 구성_방문은_조회된_방문과_일치하면_position_순서로_반환한다() throws Exception {
+		AnalysisWindow window = createWindows(sessionId, 7).get(2);
+		UUID analysisId = completed(window, "NORMAL", Instant.parse("2026-10-16T02:00:00.000Z"));
+		// 조회 순서가 구간 순서와 달라도 응답은 position 순서다
+		List<PageVisitRepository.VisitSequence> reversed = new ArrayList<>(pageVisitRepository.findByVisitIdIn(
+			visitIds.subList(2, 7).stream().map(UUID::fromString).toList()));
+		assertThat(reversed).hasSize(5);
+		java.util.Collections.reverse(reversed);
+		doReturn(reversed).when(pageVisitRepository).findByVisitIdIn(any());
+
+		mockMvc.perform(get("/api/sessions/{sessionId}/analyses/{analysisId}", sessionId, analysisId))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.visits[*].position", contains(1, 2, 3, 4, 5)))
+			.andExpect(jsonPath("$.visits[*].sequence", contains(3, 4, 5, 6, 7)))
+			.andExpect(jsonPath("$.visits[*].visitId", contains(visitIds.subList(2, 7).toArray())));
+	}
+
+	static List<String> brokenVisitLookups() {
+		return List.of("일부_누락", "다른_방문_섞임", "중복_조회", "sequence_null", "visitId_null");
+	}
+
+	@ParameterizedTest
+	@MethodSource("brokenVisitLookups")
+	void 구성_방문_조회_결과가_구간과_다르면_건너뛰거나_채우지_않고_500이다(String kind) throws Exception {
+		AnalysisWindow window = createWindows(sessionId, 5).getFirst();
+		UUID analysisId = completed(window, "NORMAL", Instant.parse("2026-10-16T02:00:00.000Z"));
+		// 구간 1은 sequence 1~5 방문으로 구성된다(트랜잭션 밖이라 구간의 지연 로딩 컬렉션 대신 저장한 ID를 쓴다)
+		List<UUID> ids = visitIds.stream().map(UUID::fromString).toList();
+		List<PageVisitRepository.VisitSequence> lookup = new ArrayList<>();
+		for (int i = 0; i < ids.size(); i++) {
+			lookup.add(visitSequence(ids.get(i), i + 1));
+		}
+		switch (kind) {
+			case "일부_누락" -> lookup.remove(2);
+			case "다른_방문_섞임" -> lookup.set(2, visitSequence(UUID.randomUUID(), 3));
+			case "중복_조회" -> lookup.add(visitSequence(ids.get(4), 5));
+			case "sequence_null" -> lookup.set(3, visitSequence(ids.get(3), null));
+			case "visitId_null" -> lookup.set(1, visitSequence(null, 2));
+			default -> throw new IllegalArgumentException(kind);
+		}
+		doReturn(lookup).when(pageVisitRepository).findByVisitIdIn(any());
+		List<Map<String, Object>> before = analysisRows();
+
+		String body = mockMvc.perform(get("/api/sessions/{sessionId}/analyses/{analysisId}", sessionId, analysisId))
+			.andExpect(status().isInternalServerError())
+			.andExpect(jsonPath("$.code").value("INTERNAL_ERROR"))
+			.andExpect(jsonPath("$.message").value("서버 내부 오류가 발생했습니다."))
+			.andExpect(jsonPath("$.fieldErrors").isEmpty())
+			.andReturn().getResponse().getContentAsString();
+
+		assertThat(body).doesNotContain(analysisId.toString(), window.getWindowId().toString(), "visits", "sequence");
+		assertThat(analysisRows()).isEqualTo(before);
+		assertThat(pageVisitRepository.count()).isEqualTo(5);
+		// 404 판정은 구성 방문 조회 전에 끝나므로 그대로다
+		mockMvc.perform(get("/api/sessions/{sessionId}/analyses/{analysisId}", sessionId, UUID.randomUUID()))
+			.andExpect(status().isNotFound())
+			.andExpect(jsonPath("$.code").value("ANALYSIS_NOT_FOUND"));
+		UUID otherSession = newSession();
+		mockMvc.perform(get("/api/sessions/{sessionId}/analyses/{analysisId}", otherSession, analysisId))
+			.andExpect(status().isNotFound())
+			.andExpect(jsonPath("$.code").value("ANALYSIS_NOT_FOUND"));
+	}
+
+	private static PageVisitRepository.VisitSequence visitSequence(UUID visitId, Integer sequence) {
+		return new PageVisitRepository.VisitSequence() {
+			@Override
+			public UUID getVisitId() {
+				return visitId;
+			}
+
+			@Override
+			public Integer getSequence() {
+				return sequence;
+			}
+		};
 	}
 
 	static List<String[]> invalidStoredJson() {
