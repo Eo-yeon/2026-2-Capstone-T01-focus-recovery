@@ -43,6 +43,17 @@ export class Collector {
     this.state = emptyState();
     this.state.session = { ...session, source: 'server' };
   }
+  resume(session: WorkSessionResponse): void {
+    if (this.state.candidates.some(candidate => candidate.sessionId !== session.sessionId)) throw new Error('세션과 방문 기록이 일치하지 않습니다.');
+    const paused = this.state;
+    this.start(session);
+    this.state = { ...paused, session: this.state.session };
+  }
+  suspend(now: number): void {
+    for (const key of Object.keys(this.state.tabs)) this.pause(Number(key), now);
+    this.state.session = null;
+    this.state.foregroundTabId = null;
+  }
   current(tabId: number): VisitCandidate | undefined {
     return this.state.candidates.find(candidate => candidate.visitId === this.state.tabs[tabId]?.candidateId);
   }

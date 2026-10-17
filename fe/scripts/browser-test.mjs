@@ -315,6 +315,61 @@ try {
     console.log('PASS: native multi-window focus/minimize/restore');
   } else console.log('SKIP: native multi-window focus/minimize/restore requires HEADED=1');
   console.log(`PASS: real MV3 load, popup, messaging, session gate, extraction, reload, back/forward, SPA, tabs, sequence, navigation failure/tab-close race, worker restart, sensitive/short exclusion, synthetic Google/Naver organic results, search SPA/reload/history/tabs/recovery/zero results, stop (${context.browser()?.version() ?? 'Chromium'})`);
+  await popup.reload();
+  await popup.getByLabel(/최초 작업 목표/).fill('세션 오류 복구 검증하기');
+  await popup.getByRole('button', { name: '작업 세션 시작', exact: true }).click();
+  await popup.getByText('서버 세션으로 수집 중', { exact: false }).waitFor();
+  await page.goto(`${origin}/a`); await page.bringToFront();
+  const beforeCheckpointFailure = await until(state => state.visits.length > 0, 'recovery test visit');
+  const activeWorker = context.serviceWorkers().find(candidate => candidate.url().includes(id));
+  assert.ok(activeWorker, 'active extension worker exists');
+  // Inject one storage failure in the real worker; HTTP still uses the fixture above.
+  await activeWorker.evaluate(() => {
+    const original = chrome.storage.session.set.bind(chrome.storage.session);
+    chrome.storage.session.set = async (...args) => {
+      chrome.storage.session.set = original;
+      throw new Error('SYNTHETIC_CHECKPOINT_FAILURE');
+    };
+  });
+  const failed = await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'status' }));
+  assert.equal(failed.ok, false, 'storage failure reaches the fail-closed handler');
+  assert.equal(failed.status.session, null);
+  assert.equal(failed.status.sessionStartRecovery.kind, 'pending');
+  const requestCount = apiRequests.length;
+  async function restartWorker() {
+    const cdp = await context.newCDPSession(page);
+    await cdp.send('ServiceWorker.enable'); await cdp.send('ServiceWorker.stopAllWorkers');
+    await cdp.detach(); await popup.reload();
+  }
+  await restartWorker();
+  await popup.getByRole('button', { name: '같은 요청 재시도', exact: true }).click();
+  await popup.getByText('서버 세션으로 수집 중', { exact: false }).waitFor();
+  result = await status();
+  assert.equal(result.session.sessionId, beforeCheckpointFailure.session.sessionId);
+  for (const visit of beforeCheckpointFailure.visits) {
+    const restored = result.visits.find(candidate => candidate.visitId === visit.visitId);
+    assert.ok(restored, 'visit ID survives failure and restart');
+    assert.equal(restored.sequence, visit.sequence);
+    assert.ok(restored.activeDurationMs >= visit.activeDurationMs);
+  }
+  assert.equal(apiRequests.length, requestCount, 'durable successful response is reused without POST');
+  await popup.getByRole('button', { name: '로컬 수집 종료', exact: true }).click();
+  const corrupt = { idempotencyKey: 'broken', goalText: 'PRIVATE_CORRUPTED_RECORD', apiBaseUrl: 'http://localhost:8080' };
+  await popup.evaluate(record => chrome.storage.local.set({ pendingSessionStart: record }), corrupt);
+  for (let restart = 0; restart < 2; restart++) {
+    await restartWorker();
+    await popup.getByText('상태: 시작 요청 복구 필요', { exact: true }).waitFor();
+    assert.equal(await popup.getByRole('button', { name: '작업 세션 시작', exact: true }).isDisabled(), true);
+    assert.equal(await popup.getByLabel(/최초 작업 목표/).isDisabled(), true);
+    assert.equal((await popup.locator('body').innerText()).includes('PRIVATE_CORRUPTED_RECORD'), false);
+    const blocked = await status();
+    assert.equal(blocked.session, null); assert.equal(blocked.sessionStartRecovery.kind, 'invalid');
+    await popup.getByRole('button', { name: '로컬 기록 삭제', exact: true }).click();
+    await until(state => state.candidates.length === 0, 'explicit clear removes visits');
+    assert.deepEqual(await popup.evaluate(() => chrome.storage.local.get('pendingSessionStart').then(saved => saved.pendingSessionStart)), corrupt);
+  }
+  assert.equal(apiRequests.length, requestCount, 'corruption never creates another server session');
+  console.log('PASS: MV3 checkpoint failure, cached-response recovery after restart, stable visits, corrupt-record Popup lock, readable status, explicit visit clear preserves raw request across restarts');
 } finally {
   await context?.close();
   await new Promise(resolve => server.close(resolve));

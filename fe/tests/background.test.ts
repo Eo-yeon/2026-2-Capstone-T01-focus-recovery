@@ -427,7 +427,8 @@ describe('background Chrome adapter', () => {
     expect(reply.ok).toBe(false);
     expect(JSON.stringify(reply)).not.toContain('SYNTHETIC_PRIVATE_ERROR');
     expect(local.activeSession).toBeUndefined();
-    expect(memory.collection.session).toBeNull();
+    expect(memory.collection).toBeUndefined();
+    expect((await message({ type: 'status' })).status?.sessionStartRecovery).toMatchObject({ kind: 'invalid', reason: 'initialization-failed' });
   });
   it('communicates only during a session, starts on existing permitted tabs, and stops late snapshots', async () => {
     expect(await message({ type: 'context' }, pageSender)).toMatchObject({ ok: true, sessionId: null });
@@ -454,12 +455,14 @@ describe('background Chrome adapter', () => {
     const reply = await message({ type: 'status' }, { ...popupSender, tab: { id: 99 } } as typeof popupSender);
     expect(reply.ok).toBe(true);
   });
-  it('fails closed on checkpoint storage failure and can handle the next command', async () => {
+  it('fails closed on checkpoint storage failure and recovers the same session', async () => {
     await message({ type: 'start', goalText: '공개 문서 조사하기' });
     api.storage.session.set.mockRejectedValueOnce(new Error('synthetic failure'));
     expect((await message({ type: 'context' }, pageSender)).ok).toBe(false);
     expect((await message({ type: 'status' })).status?.session).toBeNull();
-    expect((await message({ type: 'start', goalText: '새로운 작업 목표' })).ok).toBe(true);
+    expect((await message({ type: 'start', goalText: '새로운 작업 목표' })).ok).toBe(false);
+    expect((await message({ type: 'start', goalText: '공개 문서 조사하기' })).status?.session?.sessionId).toBe(SERVER_SESSION_ID);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
   it('ignores foreign extensions, child frames and inactive/BFCache documents', async () => {
     for (const sender of [{ ...pageSender, id: 'foreign' }, { ...pageSender, frameId: 1 }, { ...pageSender, documentLifecycle: 'cached' }]) {
@@ -671,7 +674,7 @@ describe('server session integration and durable recovery', () => {
     expect(api.scripting.registerContentScripts).not.toHaveBeenCalled();
     await reloadWorker();
     const state = (await message({ type: 'status' })).status!;
-    expect(state.pendingStart?.goalText).toBe(goalText);
+    expect(state.sessionStartRecovery).toMatchObject({ kind: 'pending', goalText });
     expect((await start('다른 작업 목표')).ok).toBe(false);
     expect(fetch).toHaveBeenCalledTimes(1);
     expect((await start()).ok).toBe(true);
@@ -748,17 +751,17 @@ describe('server session integration and durable recovery', () => {
     const key = crypto.randomUUID();
     local.pendingSessionStart = { idempotencyKey: key, goalText, apiBaseUrl: 'http://localhost:8080' };
     await reloadWorker();
-    expect((await message({ type: 'status' })).status?.pendingStart).toEqual({ goalText });
+    expect((await message({ type: 'status' })).status?.sessionStartRecovery).toMatchObject({ kind: 'pending', goalText });
     expect(fetch).not.toHaveBeenCalled();
     expect((await start()).ok).toBe(true);
     expect(vi.mocked(fetch).mock.calls[0][1]?.headers).toMatchObject({ 'Idempotency-Key': key });
   });
   it('requires explicit recovery after a crash between activation checkpoint and pending cleanup', async () => {
     await start();
-    local.pendingSessionStart = { idempotencyKey: crypto.randomUUID(), goalText, apiBaseUrl: 'http://localhost:8080', response: serverSession(goalText) };
+    local.pendingSessionStart = structuredClone(local.activeSession.startRequest);
     await reloadWorker();
     const state = (await message({ type: 'status' })).status!;
-    expect(state.session).toBeNull(); expect(state.pendingStart).toEqual({ goalText });
+    expect(state.session).toBeNull(); expect(state.sessionStartRecovery).toMatchObject({ kind: 'pending', goalText });
     expect((await message({ type: 'context' }, pageSender)).sessionId).toBeNull();
     expect((await start()).ok).toBe(true); expect(fetch).toHaveBeenCalledTimes(1);
   });
@@ -795,5 +798,192 @@ describe('server session integration and durable recovery', () => {
     memory.collection.session.source = 'development-local';
     await reloadWorker();
     expect((await message({ type: 'status' })).status?.session).toBeNull();
+  });
+});
+
+describe('corrupt start records stay inspectable', () => {
+  const valid = () => ({ idempotencyKey: crypto.randomUUID(), goalText: '공개 문서 조사하기', apiBaseUrl: 'http://localhost:8080' });
+  it.each([
+    ['UUID', () => ({ ...valid(), idempotencyKey: 'broken' })],
+    ['missing goal', () => ({ idempotencyKey: crypto.randomUUID(), apiBaseUrl: 'http://localhost:8080' })],
+    ['missing key', () => ({ goalText: '공개 문서 조사하기', apiBaseUrl: 'http://localhost:8080' })],
+    ['missing URL', () => ({ idempotencyKey: crypto.randomUUID(), goalText: '공개 문서 조사하기' })],
+    ['URL scheme', () => ({ ...valid(), apiBaseUrl: 'file:///private' })],
+    ['URL path', () => ({ ...valid(), apiBaseUrl: 'http://localhost:8080/api' })],
+    ['empty query', () => ({ ...valid(), apiBaseUrl: 'http://localhost:8080/?' })],
+    ['response', () => ({ ...valid(), response: { sessionId: 'broken' } })],
+    ['null', () => null], ['false', () => false], ['string', () => 'PRIVATE_CORRUPTED_RECORD'],
+  ])('preserves %s corruption and serves status/clear across restart', async (_label, makeRecord) => {
+    const record = makeRecord(); local.pendingSessionStart = structuredClone(record);
+    await reloadWorker();
+    for (let restart = 0; restart < 2; restart++) {
+      const reply = await message({ type: 'status' });
+      expect(reply).toMatchObject({ ok: true, status: { session: null, sessionStartRecovery: { kind: 'invalid', reason: 'corrupted-record' } } });
+      expect(JSON.stringify(reply)).not.toContain('PRIVATE_CORRUPTED_RECORD');
+      expect((await message({ type: 'start', goalText: '새로운 작업 목표' })).ok).toBe(false);
+      expect((await message({ type: 'clear' })).ok).toBe(true);
+      expect((await message({ type: 'stop' })).ok).toBe(true);
+      expect(local.pendingSessionStart).toEqual(record); expect(fetch).not.toHaveBeenCalled();
+      expect(api.scripting.registerContentScripts).not.toHaveBeenCalled(); await reloadWorker();
+    }
+  });
+  it('pauses an active checkpoint without erasing visits or the corrupt record', async () => {
+    await message({ type: 'start', goalText: '공개 문서 조사하기' }); await message({ type: 'context' }, pageSender);
+    const ids = memory.collection.candidates.map((c: any) => c.visitId);
+    local.pendingSessionStart = { ...valid(), response: 'PRIVATE_CORRUPTED_RESPONSE' };
+    const record = structuredClone(local.pendingSessionStart); await reloadWorker();
+    expect(await message({ type: 'status' })).toMatchObject({ ok: true, status: { session: null, sessionStartRecovery: { kind: 'invalid' } } });
+    expect((await message({ type: 'context' }, pageSender)).sessionId).toBeNull();
+    expect(memory.collection.candidates.map((c: any) => c.visitId)).toEqual(ids);
+    expect(memory.collection.candidates.every((c: any) => c.activeSince === null)).toBe(true);
+    expect(local.pendingSessionStart).toEqual(record); expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('active failures preserve creation identity', () => {
+  const goalText = '공개 문서 조사하기';
+  const start = (goal = goalText) => message({ type: 'start', goalText: goal });
+  it('blocks a new goal and resumes existing visits after save failure and restart', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(10000);
+    await start(); await message({ type: 'context' }, pageSender); clock.mockReturnValue(11000);
+    await message({ type: 'snapshot', sessionId: SERVER_SESSION_ID, snapshot: { ...await describeUrl(frame.url), title: '문서', content: 'x'.repeat(50) } }, pageSender);
+    const before = structuredClone(memory.collection);
+    api.storage.session.set.mockRejectedValueOnce(new Error('PRIVATE_CHECKPOINT_ERROR'));
+    expect((await message({ type: 'context' }, pageSender)).ok).toBe(false);
+    expect((await start('다른 작업 목표')).ok).toBe(false); expect(fetch).toHaveBeenCalledTimes(1);
+    await reloadWorker();
+    expect(await message({ type: 'status' })).toMatchObject({ ok: true, status: { session: null, sessionStartRecovery: { kind: 'pending', goalText } } });
+    expect((await message({ type: 'context' }, pageSender)).sessionId).toBeNull();
+    expect((await start()).status?.session?.sessionId).toBe(SERVER_SESSION_ID);
+    expect(memory.collection.candidates.map((c: any) => c.visitId)).toEqual(before.candidates.map((c: any) => c.visitId));
+    expect(memory.collection.candidates[0].activeDurationMs).toBe(before.candidates[0].activeDurationMs);
+    expect(memory.collection.candidates[0].sequence).toBe(before.candidates[0].sequence); expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it.each(['both stores', 'checkpoint cleanup'])('retains the receipt after repeated %s failures', async mode => {
+    await start(); const receipt = structuredClone(local.activeSession);
+    api.storage.session.set.mockRejectedValue(new Error('PRIVATE_STORAGE_FAILURE'));
+    if (mode === 'both stores') api.storage.local.set.mockRejectedValue(new Error('PRIVATE_STORAGE_FAILURE'));
+    else api.storage.session.remove.mockRejectedValue(new Error('PRIVATE_STORAGE_FAILURE'));
+    expect((await message({ type: 'context' }, pageSender)).ok).toBe(false);
+    expect(local.activeSession).toMatchObject({ sessionId: SERVER_SESSION_ID, startRequest: receipt.startRequest });
+    api.storage.session.set.mockImplementation(area(memory).set); api.storage.local.set.mockImplementation(area(local).set);
+    api.storage.session.remove.mockImplementation(area(memory).remove); await reloadWorker();
+    expect((await message({ type: 'status' })).status?.session).toBeNull();
+    expect((await start('다른 작업 목표')).ok).toBe(false);
+    expect((await start()).status?.session?.sessionId).toBe(SERVER_SESSION_ID); expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('requires operator recovery when a legacy active session has no creation key', async () => {
+    await start(); delete local.activeSession.startRequest; await reloadWorker();
+    api.storage.session.set.mockRejectedValueOnce(new Error('checkpoint failure'));
+    expect((await message({ type: 'context' }, pageSender)).ok).toBe(false); await reloadWorker();
+    expect(await message({ type: 'status' })).toMatchObject({ ok: true, status: { session: null, sessionStartRecovery: { kind: 'invalid', reason: 'missing-request' } } });
+    expect(local.activeSession.sessionId).toBe(SERVER_SESSION_ID);
+    expect((await start('다른 작업 목표')).ok).toBe(false); expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('activation receipts and failure boundaries', () => {
+  const goalText = '공개 문서 조사하기';
+  const start = () => message({ type: 'start', goalText });
+  it('reuses a received response in the same Worker when saving it fails', async () => {
+    const set = api.storage.local.set.getMockImplementation();
+    api.storage.local.set.mockImplementationOnce(set).mockRejectedValueOnce(new Error('response save'));
+    expect((await start()).ok).toBe(false);
+    expect((await start()).status?.session?.sessionId).toBe(SERVER_SESSION_ID);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('retries a failed Collector activation from its saved response', async () => {
+    const { Collector } = await import('../src/background/collector');
+    vi.spyOn(Collector.prototype, 'start').mockImplementationOnce(() => { throw new Error('activation'); });
+    expect((await start()).ok).toBe(false);
+    const pending = structuredClone(local.pendingSessionStart);
+    await reloadWorker();
+    expect((await message({ type: 'status' })).status?.session).toBeNull();
+    expect((await start()).status?.session?.sessionId).toBe(pending.response.sessionId);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('retains the saved response through Script registration failure and restart', async () => {
+    api.scripting.registerContentScripts.mockRejectedValueOnce(new Error('PRIVATE_SCRIPT_ERROR'));
+    const reply = await start();
+    expect(reply).toMatchObject({ ok: false, status: { session: null, sessionStartRecovery: { kind: 'pending', goalText } } });
+    expect(JSON.stringify(reply)).not.toContain('PRIVATE_SCRIPT_ERROR');
+    const pending = structuredClone(local.pendingSessionStart);
+    await reloadWorker();
+    expect((await message({ type: 'context' }, pageSender)).sessionId).toBeNull();
+    expect((await start()).status?.session?.sessionId).toBe(pending.response.sessionId);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('does not undo activation when a tab rejects its broadcast', async () => {
+    api.tabs.sendMessage.mockRejectedValue(new Error('closed tab'));
+    expect((await start()).status?.session?.sessionId).toBe(SERVER_SESSION_ID);
+    expect(local.activeSession.startRequest.response.sessionId).toBe(SERVER_SESSION_ID);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('pauses an active session on a fatal permission sync error without losing its receipt', async () => {
+    await start(); const key = local.activeSession.startRequest.idempotencyKey;
+    api.permissions.getAll.mockRejectedValueOnce(new Error('permission configuration'));
+    expect((await message({ type: 'sync-permissions' })).ok).toBe(false);
+    expect((await message({ type: 'status' })).status?.session).toBeNull();
+    await reloadWorker();
+    expect(local.activeSession.startRequest.idempotencyKey).toBe(key);
+    expect((await start()).status?.session?.sessionId).toBe(SERVER_SESSION_ID);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('keeps completed identity after browser restart but never resumes automatically', async () => {
+    await start(); const key = local.activeSession.startRequest.idempotencyKey;
+    memory = {}; api.storage.session = area(memory); await reloadWorker();
+    expect(await message({ type: 'status' })).toMatchObject({ ok: true, status: { session: null, sessionStartRecovery: { kind: 'pending', goalText } } });
+    expect(local.activeSession.startRequest.idempotencyKey).toBe(key);
+    expect((await start()).status?.session?.sessionId).toBe(SERVER_SESSION_ID);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('preserves visits when a crash leaves a pending response and checkpoint before active metadata', async () => {
+    await start(); await message({ type: 'context' }, pageSender);
+    const visitIds = memory.collection.candidates.map((candidate: any) => candidate.visitId);
+    expect(visitIds).toHaveLength(1);
+    local.pendingSessionStart = structuredClone(local.activeSession.startRequest);
+    delete local.activeSession;
+    await reloadWorker();
+    expect((await message({ type: 'status' })).status?.session).toBeNull();
+    expect((await start()).status?.session?.sessionId).toBe(SERVER_SESSION_ID);
+    expect(memory.collection.candidates.map((candidate: any) => candidate.visitId)).toEqual(visitIds);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('blocks a checkpoint whose visits conflict with its completed receipt', async () => {
+    await start(); await message({ type: 'context' }, pageSender);
+    memory.collection.candidates[0].sessionId = crypto.randomUUID();
+    const original = structuredClone(local.activeSession); await reloadWorker();
+    expect((await message({ type: 'status' })).status?.sessionStartRecovery).toMatchObject({ kind: 'invalid', reason: 'conflicting-records' });
+    expect((await start()).ok).toBe(false);
+    expect(local.activeSession).toEqual(original);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('only releases a completed receipt after an explicit local stop is persisted', async () => {
+    await start(); await message({ type: 'stop' });
+    expect(local.activeSession).toBeUndefined(); expect(local.pendingSessionStart).toBeUndefined();
+    await reloadWorker();
+    expect((await message({ type: 'status' })).status?.sessionStartRecovery).toEqual({ kind: 'none' });
+    expect((await message({ type: 'start', goalText: '새로운 작업 목표' })).ok).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+  it('does not release a receipt when local stop metadata cleanup fails', async () => {
+    await start(); const receipt = structuredClone(local.activeSession);
+    api.storage.local.remove.mockRejectedValueOnce(new Error('cleanup failure'));
+    expect((await message({ type: 'stop' })).ok).toBe(false);
+    expect(local.activeSession.startRequest).toEqual(receipt.startRequest);
+    await reloadWorker();
+    expect((await message({ type: 'status' })).status?.session).toBeNull();
+    expect((await message({ type: 'start', goalText: '다른 작업 목표' })).ok).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it.each(['response', 'metadata', 'conflict'])('blocks %s inconsistency without rewriting raw records', async kind => {
+    await start();
+    if (kind === 'response') local.activeSession.startRequest.response.sessionId = crypto.randomUUID();
+    if (kind === 'metadata') local.activeSession.startedAt = 'broken';
+    if (kind === 'conflict') local.pendingSessionStart = { ...structuredClone(local.activeSession.startRequest), idempotencyKey: crypto.randomUUID() };
+    const records = structuredClone(local); await reloadWorker();
+    expect((await message({ type: 'status' })).status?.sessionStartRecovery).toMatchObject({ kind: 'invalid', reason: kind === 'conflict' ? 'conflicting-records' : 'corrupted-record' });
+    expect((await start()).ok).toBe(false);
+    expect(local).toEqual(records); expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

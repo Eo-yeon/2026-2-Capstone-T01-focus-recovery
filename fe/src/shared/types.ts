@@ -6,6 +6,10 @@ export interface PendingSessionStart {
   apiBaseUrl: string;
   response?: WorkSessionResponse;
 }
+export type SessionStartRecovery =
+  | { kind: 'none' }
+  | { kind: 'pending'; goalText: string; blockedReason?: 'server-changed' | 'server-ended' }
+  | { kind: 'invalid'; reason: 'corrupted-record' | 'conflicting-records' | 'missing-request' | 'initialization-failed'; sessionId?: string };
 export interface VisitBehavior {
   activeDurationMs: number;
   tabSwitchCount: number;
@@ -75,7 +79,7 @@ export type ContentMessage =
 export type PopupMessage = { type: 'status' } | { type: 'start'; goalText: string } | { type: 'stop' } | { type: 'clear' } | { type: 'sync-permissions' };
 export interface DevStatus {
   session: ServerSession | null;
-  pendingStart?: { goalText: string };
+  sessionStartRecovery?: SessionStartRecovery;
   candidates: Omit<VisitCandidate, 'snapshot' | 'activeSince' | 'activeTimeCursor'>[];
   visits: (Omit<PageVisit, 'sequence'> & { sequence: number | null })[];
   readyVisits: PageVisit[]; // Only these have immutable, contiguous server sequences.

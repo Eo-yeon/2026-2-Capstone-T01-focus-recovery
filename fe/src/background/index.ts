@@ -2,56 +2,108 @@ import { Collector, emptyState } from './collector';
 import { serialExecutor } from './serial';
 import { describeUrl } from '../shared/url';
 import { isContentMessage, isPopupMessage } from '../shared/messages';
-import type { CollectionState, PendingSessionStart, Reply } from '../shared/types';
+import type { CollectionState, PendingSessionStart, Reply, ServerSession, SessionStartRecovery } from '../shared/types';
 import { API_BASE_URL, ApiError } from '../api/client';
 import { createSession, isWorkSession, UUID } from '../api/session';
 import { normalizeGoal, validGoal } from '../shared/goal';
+import { isApiOrigin } from '../shared/api-origin';
 
 const enqueue = serialExecutor();
 const collector = new Collector();
 let pendingStart: PendingSessionStart | undefined;
+let activeStart: PendingSessionStart | undefined;
+let retainedSession: ServerSession | undefined;
+let invalidRecovery: Extract<SessionStartRecovery, { kind: 'invalid' }>['reason'] | undefined;
 let startInFlight = false;
 let activatedAt = 0;
 let needsForegroundRecovery = false;
 let focusedWindowId: number | null | undefined;
 const activeWindowTabs = new Map<number, number>();
+function isStartRecord(value: unknown): value is PendingSessionStart {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.idempotencyKey === 'string' && UUID.test(v.idempotencyKey)
+    && typeof v.goalText === 'string' && validGoal(v.goalText) && normalizeGoal(v.goalText) === v.goalText
+    && isApiOrigin(v.apiBaseUrl)
+    && (v.response === undefined || (isWorkSession(v.response) && v.response.goalText === v.goalText));
+}
+function suspend(now: number) {
+  pendingStart ??= activeStart;
+  if (!pendingStart && collector.state.session) invalidRecovery ??= 'missing-request';
+  collector.suspend(now);
+}
+function recovery(): SessionStartRecovery {
+  if (invalidRecovery) return { kind: 'invalid', reason: invalidRecovery, sessionId: retainedSession?.sessionId };
+  if (!pendingStart) return { kind: 'none' };
+  const blockedReason = pendingStart.apiBaseUrl !== API_BASE_URL ? 'server-changed'
+    : pendingStart.response?.status === 'ENDED' ? 'server-ended' : undefined;
+  return { kind: 'pending', goalText: pendingStart.goalText, blockedReason };
+}
+function status(now: number) {
+  return { ...collector.status(now), sessionStartRecovery: recovery() };
+}
 const ready = (async () => {
   await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
   await chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
-  const pending = (await chrome.storage.local.get('pendingSessionStart')).pendingSessionStart as Record<string, unknown> | undefined;
-  if (pending) {
-    if (typeof pending.idempotencyKey !== 'string' || !UUID.test(pending.idempotencyKey)
-      || typeof pending.goalText !== 'string' || !validGoal(pending.goalText) || normalizeGoal(pending.goalText) !== pending.goalText
-      || typeof pending.apiBaseUrl !== 'string'
-      || (pending.response !== undefined && (!isWorkSession(pending.response) || pending.response.goalText !== pending.goalText))) throw new Error('Invalid pending start');
-    pendingStart = pending as unknown as PendingSessionStart;
+  const pending = (await chrome.storage.local.get('pendingSessionStart')).pendingSessionStart;
+  if (pending !== undefined) {
+    if (isStartRecord(pending)) pendingStart = pending;
+    else invalidRecovery = 'corrupted-record';
   }
+  const metadata = (await chrome.storage.local.get('activeSession')).activeSession;
+  let interrupted = false;
+  if (metadata && typeof metadata === 'object' && ('startRequest' in metadata || 'interrupted' in metadata)
+    && (!isWorkSession(metadata) || !('source' in metadata) || metadata.source !== 'server' || metadata.status !== 'ACTIVE')) invalidRecovery = 'corrupted-record';
+  if (isWorkSession(metadata) && 'source' in metadata && metadata.source === 'server') {
+    retainedSession = metadata as ServerSession;
+    const saved = metadata as ServerSession & { startRequest?: unknown; interrupted?: unknown };
+    interrupted = saved.interrupted === true;
+    if (saved.interrupted !== undefined && typeof saved.interrupted !== 'boolean') invalidRecovery = 'corrupted-record';
+    if (saved.startRequest !== undefined) {
+      if (isStartRecord(saved.startRequest) && saved.startRequest.response?.status === 'ACTIVE'
+        && saved.startRequest.response.sessionId === metadata.sessionId && saved.startRequest.goalText === metadata.goalText
+        && saved.startRequest.response.startedAt === metadata.startedAt) activeStart = saved.startRequest;
+      else invalidRecovery = 'corrupted-record';
+    }
+  }
+  if (pendingStart && activeStart && (pendingStart.idempotencyKey !== activeStart.idempotencyKey
+    || pendingStart.goalText !== activeStart.goalText || pendingStart.apiBaseUrl !== activeStart.apiBaseUrl
+    || (pendingStart.response && pendingStart.response.sessionId !== activeStart.response?.sessionId))) invalidRecovery = 'conflicting-records';
   const saved = await chrome.storage.session.get('collection');
   if (saved.collection) {
     const state = saved.collection as CollectionState;
-    // Old development-local sessions must never become server-backed sessions on upgrade.
     if (state.session && (state.session.source !== 'server' || !isWorkSession(state.session) || state.session.status !== 'ACTIVE')) {
       await chrome.storage.session.remove('collection');
-      await chrome.storage.local.remove('activeSession');
-      return;
+    } else {
+      collector.restore(state);
+      needsForegroundRecovery = true;
     }
-    collector.restore(state);
-    if (pendingStart && state.session) {
-      // A crash before clearing pendingStart did not complete activation; require explicit recovery.
-      collector.reconcileForeground(null, Date.now());
-      collector.stop(Date.now());
-    }
-    needsForegroundRecovery = true;
   }
-  // Browser restart/extension reload loses session storage: require a new explicit start.
-  else await chrome.storage.local.remove('activeSession');
-})();
-// Retain the rejection for dispatch, without an unhandled platform error log.
-void ready.catch(() => undefined);
+  // A crash can leave the checkpoint and pending response durable before active metadata.
+  if (!activeStart && pendingStart?.response?.status === 'ACTIVE'
+    && collector.state.session?.sessionId === pendingStart.response.sessionId) activeStart = pendingStart;
+  const expectedSessionId = activeStart?.response?.sessionId;
+  if (activeStart && ((collector.state.session && collector.state.session.sessionId !== expectedSessionId)
+    || collector.state.candidates.some(candidate => candidate.sessionId !== expectedSessionId))) invalidRecovery = 'conflicting-records';
+  if (!collector.state.session && retainedSession && !pendingStart && !activeStart) invalidRecovery ??= 'missing-request';
+  if (invalidRecovery || pendingStart || interrupted || (!collector.state.session && activeStart)
+    || (activeStart && activeStart.apiBaseUrl !== API_BASE_URL)) {
+    collector.reconcileForeground(null, Date.now());
+    suspend(Date.now());
+  } else if (!collector.state.session) await chrome.storage.local.remove('activeSession');
+})().catch(() => {
+  // Keep unread storage untouched and expose a blocked state instead of poisoning every dispatch.
+  invalidRecovery = 'initialization-failed';
+  try { collector.reconcileForeground(null, Date.now()); collector.suspend(Date.now()); }
+  catch { collector.state = emptyState(); }
+});
 async function persist() {
+  if (invalidRecovery === 'initialization-failed') return;
   await chrome.storage.session.set({ collection: collector.state });
-  if (collector.state.session) await chrome.storage.local.set({ activeSession: collector.state.session });
-  else await chrome.storage.local.remove('activeSession');
+  if (collector.state.session) {
+    retainedSession = collector.state.session;
+    await chrome.storage.local.set({ activeSession: { ...retainedSession, ...(activeStart ? { startRequest: activeStart } : {}) } });
+  } else if (!pendingStart && !activeStart && !invalidRecovery) await chrome.storage.local.remove('activeSession');
 }
 function dispatch<T>(operation: (now: number) => Promise<T>, foregroundEvent = false): Promise<T> {
   const arrivedAt = Date.now();
@@ -74,14 +126,16 @@ function dispatch<T>(operation: (now: number) => Promise<T>, foregroundEvent = f
       }
       return result;
     } catch (error) {
-      // Fail closed inside the same queue, before any later event can start a session.
-      try { collector.stop(Date.now()); }
+      // Stop collection independently of the durable request/response receipt.
+      retainedSession ??= collector.state.session ?? undefined;
+      try { suspend(Date.now()); }
       catch { collector.state = emptyState(); }
-      try { await persist(); }
-      catch {
-        await chrome.storage.local.remove('activeSession').catch(() => undefined);
-        await chrome.storage.session.remove('collection').catch(() => undefined);
+      if (retainedSession && (!invalidRecovery || invalidRecovery === 'missing-request')) {
+        await chrome.storage.local.set({ activeSession: { ...retainedSession, ...(activeStart ? { startRequest: activeStart } : {}), interrupted: true } }).catch(() => undefined);
       }
+      try { await persist(); }
+      // shortcut: total storage failure cannot persist suspension; revisit with durable server reconciliation.
+      catch { await chrome.storage.session.remove('collection').catch(() => undefined); }
       throw error;
     }
   });
@@ -164,6 +218,7 @@ async function syncScripts() {
   }
 }
 async function startSession(goal: string): Promise<string | undefined> {
+  if (invalidRecovery) return '시작 요청 정보 확인이 필요합니다. 원본을 보존한 채 서버 상태를 확인해 주세요.';
   if (collector.state.session) return '이미 활성 세션이 있습니다.';
   const goalText = normalizeGoal(goal);
   if (!validGoal(goalText)) return '목표는 앞뒤 공백을 제외하고 5~150자로 입력해 주세요.';
@@ -180,7 +235,9 @@ async function startSession(goal: string): Promise<string | undefined> {
     await chrome.storage.local.set({ pendingSessionStart: pendingStart });
     if (response.status !== 'ACTIVE') return '기존 서버 세션이 이미 종료되었습니다. 서버 상태를 확인해 주세요.';
     activatedAt = Date.now();
-    collector.start(response);
+    if (activeStart) collector.resume(response);
+    else collector.start(response);
+    activeStart = pendingStart;
     await persist();
     await refreshForeground(Date.now());
     await syncScripts();
@@ -213,11 +270,20 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
   };
   void dispatch(async (now): Promise<Reply> => {
     if (popup && isPopupMessage(message)) {
+      if (invalidRecovery === 'initialization-failed' && message.type !== 'status') return { ok: false, error: '저장된 상태를 확인할 수 없습니다. 확장 프로그램 상태를 확인하고 Worker를 재시작해 주세요.', status: status(now) };
       if (message.type === 'start') {
         const error = await startSession(message.goalText);
-        if (error) return { ok: false, error, status: { ...collector.status(Date.now()), pendingStart: pendingStart && { goalText: pendingStart.goalText } } };
+        if (error) return { ok: false, error, status: status(Date.now()) };
       } else if (message.type === 'stop') {
+        const wasActive = Boolean(collector.state.session);
         collector.stop(now);
+        if (wasActive && !pendingStart && !invalidRecovery) {
+          // A local stop is the only action that intentionally releases a completed receipt.
+          await chrome.storage.session.set({ collection: collector.state });
+          await chrome.storage.local.remove('activeSession');
+          activeStart = undefined;
+          retainedSession = undefined;
+        }
         await broadcast();
       } else if (message.type === 'clear') {
         if (collector.state.session) return { ok: false, error: '세션 종료 후 기록을 지워 주세요.' };
@@ -226,7 +292,7 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
         await syncScripts();
         await broadcast();
       }
-      return { ok: true, status: { ...collector.status(Math.max(now, Date.now())), pendingStart: pendingStart && !collector.state.session ? { goalText: pendingStart.goalText } : undefined } };
+      return { ok: true, status: status(Math.max(now, Date.now())) };
     }
     if (tabId === undefined || !sender.documentId || !isContentMessage(message)) return { ok: false };
     if (!collector.state.session || collector.state.capacityReached) return { ok: true, sessionId: null };
@@ -257,7 +323,7 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
     }
     return { ok: true, sessionId: collector.state.session?.sessionId ?? null };
   }).then(reply).catch(() => {
-    reply({ ok: false, error: '요청 처리에 실패했습니다. 수집을 중단했습니다. 확장 프로그램 상태를 확인해 주세요.' });
+    reply({ ok: false, error: '요청 처리에 실패해 수집을 중단했습니다. 기존 세션의 복구 상태를 확인해 주세요.', status: status(Date.now()) });
   });
   return true;
 });
@@ -323,7 +389,7 @@ chrome.webNavigation.onErrorOccurred.addListener(details => {
 chrome.permissions.onAdded.addListener(() => event(syncScripts));
 chrome.permissions.onRemoved.addListener(() => event(async now => {
   // Revocation is privacy-sensitive: stop and erase all in-memory samples.
-  collector.stop(now);
+  suspend(now);
   collector.state = emptyState();
   await syncScripts();
   await broadcast();
