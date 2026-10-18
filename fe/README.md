@@ -1,3 +1,182 @@
+# Focus Recovery Chrome Extension (Issue #48 포함)
+
+Manifest V3 개발용 수집기입니다. 서버 작업 세션 → 확정 방문 POST → POST ACK 이후 누적 행동 PATCH를 연동합니다. **로컬 수집 종료는 서버 세션 종료가 아닙니다.** 이번 변경은 BE 코드·DB 스키마를 변경하지 않습니다.
+
+## IndexedDB 영속 큐와 복구 (Issue #48, 2026-10-18)
+
+이 절이 현재 저장·복구 동작의 기준입니다. 아래 Issue #46 이하의 기록은 해당 작업 당시의 구현·검증 이력이며, `storage.session`만 사용한다거나 IndexedDB가 후속 작업이라는 설명은 이번 절로 대체합니다.
+
+### 코드 리뷰 후 보완 (기준 `427f9ad`, 2026-10-18)
+
+이번 보완은 `feat/48/indexeddb-durable-queue`의 `427f9adfaefc48678836d91b925ec4125590da4b`에서 시작했습니다. 시작 시 미커밋·미추적 파일이 없었고 origin은 개인 fork, upstream은 공식 저장소였습니다. 최초 확인한 공식 main은 `6059729`였으며 마무리 재확인에서 `f23b2a729defb6039a4fa537160089b030e95491`(PR #49, Issue #44 알림 이력)이 확인됐습니다. 원격 참조만 fetch했으며 **병합·rebase·commit·push·PR 생성은 하지 않았습니다.** 최신 upstream과는 upstream 쪽 5개/작업 브랜치 쪽 1개 커밋 차이이며 공통 기준은 `6059729`입니다. 검증한 BE는 현재 작업 브랜치의 소스이며 새 알림 이력 변경을 합친 BE는 아닙니다.
+
+#### 확인된 결함과 최소 수정
+
+먼저 실패 테스트로 다음을 재현했습니다. local 메타데이터 갱신 실패가 성공한 IDB 활성 checkpoint를 중단 상태로 다시 기록했고, 로컬 종료 commit 후 local 삭제 실패는 완료된 종료를 복구 대기 상태로 다시 기록했습니다. IDB의 재개 commit 직후 중단하면 오래된 local `interrupted`와 남은 pending 영수증 때문에 다시 보류됐습니다. 반대로 종료된 IDB 옆의 다른 local 세션은 충돌 검사 없이 삭제됐습니다. 마이그레이션 키 일부만 남으면 전체 해시가 달라져 정상 정리 중단도 충돌로 처리했고, 키 정리 오류가 정상 IDB를 저장소 복구 실패로 표시했습니다.
+
+DB **v1 / `state` / `current`**는 유지하고 두 선택 필드만 추가했습니다.
+
+- `value.localMirror: { previous?: 활성 세션 메타데이터 }`: 다음 local 쓰기 직전에 관찰한 이전 값을 같은 IDB 집계에 commit합니다. 실제 local 값이 commit된 목표와 같거나 기록된 이전 값과 정확히 일치할 때만 늦어진 mirror 쓰기로 판단합니다. 시각이나 세션 ID 하나만으로 최신 상태를 선택하지 않습니다. 목표 및 이전 값과 일치하지 않는 다른 세션·영수증은 원본을 보존하고 전송을 차단합니다. 구버전에서 증명할 수 없는 불일치도 자동으로 덮어쓰지 않습니다.
+- `migrationParts: { collection?: SHA256, visitDelivery?: SHA256, behaviorDelivery?: SHA256 }`: 검증한 이전 checkpoint의 키별 해시입니다. 기존 전체 `migrated` 해시는 유지합니다. 본문을 중복 저장하거나 새 Object Store를 만들지 않습니다.
+
+Collector·POST·PATCH·activeSession·이전 mirror 증거는 기존 하나의 strict 트랜잭션/revision 비교로 저장합니다. transaction complete 후 local mirror를 갱신하며 HTTP는 DB 트랜잭션 밖에 있습니다. IDB 실패와 **commit 이후 local mirror 실패**를 별도 오류로 구분합니다. 후자는 완료된 종료·ACK를 다시 중단 상태로 덮어쓰지 않으며, delivery는 commit된 ACK를 그대로 사용할 수 있습니다. 사용자 작업에서 활성 mirror 갱신이 실패하면 그 실행의 수집을 보류하지만 디스크의 성공 checkpoint는 유지합니다. 다음 실행에서 증거를 대조해 복구합니다. 종료 commit의 목표가 없는 세션이면 수집을 되살리지 않고 local 삭제만 재시도합니다. 미확인 POST/PATCH가 남으면 신규 시작은 계속 차단합니다.
+
+`pendingSessionStart`는 HTTP 전에 키를 저장하고 응답 영수증도 활성 집계 commit 전에 기록하는 순서를 유지합니다. 응답 영수증 저장 실패 후에도 이전 키로 같은 요청을 재시도합니다. IDB에 같은 키·목표·서버 주소·서버 응답의 활성 완료 영수증이 있고 Collector 세션도 일치할 때만 남은 pending 키를 완료 후 정리 잔여물로 판단합니다. 손상·다른 응답·다른 키·서버 변경은 이 경로로 우회하지 않습니다. 영속화에 실패한 HTTP ACK는 여전히 미확인이며 메모리 ACK로 PATCH를 허용하지 않습니다.
+
+#### 마이그레이션 중단·재실행
+
+- commit 전 abort: 완료 표식과 집계 모두 기록되지 않으므로 원본으로 재시도합니다.
+- commit 후 정리 전 중단: 전체 해시/키별 해시가 일치하는 원본은 다시 적용하지 않습니다. 현재 IDB가 이미 진전했어도 원래 스냅샷·ACK·시도 횟수를 되돌리지 않습니다.
+- 일부 키만 남음: 남아 있는 각 키의 해시가 이전에 commit한 receipt와 일치해야 정리 잔여물로 인정합니다. receipt 없는 불완전 초기 입력이나 달라진 세션·API·ACK는 보존하고 차단합니다.
+- 구버전 전체 해시만 있음: 현재의 완전한 세 checkpoint로 원래 해시를 재구성할 수 있거나 완전한 이전 원본이 남아 있을 때만 키별 receipt를 복원합니다. 복원한 receipt는 **키 삭제 전에 먼저 commit**합니다. 이미 IDB가 진전했고 일부 legacy 키만 남아 원래 해시를 재구성할 수 없으면 보수적으로 차단합니다.
+- 전체 legacy 본문과 IDB 본문을 별도로 검증합니다. 해시 일치만으로 손상된 집계를 승인하지 않습니다. 정리 오류 자체는 `legacyCleanupPending`으로 표시하며 정상 IDB를 손상으로 처리하지 않습니다. 다음 Worker 초기화에서 정리를 다시 시도합니다.
+
+#### Collector 정책과 Popup
+
+`docs/data-collection-spec.md` §6의 확정 prefix 정책을 변경하지 않았습니다. 앞선 `recoveryRequired` 후보가 미확정이면 이후 정상 B도 `sequence:null`이며 POST가 지연됩니다. 이 동작은 결함으로 수정하지 않았습니다. 유효했던 분리 A는 명시적 로컬 종료에서 마지막 영속 활성시간·버전·ID로 확정하여 A/B 순서를 풀 수 있습니다. 본문 없는 pending 및 복구 가능한 `unavailable-content` 후보는 종료 후에도 임의 판정하지 않습니다. 이미 확정된 방문은 ID·sequence를 유지하며 중복 POST를 만들지 않습니다.
+
+Popup은 확인 필요 후보 수, 순서 미확정 유효 방문 수와 대기 이유, 종료로 해결 가능한 유효 후보 수, 종료로 해결되지 않는 후보 수를 표시합니다. 로컬 삭제 시 대기 방문·미확인 요청도 버려지고 서버 데이터는 지워지지 않음을 설명합니다. local mirror 동기화 대기와 legacy 정리 대기는 IDB 저장 실패/서버 HTTP 실패와 구분합니다. 원문 URL·본문·검색어를 일반 화면에 추가하지 않았습니다.
+
+#### 이번 보완 검증
+
+- 기준 **20개 파일 / 581개** 유지, `durable-state.test.ts` **15개**, `durable-background.test.ts` **13개** 추가: 최종 **20개 파일 / 609개** 통과. 기존 테스트를 삭제하거나 완화하지 않았습니다. A-1 local set 실패, A-2 local remove 실패, A-3 commit 직후 중단, A-4 응답 영수증 실패, POST ACK와 PATCH 스냅샷 보존, 부분 legacy 정리·반복 이전·충돌·손상, 네 종류 Collector prefix 정책을 검증했습니다.
+- local 실패, commit 중 abort/quota, 마이그레이션 중단은 **제어된 Chrome 어댑터 + fake-indexeddb** 검증입니다. 실제 디스크 고갈이나 Chrome 저장소 장애 실험으로 표현하지 않습니다.
+- `npm run typecheck`, `npm test`, `npm run build`, `git diff --check` 통과. BE는 `./gradlew test --rerun-tasks`로 **13 suite / 328개**를 실제 재실행해 통과했고 `bootJar`도 성공했습니다. BE 소스·스키마는 수정하지 않았습니다.
+- 실제 Chrome for Testing **151.0.7922.34**의 기존 `test:browser` 통과. 이 스크립트의 API/검색 페이지는 합성 fixture이며 native 다중 창·최소화는 headless에서 SKIP입니다.
+- 실제 Chrome → Spring Boot **4.1.1** → 전용 임시 MySQL **8.4.9**에서 기존 visit 통합 전체 통과: 6개 방문/2개 Window, 중복 200 및 SQL 불변, 세션 A/B 분리, 서버 저장 후 응답 보류·Worker 종료·같은 요청 재전송, 로컬 종료 후 미전송 유지, 3회 소진·수동 재시도, 지연 ACK 삭제 경합, 본문 길이 계약.
+- behavior 통합은 기존 전체 시나리오와 추가 REVIEW-C를 실행했습니다. 실제 POST/PATCH 저장 후 응답만 보류한 Worker/브라우저 재시작 및 reload, 동일 요청·ID·버전·시도 복원, 재시도 3회·수동 예산, SQL 중복/최신값 보호를 확인했습니다. 브라우저 종료는 전용 browser PID SIGKILL 후 같은 프로필 재실행이며 Worker 중단으로 대체하지 않았습니다. reload는 실제 `runtime.reload()`와 session 표식 소실을 확인했습니다. 503 오류는 테스트 프록시의 명시적 주입이며 BE 오류와 구분합니다.
+- 추가 실제 Collector 검증: 브라우저 재시작 후 pending A 뒤의 새 유효 B를 수집해 sequence/POST 보류 및 Popup 설명을 확인했습니다. 별도로 유효 A를 저장한 뒤 완전 재시작, 새 B 수집, 명시적 종료에서 원래 ID/저장 누적값과 sequence 1·2를 유지하며 실제 SQL/ACK에 도달함을 확인했습니다. 정상 경로의 IDB/local 메타데이터도 대조했습니다.
+- 추가 통합 초기 실행에서는 강제 종료 후 테스트 프로필 개발자 모드가 소실되어 후속 reload가 실패했습니다. 재실행 시 `getProfileConfiguration()`으로 꺼진 것을 확인했습니다. 스크립트가 매 브라우저 실행에서 전용 프로필의 개발자 모드를 확인·설정하도록 고쳤으며 reload 확인 조건은 유지했습니다. 이 실패를 제품 복구 성공으로 세지 않습니다.
+
+검증용 BE PID·전용 MySQL 컨테이너와 연결된 익명 볼륨·각 Chrome 임시 프로필은 종료 후 정리했습니다. 기존 사용자 DB/프로필은 변경하지 않았습니다.
+
+미검증 범위는 실제 local/IDB 디스크 장애·전원 상실, Windows/Chrome 최소 버전, native 다중 창·OS 포커스, 새 upstream 알림 이력 변경을 합친 BE입니다. 중단 직전 commit되지 않은 이벤트·중단 중 행동은 복구할 수 없습니다. 구버전 receipt만으로 원본을 증명할 수 없는 충돌의 운영자 복구, 미결 후보 판정/재연결과 장기간 sequence 대기는 후속 정책 협의가 필요합니다. 서버 종료 API·END_PENDING은 구현하지 않았으며 후속 종료 작업은 미확인 POST/PATCH와 후보 보류를 먼저 고려해야 합니다.
+
+
+### Git 기준과 기존 저장 흐름
+
+시작 상태는 detached HEAD `f73e08636892f22eca36f347c46cfe0a34e5612c`, 미커밋·미추적 파일 없음입니다. `origin`은 `hyeon-marina` fork, `upstream`은 `SKHU-AI-Projects-Archive` 공식 저장소입니다. fetch한 `upstream/main`은 `6059729ca837135a2ab84164fb261165118d5645`이며 PR #47 병합 및 실제 Issue #48을 확인했습니다. 이 커밋에서 `feat/48/indexeddb-durable-queue`를 생성했습니다. 저장소에 별도 AGENTS/브랜치 규칙 문서는 없었으며 기존 `feat/이슈번호/설명`, `feat(#번호): ...` 이력을 참고했습니다. 최초 구현·검증 단계에서는 커밋·푸시·PR을 생성하지 않았습니다.
+
+기존 `Collector`는 후보 생성 순서, 방문 ID, 유효·제외·보류 판정, sequence 확정, 활성시간과 전환 횟수·행동 버전을 메모리에서 관리했습니다. Background는 Collector와 POST/PATCH checkpoint를 한 번의 `chrome.storage.session.set`에 기록했습니다. `storage.local`은 세션 생성 멱등 키·응답인 `pendingSessionStart` 및 `activeSession/startRequest/interrupted`만 보존했습니다. 순차 전송과 HTTP 전에 저장을 기다리는 구조는 이미 있었지만 브라우저 재시작·확장 reload에서 session 저장이 사라지고, ACK 저장 실패 후 메모리에 남은 ACK가 잘못 사용될 위험이 있었습니다.
+
+| 정보 | 이전 저장소 | 현재 역할 |
+| --- | --- | --- |
+| 활성 서버 세션·세션 생성 요청 키·응답·중단 기록 | local | local 프로토콜 유지; 활성 세션 메타데이터는 IDB 집계에도 함께 기록·대조 |
+| 후보·확정 방문·판정·탭 연결·ID·sequence 할당 상태 | session | IndexedDB `collection` |
+| 최초 POST 스냅샷·단계·시도·시각·오류·ACK·서버 baseline | session | IndexedDB `visitDelivery` |
+| 최초/최신 행동값·마지막 ACK·불변 PATCH 스냅샷·행동 버전·재시도 | session | IndexedDB `behaviorDelivery` |
+| 권한 철회·로컬 삭제 | 메모리와 session 정리 | 세 큐를 함께 비우는 IDB commit; 최소 revision/이전 표식만 유지 |
+| Chrome session 저장소 | Worker 복구 checkpoint | 구버전 데이터 읽기·이전·정리만 수행. 새 checkpoint는 쓰지 않음 |
+
+### 데이터 모델과 세션 격리
+
+DB 이름 `focus-recovery`, 버전 **1**, Object Store **`state` 하나**, Out-of-line key **`current` 하나**입니다.
+
+```text
+current = {
+  format: 1, revision, sessionId: UUID | null,
+  migrated?: SHA256(기존 collection/POST/PATCH의 canonical JSON),
+  migrationParts?: { collection?: SHA256, visitDelivery?: SHA256, behaviorDelivery?: SHA256 },
+  value: { collection, visitDelivery?, behaviorDelivery?, activeSession?, localMirror?: { previous? } }
+}
+```
+
+Collector의 전체 bounded 상태(기존 최대 200개 후보)를 집계로 저장하므로 후보 확정과 sequence 할당이 부분 기록되지 않습니다. POST에는 최초 `visit`, 단계·attempts·nextRetryAt·error/code·retryable·`serverBehavior`를, PATCH에는 `initial/latest/ack/request`, 버전·단계·재시도 정보를 보존합니다. URL·본문은 별도 로그에 기록하지 않습니다.
+
+여러 세션의 큐를 섞거나 임의로 최신 세션을 선택하지 않습니다. 루트 `sessionId`, Collector, 후보, POST, PATCH 및 세션 메타데이터를 대조합니다. sequence는 유효한 확정 prefix에서 연속적이어야 하고, POST 원본의 불변 필드·초기 행동값이 Collector와 일치해야 합니다. 확정 방문이 있는데 POST checkpoint가 없거나, POST가 있는데 PATCH checkpoint/항목이 빠졌으면 빈 큐로 추정하지 않고 차단합니다. 이전 세션에 미확인 POST/PATCH 또는 확인 필요 후보가 있으면 신규 세션을 차단합니다. 정상 완료 후 명시적인 다음 세션 시작에서만 전체 집계를 새 세션으로 교체하므로 이전 완료 세션의 본문·ACK가 무한히 누적되지 않습니다.
+
+`format`과 DB 버전을 검증하고 `versionchange`에서 연결을 닫습니다. 현재 정의된 스키마는 v1뿐입니다. 알 수 없는 미래 DB/레코드 버전을 삭제하거나 빈 상태로 덮어쓰지 않습니다. 후속 v2는 별도의 명시적인 업그레이드 변환과 테스트가 필요합니다.
+
+### 트랜잭션과 HTTP 경계
+
+`DurableRepository`가 단일 집계 레코드 전체를 짧은 `readwrite` 트랜잭션으로 기록합니다. `durability: 'strict'`를 요청하고 **request의 success가 아닌 transaction complete**를 기다립니다. 같은 트랜잭션에서 이전 revision을 읽어 비교하므로 삭제·세션 교체 전 상태를 가진 오래된 Worker의 쓰기는 abort됩니다. HTTP를 트랜잭션에 넣지 않습니다.
+
+- POST: 확정 방문 → 최초 스냅샷 등록 → `sending/attempts`와 Collector·PATCH 상태 commit → HTTP → 기존 201/200 계약 검증 → POST ACK·서버 행동 baseline·PATCH baseline을 함께 commit → 다음 sequence.
+- PATCH: **commit된 POST ACK 집합** 확인 → 최신 Collector 비교 → 최초 `request`/버전과 `sending/attempts` commit → HTTP → 기존 `applied=true/false` 검증 → 행동 ACK commit → 후속 변경이 있으면 다음 스냅샷.
+- 저장 실패 시 마지막 commit 집계로 메모리를 되돌리고 수집·전송을 차단합니다. 저장하지 못한 ACK를 복구된 ACK로 표시하거나 PATCH 허용에 사용하지 않습니다. raw 오류 메시지는 UI/로그에 노출하지 않습니다.
+- 서버 저장과 로컬 ACK commit은 원자적일 수 없습니다. 서버 저장 후 ACK 유실 또는 commit 실패 시, 디스크의 `sending`과 동일 ID·sequence·스냅샷·버전으로 재전송합니다. 재전송이 실제 서버 저장을 중복 적용하지 않는 것은 기존 BE 멱등 계약으로 확인합니다.
+
+기존 `serialExecutor`로 초기화 후 이벤트·상태 변경·commit만 직렬화합니다. POST/PATCH HTTP 응답 대기는 이 실행기 밖이므로 느린 요청 중에도 수집·종료·삭제 이벤트가 처리됩니다. 초기화 중 Popup·Content Script·탭 이벤트는 준비 Promise 뒤에서 처리되고, Popup은 응답 전 초기화 중으로 표시합니다.
+
+### Collector 복구
+
+Worker 시작 시 전체 후보·판정·확정 여부·ID·sequence·누적 행동값과 버전을 복원합니다. 모든 `activeSince`를 해제하여 중단 기간을 더하지 않고, Chrome `webNavigation.getFrame`의 실제 문서 ID와 URL 식별자·권한을 저장된 탭 연결과 대조합니다. 같은 tabId나 URL만으로 동일 문서라고 간주하지 않습니다.
+
+동일 문서가 확인되면 기존 후보에 다시 연결하고 실제 foreground 이벤트/조회 이후부터 측정합니다. `onInstalled`(unpacked reload 포함)와 `onStartup`에서 활성 세션의 허용 사이트 스크립트를 다시 등록·주입합니다. Extension reload가 무효화한 기존 isolated world만 믿고 수집이 멈추는 일을 막으며, 살아 있는 문서는 기존 후보로 연결합니다. 확인되지 않으면 탭 연결을 해제하고 열린 후보에 `recoveryRequired`를 표시합니다. **복구 자체는 visitId나 이미 확정된 sequence를 변경하지 않으며, 순서가 미확정인 후보도 그대로 둡니다.** 제외된 후보를 유효 방문으로 승격하지 않습니다.
+
+사용자의 명시적 로컬 수집 종료에서는 이미 유효했던 분리 후보를 저장된 누적값 그대로 확정할 수 있습니다. 이는 기존 종료 시 유효 방문을 확정하는 정책의 복구 적용입니다. 판정 미완료·복구 가능한 제외 후보는 임의로 유효/최종 제외 처리하지 않고 보존하며 뒤 후보의 sequence를 막습니다. 이 상태에서는 신규 세션을 만들 수 없고 확인 후 명시적으로 로컬 데이터를 삭제해야 합니다. 수동으로 임의 탭에 재연결하거나 부족한 체류시간을 추정하는 UI는 제공하지 않습니다.
+
+### 이전 저장소 마이그레이션
+
+1. local 요청 키·세션 메타데이터와 session의 세 checkpoint를 읽습니다. IndexedDB가 비었으면 Collector·ID·sequence·POST/PATCH 관계·API 주소·메타데이터를 검증한 후 데이터와 이전 원본 해시를 한 번에 commit합니다.
+2. 검증·복구가 정상인 경우에만 이전 session 키 세 개를 제거합니다. local의 미확인 세션 생성 요청은 기존 성공 checkpoint/metadata 저장 절차가 끝난 뒤에만 정리합니다.
+3. 이전 commit 전 중단이면 원본이 남고, commit 후 정리 전 중단이면 원본 해시가 완료 표식이므로 다시 가져오지 않습니다. 이후 IDB가 진전해도 동일 이전 원본은 재적용하지 않습니다.
+4. 양쪽이 같은 값이면 기존 IDB를 사용합니다. 값이 다르고 완료 표식도 없다면 timestamp만으로 최신성을 추정하지 않습니다. IDB가 오래되었거나 legacy가 더 최신일 가능성, 서로 다른 세션, 손상 데이터는 양쪽 원본을 보존하고 복구·HTTP를 차단합니다.
+5. IDB가 정상이고 session 저장만 사라졌으면 IDB를 사용합니다. 아직 IDB로 이전하지 않은 구버전 session 데이터가 이미 브라우저 종료/reload로 사라진 경우에는 이를 복원할 수 없습니다. local 세션 생성 영수증은 보존해 새 키로 중복 생성하지 않습니다.
+
+local과 IDB는 서로 다른 저장소이므로 하나의 트랜잭션이 아닙니다. commit된 IDB 활성 메타데이터를 기준으로 같은 요청 키·세션임을 대조하며, local 값이 commit된 목표/이전 mirror 증거와 일치하는지 대조합니다. 증거로 이전 값임을 확인할 수 없는 같은 세션의 local `interrupted` 표식은 보수적으로 중단/동일 요청 재개에 반영합니다. 반대로 IDB의 명시적 종료 commit 뒤 남은 이전 local 메타데이터가 수집을 되살리지 않습니다. 두 저장소 모두 쓰기 불가능한 동안의 중단 사실은 영속 기록할 수 없으며 다음 시작은 마지막 성공 checkpoint와 실제 Chrome 상태로 판단합니다.
+
+### 재시작과 재시도
+
+저장된 `sending`만 `queued`로 복구하며 스냅샷·버전·attempts는 유지합니다. `retry-wait`는 저장된 `nextRetryAt`과 현재 시각을 비교합니다. 최초 포함 자동 최대 **3회**이며 Worker·브라우저 재시작/reload로 예산을 초기화하지 않습니다. 소진 시 마지막 요청이 서버에 반영되었을 수 있음을 표시하고 실패·수동 재시도 상태로 보존합니다. 명시적인 같은 요청 재시도만 기존 스냅샷에 새 예산을 허용합니다. ACK가 commit된 후 생기는 새로운 행동 요청은 별도 예산입니다.
+
+Manifest에 `alarms` 권한을 추가했습니다. 매 Worker 시작 시 1분 반복 알람을 다시 생성하고, `onAlarm`, `onStartup`, `onInstalled` 및 일반 확장 이벤트에서 저장 상태를 확인합니다. 정상 초기화 후에는 Popup 없이도 기존 큐를 깨웁니다. 메모리 타이머는 Worker가 살아 있는 동안 짧은 backoff만 지원합니다. [Chrome alarms 문서](https://developer.chrome.com/docs/extensions/reference/api/alarms)에 따라 알람은 지연될 수 있고 장치 절전에서 기기를 깨우지 않습니다. 구버전 Chrome에서는 재시작 때 소실될 수 있어 시작 때 재생성합니다. 실시간 재개·정확한 1분 실행을 보장하지 않습니다.
+
+### 삭제·오류·보존과 개인정보
+
+로컬 수집 종료는 미전송 데이터와 ACK를 디스크에 남깁니다. session 저장과 달리 브라우저 종료/reload로 자동 삭제되지 않습니다. 임의의 장기 보존 기간은 도입하지 않았습니다. 명시적 로컬 기록 삭제 또는 사이트 권한 철회에서 Collector·POST·PATCH를 함께 비우고 commit합니다. 삭제된 항목의 객체 소속 검사와 revision 비교로 지연된 ACK나 오래된 쓰기가 원본을 재생성하지 못합니다. 이미 발송된 HTTP는 서버에 저장될 수 있으며 로컬 삭제는 서버 기록을 삭제하지 않습니다. 미확인 세션 생성 요청 키/영수증은 중복 생성을 막기 위한 기존 정책에 따라 샘플 삭제와 별도로 보존합니다.
+
+열기 실패·quota·transaction abort·손상·마이그레이션 충돌·세션 불일치·API 주소 변경은 빈 정상 상태로 대체하지 않습니다. Popup은 영속 저장/복구 실패를 서버 HTTP 실패와 구분해 표시하고 신규 시작·수동 전송을 차단합니다. 원본을 유지한 채 Worker/서버 설정을 확인해야 하며, 손상된 요청 영수증을 삭제로 우회하는 기능은 제공하지 않습니다. 디스크 삭제 commit 자체가 실패하면 삭제 완료로 표시하지 않으며 재시작 후 이전 원본이 남을 수 있습니다.
+
+일반 Popup에는 건수·단계·시도·버전·확인 필요 상태만 표시하고 URL·본문·검색어 원문은 기존 명시적인 개발용 데이터 표시 선택에서만 보여줍니다. 방문 원문·검색어는 IDB 디스크와 설정된 BE에 보존되므로 실제 개인정보가 있는 사이트는 권한과 삭제 정책을 확인해야 합니다. 오류 로그에는 이 원문과 플랫폼 오류 원문을 남기지 않습니다. 삭제 후에도 브라우저/OS의 물리적 디스크 영역에 대한 보안 삭제까지 보장하는 것은 아닙니다.
+
+### 변경 파일과 검증 방법
+
+- `src/background/durable-state.ts`: v1 저장 어댑터, 집계 검증, commit 대기, revision 비교, 이전 표식과 충돌 차단.
+- `src/background/index.ts`: 초기화 장벽, IDB commit 연결, commit된 POST ACK 허용, 실제 문서 대조, local 영수증 정합성, 삭제와 alarms 이벤트.
+- `src/background/collector.ts`, `src/shared/types.ts`: 확인 필요 후보와 명시적 종료에서의 유효 분리 후보 처리, Popup 저장 상태 타입.
+- `src/background/visit-delivery.ts`, `behavior-delivery.ts`: 기존 전송·재시도 구현 유지; 폐기된 session-only 주석만 제거.
+- `src/popup/index.tsx`, `public/manifest.json`: 복구/저장 오류/보류 표시와 작업 차단, alarms 권한.
+- `tests/durable-state.test.ts`, `durable-background.test.ts`: 실제 fake-indexeddb transaction/abort 및 실제 Background+IDB 연결 테스트. quota는 DOMException 주입이며 실제 디스크 고갈 시험이 아닙니다.
+- `tests/background.test.ts`: 기존 Chrome adapter 회귀 133개 유지, 저장소 모의 경계만 Repository로 옮겼습니다. 영속 저장 실패 뒤 재시작이 필요한 정책 및 실제 문서 조회 모의를 반영했습니다. 이 파일 단독으로 실제 IDB 검증을 주장하지 않습니다.
+- `scripts/durable-test-utils.mjs`, 기존 browser/visit/behavior/live-search 스크립트: session mirror 대신 commit된 IDB 읽기, 실제 transaction abort 주입, 브라우저 전체 종료/동일 프로필 재실행 및 extension reload 검증.
+- `package.json`, `package-lock.json`: 테스트 전용 `fake-indexeddb` 추가. 런타임 의존성은 추가하지 않았습니다.
+
+```sh
+cd fe
+npm run typecheck
+npm test
+npm run build
+git diff --check
+CHROMIUM_PATH="/absolute/path/to/Chrome for Testing" npm run test:browser
+INTEGRATION_API_BASE_URL=http://localhost:18048 \
+INTEGRATION_MYSQL_CONTAINER=전용임시MySQL \
+CHROMIUM_PATH="/absolute/path/to/Chrome for Testing" \
+node scripts/behavior-integration-test.mjs
+# 같은 환경으로 node scripts/visit-integration-test.mjs
+```
+
+통합 스크립트는 비밀번호 없는 root로 접근 가능한 **개인정보 없는 전용 임시 DB**만 대상으로 합니다. 기존 운영/개발 DB를 사용하지 마세요. `behavior-integration-test.mjs`는 전용 Chrome 임시 프로필에서만 개발자 모드를 활성화하고 실제 `runtime.reload()`와 session 표식 소실을 검증합니다. CLI로 로드한 unpacked 확장은 개발자 모드가 꺼져 있으면 최초 실행은 되더라도 reload 때 `unsupportedDeveloperExtension`으로 비활성화될 수 있습니다. 프록시는 실제 BE가 저장한 응답만 보류하며, 명시적으로 주입한 503 횟수를 실제 BE 오류와 구분합니다.
+
+### 이번 실행 결과와 남은 범위
+
+- 변경 전 **18개 파일 / 535개**, 최종 **20개 파일 / 581개** 성공. 기존 535개 회귀를 유지하고 Repository 31개·실제 Background+IDB 15개, 총 46개를 추가했습니다. 타입 검사·production build·`git diff --check`도 통과했습니다. 저장 전 HTTP 차단, POST/PATCH ACK commit 실패와 동일 스냅샷 복구, quota/abort, 버전 거부, 중복 초기화, 원본 보존·이전 재실행·충돌, 문서 식별자 불일치, 재시도 시각/alarm, 삭제·권한 철회 경합을 검증했습니다.
+- 변경하지 않은 BE는 Java **21.0.10**, Spring Boot **4.1.1**에서 Gradle **13개 suite / 328개 테스트** 및 bootJar 빌드 성공. 임시 MySQL의 실제 버전은 **8.4.9**입니다.
+- macOS Chrome for Testing **151.0.7922.34**에서 기존 `browser-test.mjs` 회귀 성공. 합성 API·Google/Naver fixture이며 실제 서비스 증거와 구분합니다. checkpoint 오류는 실제 IDB `put` 성공 뒤 transaction abort를 주입했습니다. native 다중 창/최소화 경로는 기본 headless 실행에서 `SKIP`이며 성공으로 세지 않습니다.
+- 기존 `visit-integration-test.mjs` 실제 Chrome → Spring Boot → MySQL 회귀 성공. 6개 방문과 2개 Window 구성·중복 방지, A/B 세션 분리, 전송 중 종료/삭제, POST 응답 유실·동일 재전송 200, 3회 재시도 소진·수동 재시도, 본문 길이 경계를 확인했습니다. 프록시 503은 합성 주입이며 실제 BE 장애로 보고하지 않습니다.
+- 확장한 `behavior-integration-test.mjs` 전체 성공. B-1 정상/보류 POST ACK, B-2 세 번째 PATCH 중단, B-3 반복 Worker 중단과 예산 소진·명시적 재시도, D-1 실제 Chrome 전체 프로세스 종료/동일 프로필 재실행, D-2 실제 extension reload, D-3 브라우저 반복 재실행 후 예산 3회 유지까지 통과했습니다. 실제 PATCH `applied=true` 저장 뒤 응답만 보류하고 재전송 `applied=false`, MySQL 계수·버전·`updated_at` 불변 및 실제 409 계약을 검증했습니다.
+- D-POST-browser/reload: 실제 BE의 방문 저장 완료 뒤 201 응답만 보류 → 브라우저 전체 종료 또는 extension reload → 동일 ID·sequence·본문·초기 행동 스냅샷과 attempts 복구 → 200 멱등 응답 → SQL 방문 행 1개를 확인했습니다. POST ACK 전 PATCH 대기도 확인했습니다.
+- D-LIVE: 실제 extension reload 후 살아 있는 동일 문서에 Content Script가 다시 연결되고, 원래 visitId가 1개로 유지되며 이후 실제 SPA 콘텐츠 변경이 새 방문으로 수집·ACK되는 것을 확인했습니다.
+- D-COLLECTOR: 열린 짧은 후보와 그 뒤의 유효하지만 sequence 미확정인 후보를 만들고, 실제 reload와 브라우저 전체 종료를 수행했습니다. 원래 후보 순서·ID·sequence·버전·활성시간을 보존하고 문서 불일치 후보를 확인 필요로 유지하며 신규 시작 차단·명시적 디스크 삭제를 확인했습니다. 테스트가 새 Popup 탭을 여는 과정의 추가 URL-policy 제외 후보는 원래 후보와 구분해 검증합니다.
+- 브라우저 전체 종료의 최종 검증은 CDP로 **테스트가 만든 전용 browser PID만 확인하여 SIGKILL**한 뒤 같은 임시 프로필로 재실행했습니다. Worker만 재시작한 결과로 대체하지 않았습니다. 초기 graceful close 실험에서는 종료 직전 탭 이벤트가 commit되어 마지막 사전 snapshot과 달라질 수 있었습니다. 최종 시험은 이 flush를 배제한 강제 종료로 후보 checkpoint 보존을 확인했습니다. Extension reload는 실제 `runtime.reload()` 후 `storage.session`의 시험 표식이 사라졌는지 검사했습니다.
+- 검증용 BE·MySQL 컨테이너·Chrome 프로필은 테스트 종료 후 정리했습니다. 실제 사용자 데이터나 기존 DB/Chrome 프로필은 사용하지 않았습니다.
+
+Windows 11 Chrome Stable, 최소 지원 Chrome 106, 실제 Google/Naver 서비스 DOM, native 창 최소화/OS 포커스 경계, 실제 디스크 용량 고갈·전원 상실·디스크 손상은 이번에 실행 검증하지 않았습니다. quota는 주입 오류 시험입니다. 브라우저/OS의 저장소 삭제·확장 제거 이후 데이터 복원은 제공하지 않습니다. **종료 직전 commit되지 않은 이벤트와 마지막 성공 checkpoint 뒤 실제 행동·중단 중 사용자 행동은 복구할 수 없습니다.** 알람의 정확한 실행 시각과 장치 절전 중 즉시 전송도 보장하지 않습니다. 로컬·IDB에 충돌한 원본을 자동 병합하는 운영자 복구 UI와 미확인 후보의 수동 재연결은 후속 검토입니다.
+
+서버 세션 종료 API·END_PENDING 전체 처리, AI/목표 복귀 알림·내보내기/라벨링은 구현하지 않았습니다. 후속 서버 종료 Issue는 이 영속 큐의 미확인 POST/PATCH와 확인 필요 후보가 해결되기 전 서버 종료를 완료로 처리하지 않아야 하며, 서버 ACK와 로컬 종료 commit을 구분해 END_PENDING 복구를 설계해야 합니다. 기존 활성 10초 분석 시점·본문 길이 FE code point/BE UTF-16 차이는 이번 저장소 변경으로 해결되지 않으며 기존 방문 판정 자체는 변경하지 않습니다.
+
+---
+
 # Focus Recovery Chrome Extension (Issue #9·21·32·34·43·46 / FE-001·002·004~007)
 
 Manifest V3 기반 개발용 페이지 수집기입니다. React popup의 목표로 Background Service Worker가 Spring Boot `POST /api/sessions`를 호출하고, 검증된 서버 세션으로 수집을 시작합니다. 확정된 유효 방문·본문·초기 행동 정보는 `POST /api/sessions/{sessionId}/visits`로 저장하고 응답을 검증합니다. POST ACK 이후 달라진 누적 행동 정보는 행동 PATCH로 갱신합니다. AI 결과 조회는 아직 구현하지 않습니다. **로컬 수집 종료는 서버 종료가 아니며 서버 세션은 ACTIVE로 남을 수 있습니다.**

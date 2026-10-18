@@ -211,6 +211,13 @@ export class Collector {
     if (this.state.foregroundTabId === tabId) this.state.foregroundTabId = null;
   }
   stop(now: number): void {
+    // An explicit stop can close an already valid detached visit at its committed duration.
+    // Undecided detached candidates retain their recovery hold and block later sequences.
+    for (const candidate of this.state.candidates) if (candidate.recoveryRequired && candidate.state === 'valid') {
+      candidate.finalized = true;
+      delete candidate.recoveryRequired;
+    }
+    this.assignSequences();
     for (const key of Object.keys(this.state.tabs)) this.pause(Number(key), now, true);
     this.state.session = null;
     this.state.foregroundTabId = null;

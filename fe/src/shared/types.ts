@@ -44,6 +44,7 @@ export interface VisitCandidate extends VisitBehavior {
   sessionId: string;
   sequence: number | null; // Assigned once, in candidate creation order after finalization.
   finalized: boolean;
+  recoveryRequired?: boolean; // Live document identity could not be verified after recovery.
   browserTabKey: string;
   visitedAt: string;
   state: 'pending' | 'valid' | 'excluded';
@@ -88,6 +89,8 @@ export interface BehaviorDeliveryStatus {
     error?: string; code?: string; retryable?: boolean; nextRetryAt?: number }[];
 }
 export interface DevStatus {
+  storage?: { phase: 'initializing' | 'ready' | 'failed'; recovered: boolean; error?: string; metadataSyncPending?: boolean; legacyCleanupPending?: boolean };
+  recoveryCandidates?: number;
   session: ServerSession | null;
   sessionStartRecovery?: SessionStartRecovery;
   visitDelivery?: VisitDeliveryStatus;

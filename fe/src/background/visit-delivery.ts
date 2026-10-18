@@ -19,7 +19,6 @@ function isSnapshot(visit: PageVisit) {
     && Number.isSafeInteger(visit.behaviorVersion) && visit.behaviorVersion >= 0;
 }
 export class VisitDelivery {
-  // shortcut: storage.session survives worker restarts, not browser restarts; use IndexedDB for durable delivery.
   checkpoint: Checkpoint = { apiBaseUrl: API_BASE_URL, entries: [] };
   blocked: string | undefined;
   private running = false;

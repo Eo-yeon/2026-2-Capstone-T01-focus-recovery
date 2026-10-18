@@ -13,6 +13,11 @@ function App() {
   const recovery = status?.sessionStartRecovery;
   const pending = recovery?.kind === 'pending' ? recovery : undefined;
   const invalid = recovery?.kind === 'invalid' ? recovery : undefined;
+  const storage = status?.storage;
+  const storageBlocked = !storage || storage.phase !== 'ready';
+  const held = status?.candidates.filter(candidate => candidate.recoveryRequired) ?? [];
+  const stoppable = held.filter(candidate => candidate.state === 'valid').length;
+  const sequenceWaiting = status?.visits.filter(visit => visit.sequence === null).length ?? 0;
   const delivery = status?.visitDelivery;
   const behavior = status?.behaviorDelivery;
   const pendingBehavior = behavior?.visits.filter(visit => visit.phase !== 'acked') ?? [];
@@ -47,6 +52,16 @@ function App() {
     <p>작업 목표와 허용한 사이트의 확정된 방문·본문·누적 행동 정보를 설정된 API 서버에 전송합니다.</p>
     <p>종료는 로컬 수집만 중단합니다. 서버 종료 API는 미연동이므로 서버 세션은 ACTIVE로 남을 수 있습니다.</p>
     <button disabled={busy} onClick={() => void allowSite()}>현재 사이트 수집 허용</button>
+    <p>IndexedDB: {storage?.phase ?? 'initializing'} / {storage?.recovered ? '이전 작업 복구됨' : '이전 작업 없음'}</p>
+    {storage?.phase === 'failed' && <p role="alert">영속 저장·복구 실패 ({storage.error}). 서버 오류와 별개로 전송을 차단했습니다. 원본을 보존했으며 Worker 재시작 후 확인이 필요합니다.</p>}
+    {storage?.metadataSyncPending && <p role="alert">IndexedDB 데이터는 저장됐지만 local 세션 메타데이터 동기화가 남았습니다. 서버 저장 오류와 구분하며, 상태 새로고침 또는 Worker 재시작에서 같은 영수증으로 확인합니다.</p>}
+    {storage?.legacyCleanupPending && <p role="alert">검증된 이전 데이터는 IndexedDB에 저장됐지만 legacy 키 정리가 남았습니다. Worker 재시작에서 이전 해시를 확인한 뒤 정리를 재시도합니다.</p>}
+    {held.length > 0 && <div role="alert">
+      <p>동일한 Chrome 문서를 확인하지 못한 후보 {held.length}건을 보존했습니다. 유효 방문 중 순서 미확정 {sequenceWaiting}건은 앞 후보의 판정이 끝날 때까지 POST를 기다립니다. 확인 필요 후보가 남으면 신규 세션을 시작할 수 없습니다.</p>
+      {stoppable > 0 && <p>이미 유효했던 {stoppable}건은 명시적 로컬 수집 종료에서 마지막 저장 누적값으로 확정할 수 있습니다.</p>}
+      {held.length > stoppable && <p>판정 미완료·복구 가능한 제외 후보 {held.length - stoppable}건은 로컬 종료로 해결되지 않습니다. 자동 판정이나 임의 재연결 기능은 없으며 원본을 보존합니다.</p>}
+      <p>로컬 기록 삭제는 이 후보와 뒤에서 대기 중인 방문·미확인 요청도 버립니다. 서버 데이터는 삭제하지 않습니다.</p>
+    </div>}
     <p>상태: {status?.session ? '서버 세션으로 수집 중' : invalid ? '시작 요청 복구 필요' : pending ? '이전 시작 요청 확인 필요' : '수집 중지'}</p>
     {invalid && <div role="alert">
       <p>{invalid.reason === 'initialization-failed' ? '저장된 상태를 확인할 수 없습니다. 확장 프로그램과 저장소 상태를 확인한 뒤 Worker를 재시작해 주세요.'
@@ -60,23 +75,23 @@ function App() {
       <label htmlFor="goal">최초 작업 목표 (현재 BE 구현 기준 5~150자)</label>
       <textarea id="goal" value={pending?.goalText ?? goal} disabled={busy || Boolean(pending) || Boolean(invalid)} onChange={event => setGoal(event.target.value)} />
       {pending && <p>서버에 이미 생성되었을 수 있습니다. 목표와 요청 키를 유지해 재시도합니다. 로컬 기록 삭제로 이 요청을 취소할 수 없습니다.</p>}
-      <button disabled={busy || !status || Boolean(invalid) || Boolean(pending?.blockedReason) || !validGoal(pending?.goalText ?? goal)} onClick={() => { setInspect(false); void request({ type: 'start', goalText: pending?.goalText ?? goal }); }}>{busy ? '처리 중…' : pending ? '같은 요청 재시도' : '작업 세션 시작'}</button>
+      <button disabled={busy || storageBlocked || (!pending && (Boolean(status?.recoveryCandidates) || unconfirmed.length > 0 || pendingBehavior.length > 0)) || !status || Boolean(invalid) || Boolean(pending?.blockedReason) || !validGoal(pending?.goalText ?? goal)} onClick={() => { setInspect(false); void request({ type: 'start', goalText: pending?.goalText ?? goal }); }}>{busy ? '처리 중…' : pending ? '같은 요청 재시도' : '작업 세션 시작'}</button>
     </>}
     {status?.capacityReached && <p role="alert">개발용 200건 한도에 도달해 수집이 중지되었습니다. 종료 후 새 세션을 시작해 주세요.</p>}
     {error && <p role="alert">{error}</p>}
     <p>후보 {status?.candidates.length ?? 0}건 / 유효 방문 {status?.visits.length ?? 0}건</p>
     <p>서버 저장 확인 {delivery?.visits.filter(visit => visit.phase === 'acked').length ?? 0}건 / 저장 미확인 {unconfirmed.length}건. 유효 방문 중 순서 미확정 방문은 아직 전송하지 않습니다.</p>
-    <p>전송 상태는 브라우저 재시작·확장 재로드 시 유실될 수 있습니다. 로컬 수집 종료 후에도 확정 방문 저장과 최종 행동 갱신은 계속됩니다.</p>
+    <p>전송 상태는 IndexedDB에 보존하며 브라우저 재시작·확장 재로드 후 복구합니다. 저장 직전 중단된 이벤트와 중단 중 행동은 복구할 수 없습니다. 로컬 수집 종료 후에도 확정 방문 저장과 최종 행동 갱신은 계속됩니다.</p>
     {delivery?.blocked && <p role="alert">{delivery.blocked}</p>}
     {unconfirmed.map(visit => <p key={visit.visitId} role={visit.error ? 'alert' : undefined}>방문 #{visit.sequence}: {visit.phase} (시도 {visit.attempts}회){visit.error && ` — ${visit.code ? `${visit.code}: ` : ''}${visit.error}`}</p>)}
-    <button disabled={busy || !unconfirmed.some(visit => visit.phase === 'failed' && visit.retryable)} onClick={() => void request({ type: 'retry-visits' })}>같은 방문 재시도</button>
+    <button disabled={busy || storageBlocked || !unconfirmed.some(visit => visit.phase === 'failed' && visit.retryable)} onClick={() => void request({ type: 'retry-visits' })}>같은 방문 재시도</button>
     <p>행동 갱신 {behavior?.blocked ? '상태 확인 필요' : `확인 ${behavior?.visits.filter(visit => visit.phase === 'acked').length ?? 0}건 / 갱신 미확인 ${pendingBehavior.length}건`} (POST 저장 대기 포함).</p>
     {behavior?.blocked && <p role="alert">{behavior.blocked}</p>}
     {pendingBehavior.map(visit => <p key={visit.visitId} role={visit.error ? 'alert' : undefined}>행동 #{visit.sequence}: {visit.phase} (시도 {visit.attempts}회, 최신 v{visit.latest.behaviorVersion} / 서버 ACK {visit.ack ? `v${visit.ack.behaviorVersion}` : '미확인'}){visit.error && ` — ${visit.code ? `${visit.code}: ` : ''}${visit.error}`}{visit.phase === 'failed' && (visit.retryable ? ' / 재시도 가능' : ' / 서버 상태 확인 필요')}</p>)}
-    <button disabled={busy || !pendingBehavior.some(visit => visit.phase === 'failed' && visit.retryable)} onClick={() => void request({ type: 'retry-behaviors' })}>같은 행동 갱신 재시도</button>
+    <button disabled={busy || storageBlocked || !pendingBehavior.some(visit => visit.phase === 'failed' && visit.retryable)} onClick={() => void request({ type: 'retry-behaviors' })}>같은 행동 갱신 재시도</button>
     {(pendingBehavior.length > 0 || behavior?.blocked) && <p>행동 갱신이 미확인인 동안 새 세션 시작을 보류합니다. 삭제하면 최종 행동값을 복구할 수 없습니다.</p>}
     <button disabled={busy} onClick={() => void request({ type: 'status' })}>상태 새로고침</button>
-    <button disabled={busy || Boolean(status?.session)} onClick={() => { setInspect(false); void request({ type: 'clear' }); }}>로컬 기록 삭제</button>
+    <button disabled={busy || storageBlocked || Boolean(status?.session)} onClick={() => { setInspect(false); void request({ type: 'clear' }); }}>로컬 기록 삭제</button>
     {(unconfirmed.length > 0 || pendingBehavior.length > 0) && <p>로컬 기록 삭제는 저장·행동 갱신 미확인 요청도 버립니다. 진행 중 요청은 서버에 저장될 수 있으며 서버 기록은 삭제되지 않습니다.</p>}
     <label><input type="checkbox" checked={inspect} onChange={event => setInspect(event.target.checked)} /> 수집 데이터 표시 (본문이 화면에 나타납니다)</label>
     {inspect && <pre>{JSON.stringify({ candidates: status?.candidates, visits: status?.visits, readyVisits: status?.readyVisits }, null, 2)}</pre>}
