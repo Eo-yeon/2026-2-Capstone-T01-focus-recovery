@@ -217,8 +217,8 @@ export class Collector {
     this.state.lastActiveTabId = null;
     this.state.lastActiveVisitId = null;
   }
-  status(now: number): DevStatus {
-    if (this.state.session && this.state.foregroundTabId !== null) this.foreground(this.state.foregroundTabId, now);
+  status(now: number, settle = true): DevStatus {
+    if (settle && this.state.session && this.state.foregroundTabId !== null) this.foreground(this.state.foregroundTabId, now);
     const visits: DevStatus['visits'] = this.state.candidates.filter(candidate => candidate.state === 'valid' && candidate.snapshot).map(candidate => {
       const { identity: _, organicResultCount: __, ...snapshot } = candidate.snapshot!;
       return { ...snapshot, visitId: candidate.visitId, sessionId: candidate.sessionId, sequence: candidate.sequence, browserTabKey: candidate.browserTabKey, visitedAt: candidate.visitedAt, searchQuery: snapshot.searchQuery ?? null, activeDurationMs: candidate.activeDurationMs, tabSwitchCount: candidate.tabSwitchCount, behaviorVersion: candidate.behaviorVersion };

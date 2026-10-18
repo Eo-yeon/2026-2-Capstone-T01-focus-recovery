@@ -11,8 +11,25 @@ const bodyA = 'JWT 문서에서 토큰 검증 방법과 Spring Security 인증 �
 const bodyB = '우주 탐사선은 먼 행성의 대기와 암석을 연구합니다. 천문학자들이 수집한 관측 자료로 태양계 형성 과정을 분석하는 과학 기사입니다.';
 const sessions = new Map();
 const apiRequests = [];
+const savedVisits = new Map();
+const visitRequests = [];
+let loseVisitResponse = true;
 let loseResponse = true;
 const server = createServer(async (req, res) => {
+  const visitPath = req.url.match(/^\/api\/sessions\/([a-f0-9-]+)\/visits$/);
+  if (visitPath && req.method === 'POST') {
+    let body = ''; for await (const chunk of req) body += chunk;
+    const visit = { ...JSON.parse(body), sessionId: visitPath[1], updatedAt: null };
+    assert.equal(req.headers['idempotency-key'], undefined);
+    visitRequests.push({ sessionId: visit.sessionId, visitId: visit.visitId, sequence: visit.sequence });
+    const saved = savedVisits.get(visit.visitId);
+    if (saved) {
+      for (const key of ['sessionId', 'sequence', 'browserTabKey', 'normalizedUrl', 'domain', 'title', 'content', 'searchQuery', 'isSearchResultPage', 'visitedAt']) assert.deepEqual(visit[key], saved[key]);
+    } else savedVisits.set(visit.visitId, visit);
+    if (loseVisitResponse) { loseVisitResponse = false; req.socket.destroy(); return; }
+    res.setHeader('Content-Type', 'application/json');
+    res.writeHead(saved ? 200 : 201); res.end(JSON.stringify(saved ?? visit)); return;
+  }
   if (req.url === '/api/sessions' && req.method === 'POST') {
     let body = ''; for await (const chunk of req) body += chunk;
     const { goalText } = JSON.parse(body);
@@ -253,6 +270,11 @@ try {
   assert.deepEqual(result.readyVisits.slice(0, searchReady.length), searchReady, 'exclusions do not renumber published visits');
   await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'stop' }));
   const stopped = await status();
+  await until(state => state.visitDelivery.visits.length === stopped.readyVisits.length && state.visitDelivery.visits.every(visit => visit.phase === 'acked'), 'all finalized visits receive validated server ACK');
+  assert.equal(savedVisits.size, stopped.readyVisits.length, 'one stored record per valid visit despite lost-response retry');
+  assert.equal(visitRequests[0].visitId, visitRequests[1].visitId, 'lost visit response retries the same ID');
+  assert.deepEqual(visitRequests.filter((request, index) => index === 0 || request.visitId !== visitRequests[index - 1].visitId).map(request => request.sequence), stopped.readyVisits.map(visit => visit.sequence));
+  console.log('PASS: MV3 visit HTTP delivery, lost response, duplicate 200 replay, sequence order, ACK and worker checkpoint recovery (synthetic API)');
   assert.equal([...sessions.values()].every(session => session.status === 'ACTIVE'), true, 'local stop does not claim server termination');
   assert.equal(stopped.readyVisits.length, stopped.visits.length, 'stop finalizes every valid visit');
   assert.deepEqual(stopped.readyVisits.map(v => v.sequence), stopped.readyVisits.map((_, i) => i + 1), 'excluded candidates never consume server sequences');

@@ -41,7 +41,9 @@ beforeEach(async () => {
     scripting: { getRegisteredContentScripts: vi.fn(async () => []), unregisterContentScripts: vi.fn(async () => undefined), registerContentScripts: vi.fn(async () => undefined), executeScript: vi.fn(async () => undefined) },
     webNavigation: { getFrame: vi.fn(async () => frame), onCommitted: chromeEvent(), onHistoryStateUpdated: chromeEvent(), onErrorOccurred: chromeEvent() },
   };
-  vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify({ ...serverSession(JSON.parse(init.body as string).goalText), sessionId: SERVER_SESSION_ID }), { status: 201 })));
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => new Response(JSON.stringify(url.endsWith('/visits')
+    ? { ...JSON.parse(init.body as string), sessionId: SERVER_SESSION_ID, updatedAt: null }
+    : { ...serverSession(JSON.parse(init.body as string).goalText), sessionId: SERVER_SESSION_ID }), { status: 201 })));
   vi.stubGlobal('chrome', api);
   await import('../src/background/index');
 });
@@ -168,7 +170,12 @@ describe('background Chrome adapter', () => {
     clock.mockReturnValue(20000);
     await reloadWorker();
     api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
-    expect((await message({ type: 'status' })).status).toEqual(stopped);
+    const restored = (await message({ type: 'status' })).status!;
+    const { visitDelivery: stoppedDelivery, ...stoppedCollection } = stopped;
+    const { visitDelivery: restoredDelivery, ...restoredCollection } = restored;
+    expect(restoredCollection).toEqual(stoppedCollection);
+    expect(stoppedDelivery!.visits[0].visitId).toBe(restoredDelivery!.visits[0].visitId);
+    expect(restoredDelivery!.visits[0].phase).toBe('acked');
   });
   it('does not resume when a tab is selected inside a minimized window', async () => {
     const { clock } = await validVisit();
@@ -985,5 +992,177 @@ describe('activation receipts and failure boundaries', () => {
     expect((await message({ type: 'status' })).status?.sessionStartRecovery).toMatchObject({ kind: 'invalid', reason: kind === 'conflict' ? 'conflicting-records' : 'corrupted-record' });
     expect((await start()).ok).toBe(false);
     expect(local).toEqual(records); expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('visit HTTP integration in the real background adapter', () => {
+  async function prepare() {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(10000);
+    const started = await message({ type: 'start', goalText: '방문 저장 연동 검증하기' });
+    const sessionId = started.status!.session!.sessionId;
+    await message({ type: 'context' }, pageSender);
+    clock.mockReturnValue(11000);
+    await message({ type: 'snapshot', sessionId, snapshot: { ...await describeUrl(frame.url), title: '합성 문서', content: '공개 합성 본문입니다. '.repeat(10) } }, pageSender);
+    return { clock, sessionId };
+  }
+  it('keeps processing collection events and new visits while awaiting the preceding HTTP ACK', async () => {
+    const { clock, sessionId } = await prepare();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const requests: any[] = [];
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      const body = JSON.parse(init!.body as string); requests.push({ url, body });
+      if (requests.length === 1) await gate;
+      return new Response(JSON.stringify({ ...body, sessionId, updatedAt: null }), { status: 201 });
+    });
+    clock.mockReturnValue(12000);
+    frame = { documentId: 'document2', url: 'https://example.com/two' };
+    const second = { ...pageSender, documentId: frame.documentId, url: frame.url };
+    await message({ type: 'context' }, second);
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    const firstRequest = structuredClone(requests[0].body);
+    clock.mockReturnValue(13000);
+    await message({ type: 'snapshot', sessionId, snapshot: { ...await describeUrl(frame.url), title: '두 번째 문서', content: '새 공개 합성 본문입니다. '.repeat(10) } }, second);
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
+    await message({ type: 'stop' });
+    const pending = (await message({ type: 'status' })).status!;
+    expect(pending.session).toBeNull();
+    expect(pending.readyVisits.map(v => v.sequence)).toEqual([1, 2]);
+    expect(requests).toHaveLength(1);
+    expect(memory.visitDelivery.entries[0].visit).toMatchObject(firstRequest);
+    expect(memory.collection.candidates[1].tabSwitchCount).toBe(1);
+    release();
+    await vi.waitFor(() => expect(requests).toHaveLength(2));
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.visitDelivery!.visits.map(v => v.phase)).toEqual(['acked', 'acked']));
+    expect(requests.map(request => request.body.sequence)).toEqual([1, 2]);
+    await message({ type: 'status' }); expect(requests).toHaveLength(2);
+  });
+  it('preserves a failed request and blocks a new session until explicit local deletion', async () => {
+    await prepare();
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ code: 'SESSION_ENDED' }), { status: 409 }));
+    await message({ type: 'stop' });
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.visitDelivery!.visits[0]).toMatchObject({ phase: 'failed', code: 'SESSION_ENDED', retryable: false }));
+    const count = vi.mocked(fetch).mock.calls.length;
+    const blocked = await message({ type: 'start', goalText: '새 작업을 시작해 보기' });
+    expect(blocked.ok).toBe(false); expect(fetch).toHaveBeenCalledTimes(count);
+    await message({ type: 'clear' });
+    expect(memory.visitDelivery.entries).toEqual([]);
+    expect(memory.collection.candidates).toEqual([]);
+  });
+});
+
+describe('session separation and local delivery lifecycle', () => {
+  async function scenario() {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(20000);
+    const sessions: string[] = [], visits: { sessionId: string; body: any }[] = [];
+    let fail = false;
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      const body = JSON.parse(init!.body as string), path = String(url);
+      if (!path.endsWith('/visits')) {
+        const session = serverSession(body.goalText, Date.now()); sessions.push(session.sessionId);
+        return new Response(JSON.stringify(session), { status: 201 });
+      }
+      const sessionId = path.split('/').at(-2)!; visits.push({ sessionId, body: structuredClone(body) });
+      return new Response(JSON.stringify(fail ? { code: 'SERVER_ERROR' } : { ...body, sessionId, updatedAt: null }), { status: fail ? 503 : 201 });
+    });
+    const begin = async () => {
+      const result = await message({ type: 'start', goalText: '연속 세션 방문 보존 검증하기' });
+      expect(result.ok).toBe(true); return result.status!.session!.sessionId;
+    };
+    const collect = async (sessionId: string, count: number) => {
+      for (let i = 0; i < count; i++) {
+        clock.mockReturnValue(Date.now() + 1500);
+        frame = { documentId: crypto.randomUUID(), url: `https://example.com/${sessionId}/${i}` };
+        const sender = { ...pageSender, documentId: frame.documentId, url: frame.url };
+        await message({ type: 'context' }, sender);
+        clock.mockReturnValue(Date.now() + 1100);
+        await message({ type: 'snapshot', sessionId, snapshot: { ...await describeUrl(frame.url), title: '공개 합성 문서', content: '공개 본문 '.repeat(20) } }, sender);
+      }
+      api.tabs.onRemoved.listeners[0](1); await message({ type: 'status' });
+    };
+    const ack = async (count: number) => vi.waitFor(async () => {
+      const state = (await message({ type: 'status' })).status!;
+      expect(state.visitDelivery!.visits).toHaveLength(count);
+      expect(state.visitDelivery!.visits.every(visit => visit.phase === 'acked')).toBe(true);
+    });
+    return { clock, sessions, visits, begin, collect, ack, setFail: (value: boolean) => { fail = value; } };
+  }
+  it('separates six ACKed visits in A from two visits in B without explicit clear and survives restart', async () => {
+    const run = await scenario(), a = await run.begin(); await run.collect(a, 6); await run.ack(6);
+    const originals = structuredClone(run.visits); await message({ type: 'stop' });
+    const b = await run.begin(); expect(b).not.toBe(a);
+    await run.collect(b, 2); await run.ack(2); await reloadWorker(); await message({ type: 'status' });
+    expect(memory.visitDelivery.entries.map((entry: any) => [entry.visit.sessionId, entry.sequence, entry.phase])).toEqual([[b, 1, 'acked'], [b, 2, 'acked']]);
+    expect(run.visits.slice(0, 6)).toEqual(originals);
+    expect(run.visits.slice(6).map(visit => [visit.sessionId, visit.body.sequence])).toEqual([[b, 1], [b, 2]]);
+    expect((await message({ type: 'status' })).status!.visitDelivery!.blocked).toBeUndefined();
+    expect(run.sessions).toEqual([a, b]);
+  });
+  it('preserves an unresolved snapshot, then allows B after explicit retry and ACK', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const run = await scenario(), a = await run.begin(); run.setFail(true); await run.collect(a, 1); await message({ type: 'stop' });
+      await vi.waitFor(() => expect(memory.visitDelivery.entries[0].phase).toBe('retry-wait'));
+      for (const delay of [1000, 2000]) {
+        run.clock.mockReturnValue(Date.now() + delay); await vi.advanceTimersByTimeAsync(delay);
+      }
+      expect(memory.visitDelivery.entries[0]).toMatchObject({ phase: 'failed', attempts: 3 });
+      await reloadWorker(); const before = structuredClone(memory.visitDelivery);
+      const denied = await message({ type: 'start', goalText: '두 번째 작업을 시작하기' });
+      expect(denied.ok).toBe(false); expect(denied.error).toContain('확인되지 않은 방문');
+      expect(run.sessions).toEqual([a]); expect(memory.visitDelivery).toEqual(before);
+      expect(denied.status!.visitDelivery!.visits[0].error).toBeTruthy();
+      run.setFail(false); await message({ type: 'retry-visits' }); await run.ack(1);
+      expect(run.visits.at(-1)!.body).toEqual(run.visits[0].body);
+      const b = await run.begin(); await run.collect(b, 2); await run.ack(2);
+      expect(run.sessions).toEqual([a, b]); expect(b).not.toBe(a);
+      expect(run.visits.slice(-2).map(visit => [visit.sessionId, visit.body.sequence])).toEqual([[b, 1], [b, 2]]);
+    } finally { vi.useRealTimers(); }
+  });
+  it.each(['queued', 'sending', 'retry-wait', 'failed', 'acked'] as const)('rehydrates %s through the Background adapter without losing the snapshot', async phase => {
+    const run = await scenario(), sessionId = await run.begin(); await run.collect(sessionId, 1); await run.ack(1);
+    const entry = memory.visitDelivery.entries[0], original = structuredClone(entry.visit), calls = run.visits.length;
+    Object.assign(entry, { phase, attempts: phase === 'queued' ? 0 : 1 });
+    if (phase === 'retry-wait') entry.nextRetryAt = Date.now() + 60000;
+    if (phase === 'failed') Object.assign(entry, { error: '확인 필요', retryable: false, code: 'VISIT_ID_CONFLICT' });
+    const raw = structuredClone(memory.visitDelivery);
+    await reloadWorker(); await message({ type: 'status' });
+    if (phase === 'queued' || phase === 'sending') {
+      await run.ack(1); expect(run.visits).toHaveLength(calls + 1);
+      expect(run.visits.at(-1)!.body).toEqual(run.visits[0].body);
+    } else {
+      await message({ type: 'status' }); expect(run.visits).toHaveLength(calls);
+      expect(memory.visitDelivery).toEqual(raw);
+    }
+    expect(memory.visitDelivery.entries[0].visit).toEqual(original);
+    await message({ type: 'stop' }); await message({ type: 'clear' });
+  });
+  it('does not resurrect a deleted adapter checkpoint after a delayed successful HTTP response', async () => {
+    const run = await scenario(), sessionId = await run.begin();
+    let release!: () => void, received = false;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const send = vi.mocked(fetch).mockImplementation(async (_url, init) => {
+      const body = JSON.parse(init!.body as string); await gate; received = true;
+      return new Response(JSON.stringify({ ...body, sessionId, updatedAt: null }), { status: 201 });
+    });
+    await run.collect(sessionId, 2); await message({ type: 'stop' });
+    expect(memory.visitDelivery.entries.map((entry: any) => entry.phase)).toEqual(['sending', 'queued']);
+    const requests = send.mock.calls.length;
+    expect((await message({ type: 'clear' })).ok).toBe(true);
+    release(); await vi.waitFor(() => expect(received).toBe(true));
+    await message({ type: 'status' }); await reloadWorker(); await message({ type: 'status' });
+    expect(memory.collection.candidates).toEqual([]); expect(memory.visitDelivery.entries).toEqual([]);
+    expect(send).toHaveBeenCalledTimes(requests);
+  });
+  it('blocks a restored queue belonging to a different Collector session and preserves the raw checkpoint', async () => {
+    const run = await scenario(), a = await run.begin(); await run.collect(a, 1); await run.ack(1);
+    memory.visitDelivery.entries[0].visit.sessionId = crypto.randomUUID();
+    memory.visitDelivery.entries[0].phase = 'queued';
+    const raw = structuredClone(memory.visitDelivery), calls = run.visits.length;
+    await reloadWorker(); const restored = (await message({ type: 'status' })).status!;
+    expect(restored.visitDelivery!.blocked).toBeTruthy();
+    expect(memory.visitDelivery).toEqual(raw); expect(run.visits).toHaveLength(calls);
+    expect((await message({ type: 'stop' })).ok).toBe(true);
+    expect((await message({ type: 'start', goalText: '다음 세션을 시작하기' })).ok).toBe(false);
   });
 });

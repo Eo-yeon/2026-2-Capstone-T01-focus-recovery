@@ -6,3 +6,6 @@ export interface WorkSessionResponse {
   status: 'ACTIVE' | 'ENDED';
   endedAt: string | null;
 }
+
+export type CreatePageVisitRequest = Omit<import('../shared/types').PageVisit, 'sessionId'>;
+export type PageVisitResponse = import('../shared/types').PageVisit & { updatedAt: string | null };

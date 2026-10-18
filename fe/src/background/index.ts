@@ -1,5 +1,6 @@
 import { Collector, emptyState } from './collector';
 import { serialExecutor } from './serial';
+import { VisitDelivery } from './visit-delivery';
 import { describeUrl } from '../shared/url';
 import { isContentMessage, isPopupMessage } from '../shared/messages';
 import type { CollectionState, PendingSessionStart, Reply, ServerSession, SessionStartRecovery } from '../shared/types';
@@ -19,6 +20,12 @@ let activatedAt = 0;
 let needsForegroundRecovery = false;
 let focusedWindowId: number | null | undefined;
 const activeWindowTabs = new Map<number, number>();
+const delivery = new VisitDelivery(operation => enqueue(async () => {
+  await ready;
+  const result = operation();
+  await persist();
+  return result;
+}), () => !pendingStart && !invalidRecovery);
 function isStartRecord(value: unknown): value is PendingSessionStart {
   if (!value || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
@@ -40,7 +47,9 @@ function recovery(): SessionStartRecovery {
   return { kind: 'pending', goalText: pendingStart.goalText, blockedReason };
 }
 function status(now: number) {
-  return { ...collector.status(now), sessionStartRecovery: recovery() };
+  const collected = collector.status(now);
+  delivery.collect(collected.readyVisits);
+  return { ...collected, sessionStartRecovery: recovery(), visitDelivery: delivery.status() };
 }
 const ready = (async () => {
   await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
@@ -70,6 +79,7 @@ const ready = (async () => {
     || pendingStart.goalText !== activeStart.goalText || pendingStart.apiBaseUrl !== activeStart.apiBaseUrl
     || (pendingStart.response && pendingStart.response.sessionId !== activeStart.response?.sessionId))) invalidRecovery = 'conflicting-records';
   const saved = await chrome.storage.session.get('collection');
+  const savedDelivery = (await chrome.storage.session.get('visitDelivery')).visitDelivery;
   if (saved.collection) {
     const state = saved.collection as CollectionState;
     if (state.session && (state.session.source !== 'server' || !isWorkSession(state.session) || state.session.status !== 'ACTIVE')) {
@@ -83,6 +93,7 @@ const ready = (async () => {
   if (!activeStart && pendingStart?.response?.status === 'ACTIVE'
     && collector.state.session?.sessionId === pendingStart.response.sessionId) activeStart = pendingStart;
   const expectedSessionId = activeStart?.response?.sessionId;
+  delivery.restore(savedDelivery, expectedSessionId ?? collector.state.session?.sessionId ?? collector.state.candidates[0]?.sessionId);
   if (activeStart && ((collector.state.session && collector.state.session.sessionId !== expectedSessionId)
     || collector.state.candidates.some(candidate => candidate.sessionId !== expectedSessionId))) invalidRecovery = 'conflicting-records';
   if (!collector.state.session && retainedSession && !pendingStart && !activeStart) invalidRecovery ??= 'missing-request';
@@ -99,7 +110,7 @@ const ready = (async () => {
 });
 async function persist() {
   if (invalidRecovery === 'initialization-failed') return;
-  await chrome.storage.session.set({ collection: collector.state });
+  await chrome.storage.session.set({ collection: collector.state, ...(!delivery.blocked ? { visitDelivery: delivery.checkpoint } : {}) });
   if (collector.state.session) {
     retainedSession = collector.state.session;
     await chrome.storage.local.set({ activeSession: { ...retainedSession, ...(activeStart ? { startRequest: activeStart } : {}) } });
@@ -118,6 +129,7 @@ function dispatch<T>(operation: (now: number) => Promise<T>, foregroundEvent = f
         if (!foregroundEvent) await refreshForeground(now);
       }
       const result = await operation(now);
+      delivery.collect(collector.status(now, false).readyVisits);
       await persist();
       // Remove the recovery record only after the active checkpoint and metadata are durable.
       if (pendingStart?.response && pendingStart.response.sessionId === collector.state.session?.sessionId) {
@@ -138,7 +150,7 @@ function dispatch<T>(operation: (now: number) => Promise<T>, foregroundEvent = f
       catch { await chrome.storage.session.remove('collection').catch(() => undefined); }
       throw error;
     }
-  });
+  }).then(result => { delivery.kick(); return result; });
 }
 function event(operation: (now: number) => Promise<unknown>, foregroundEvent = false) {
   // Never log raw URLs, payloads, goals or platform error messages.
@@ -220,6 +232,7 @@ async function syncScripts() {
 async function startSession(goal: string): Promise<string | undefined> {
   if (invalidRecovery) return '시작 요청 정보 확인이 필요합니다. 원본을 보존한 채 서버 상태를 확인해 주세요.';
   if (collector.state.session) return '이미 활성 세션이 있습니다.';
+  if (!pendingStart && delivery.hasUnconfirmed()) return '저장이 확인되지 않은 방문이 있습니다. 전송 상태를 확인하고 재시도하거나 로컬 기록을 명시적으로 삭제해 주세요.';
   const goalText = normalizeGoal(goal);
   if (!validGoal(goalText)) return '목표는 앞뒤 공백을 제외하고 5~150자로 입력해 주세요.';
   if (pendingStart && (pendingStart.goalText !== goalText || pendingStart.apiBaseUrl !== API_BASE_URL)) {
@@ -236,7 +249,7 @@ async function startSession(goal: string): Promise<string | undefined> {
     if (response.status !== 'ACTIVE') return '기존 서버 세션이 이미 종료되었습니다. 서버 상태를 확인해 주세요.';
     activatedAt = Date.now();
     if (activeStart) collector.resume(response);
-    else collector.start(response);
+    else { collector.start(response); delivery.clear(); }
     activeStart = pendingStart;
     await persist();
     await refreshForeground(Date.now());
@@ -288,6 +301,10 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
       } else if (message.type === 'clear') {
         if (collector.state.session) return { ok: false, error: '세션 종료 후 기록을 지워 주세요.' };
         collector.state = emptyState();
+        delivery.clear();
+        await chrome.storage.session.remove('visitDelivery');
+      } else if (message.type === 'retry-visits') {
+        delivery.retry();
       } else if (message.type === 'sync-permissions') {
         await syncScripts();
         await broadcast();
@@ -391,6 +408,8 @@ chrome.permissions.onRemoved.addListener(() => event(async now => {
   // Revocation is privacy-sensitive: stop and erase all in-memory samples.
   suspend(now);
   collector.state = emptyState();
+  delivery.clear();
+  await chrome.storage.session.remove('visitDelivery');
   await syncScripts();
   await broadcast();
 }));
