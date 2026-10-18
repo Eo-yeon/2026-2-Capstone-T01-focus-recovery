@@ -42,11 +42,12 @@ class OpenApiDocsTest {
 			.andExpect(jsonPath("$.paths['/api/sessions/{sessionId}/analysis-status'].get.description",
 				allOf(containsString("참고 결과"), containsString("구간 3의 결과로 새 알림을 표시하면 안 됩니다"),
 					containsString("windowIndex가 같다는 것만으로 알림을 허용하면 안 됩니다"),
-					containsString("ACTIVE인지와 alertId 중복"), containsString("alert는 항상 null"))))
+					containsString("ACTIVE인지와 alertId 중복"), containsString("아직 표시되지 않은 후보만"),
+					containsString("이전 구간의 후보는 반환하지 않습니다"))))
 			.andExpect(jsonPath("$.components.schemas.AnalysisStatusResponse.properties.latestCompletedAnalysis.description",
 				containsString("알림 표시 허용을 의미하지 않는다")))
 			.andExpect(jsonPath("$.components.schemas.AnalysisStatusResponse.properties.alert.description",
-				containsString("항상 null")));
+				containsString("미표시 후보만")));
 	}
 
 	// 분석 상세의 JSON 필드는 문자열이 아니라 객체 또는 null로 문서화되고, JsonNode 내부 구조가 노출되지 않아야 한다
