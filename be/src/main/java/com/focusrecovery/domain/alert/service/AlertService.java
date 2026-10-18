@@ -76,7 +76,9 @@ public class AlertService {
 
 	// 처리할 때마다 현재 상태로 다시 판단한다(잠정 정책): 같은 분석의 후보가 이미 있으면 그것을 쓰고, 아니면
 	// AI 모드, ACTIVE 세션, COMPLETED·DRIFT, 실제 analysis_window의 최신 구간, 실제 표시 이력·최소 간격 조건을 모두 통과해야 만든다.
-	// 잠금은 세션(공유) → 분석 행 순서이며, 같은 분석의 동시 호출은 분석 행 잠금에서 직렬화되어 후보는 하나만 생긴다
+	// 잠금은 세션(공유) → 분석 행 순서이며, 같은 분석의 동시 호출은 분석 행 잠금에서 직렬화되어 후보는 하나만 생긴다.
+	// 공유 잠금으로 충분하다: 판단에 쓰는 표시 이력을 바꾸는 표시 확인·사용자 응답은 세션 배타 잠금을 잡으므로 서로 직렬화되고,
+	// 후보 생성끼리는 같은 분석이면 분석 행에서, 다른 분석이면 최신 구간 조건으로 갈리므로 세션 단위로 막을 필요가 없다
 	@Transactional(propagation = Propagation.MANDATORY)
 	public AiDecision decideAiCandidate(UUID sessionId, UUID analysisId) {
 		WorkSession session = workSessionRepository.findForShareBySessionId(sessionId).orElse(null);

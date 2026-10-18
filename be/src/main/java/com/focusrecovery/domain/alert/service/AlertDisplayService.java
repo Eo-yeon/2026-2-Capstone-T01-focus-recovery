@@ -24,7 +24,9 @@ import com.focusrecovery.domain.session.repository.WorkSessionRepository;
 import com.focusrecovery.global.exception.ConflictException;
 import com.focusrecovery.global.exception.InvalidRequestException;
 
-// 실제 알림 표시 확인과 사용자 선택 저장. 잠금은 세션(공유) → 알림 행 순서로 종료·후보 생성과 같은 세션 우선 순서를 지킨다.
+// 실제 알림 표시 확인과 사용자 선택 저장. 둘 다 shownAt을 처음 기록할 수 있으므로 트랜잭션 시작부터 세션 배타 잠금을 잡고
+// 그다음 알림 행을 잠근다(공유 → 배타 전환 없음). AI 후보 생성은 세션 공유 잠금을 먼저 잡으므로, 표시 기록이 커밋될 때까지 기다린 뒤
+// 커밋된 표시 이력으로 연속 DRIFT·최소 간격을 판단한다. 잠금 순서는 세션 → 알림 행 → 응답으로 다른 쓰기와 같은 세션 우선 순서다.
 // 늦게 도착한 요청을 요청 시점의 현재 후보 여부로 거절하지 않고, 전달된 시각 자체(생성·종료·현재 시각과의 관계)로 판단한다
 @Service
 public class AlertDisplayService {
@@ -54,7 +56,7 @@ public class AlertDisplayService {
 	@Transactional
 	public AlertResponse markShown(UUID sessionId, UUID alertId, Instant shownAt) {
 		requireMillis(shownAt, "shownAt");
-		WorkSession session = workSessionRepository.findForShareBySessionId(sessionId).orElseThrow(SessionNotFoundException::new);
+		WorkSession session = workSessionRepository.findForUpdateBySessionId(sessionId).orElseThrow(SessionNotFoundException::new);
 		Notification alert = lockAlert(sessionId, alertId);
 		if (alert.getShownAt() != null) {
 			if (!alert.getShownAt().equals(shownAt)) {
@@ -73,7 +75,7 @@ public class AlertDisplayService {
 	public ResponseResult respond(UUID sessionId, UUID alertId, AlertResponseRequest request) {
 		requireMillis(request.selectedAt(), "selectedAt");
 		requireMillis(request.shownAt(), "shownAt");
-		WorkSession session = workSessionRepository.findForShareBySessionId(sessionId).orElseThrow(SessionNotFoundException::new);
+		WorkSession session = workSessionRepository.findForUpdateBySessionId(sessionId).orElseThrow(SessionNotFoundException::new);
 		Notification alert = lockAlert(sessionId, alertId);
 		if (alert.getShownAt() != null && request.shownAt() != null && !alert.getShownAt().equals(request.shownAt())) {
 			throw shownAtConflict();

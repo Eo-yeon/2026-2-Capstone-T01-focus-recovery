@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -12,6 +13,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import java.lang.reflect.InvocationTargetException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -32,23 +34,30 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.mockito.invocation.InvocationOnMock;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.jpa.repository.support.JpaRepositoryFactory;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
+import org.springframework.test.util.AopTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
+import com.focusrecovery.domain.alert.entity.AlertCandidateTask;
+import com.focusrecovery.domain.alert.entity.AlertTaskStatus;
 import com.focusrecovery.domain.alert.entity.Notification;
+import com.focusrecovery.domain.alert.repository.AlertCandidateTaskRepository;
 import com.focusrecovery.domain.alert.repository.NotificationRepository;
 import com.focusrecovery.domain.alert.repository.NotificationResponseRepository;
 import com.focusrecovery.domain.alert.service.AlertService;
+import com.focusrecovery.domain.alert.service.AlertTaskProcessor;
 import com.focusrecovery.domain.analysis.client.AiAnalysisOutcome;
 import com.focusrecovery.domain.analysis.entity.AnalysisResult;
 import com.focusrecovery.domain.analysis.repository.AnalysisResultRepository;
@@ -58,6 +67,9 @@ import com.focusrecovery.domain.visit.repository.PageVisitRepository;
 import com.focusrecovery.domain.window.entity.AnalysisWindow;
 import com.focusrecovery.domain.window.repository.AnalysisWindowRepository;
 import com.jayway.jsonpath.JsonPath;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
 
 // 실제 알림 표시 확인(PATCH shown)과 사용자 선택 저장(POST responses). 서버 현재 시각은 Clock으로 고정하고,
 // 시계 오차 허용치(잠정 5초) 경계를 1ms 단위로 확인한다
@@ -76,8 +88,18 @@ class AlertDisplayTest {
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
 
-	@Autowired
+	// 기본은 실제 동작. 경합 테스트에서만 표시 확인을 커밋 전에 멈춘다
+	@MockitoSpyBean
 	private AlertService alertService;
+
+	@Autowired
+	private AlertTaskProcessor alertTaskProcessor;
+
+	@Autowired
+	private AlertCandidateTaskRepository taskRepository;
+
+	@PersistenceContext
+	private EntityManager entityManager;
 
 	@Autowired
 	private WorkSessionRepository workSessionRepository;
@@ -331,6 +353,184 @@ class AlertDisplayTest {
 		assertThat(alertService.createAiCandidate(sessionId, next)).isEmpty();
 		mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", sessionId))
 			.andExpect(jsonPath("$.alert").value(nullValue()));
+	}
+
+	// 1) 표시 확인이 shownAt을 바꾸고 커밋 전에 멈춤(세션 배타 잠금 보유) 2) 후보 생성 작업 시작 → 세션 공유 잠금에서 대기
+	// 3) 표시 확인 커밋 후 후보 생성이 커밋된 표시 이력을 보고 연속 DRIFT로 건너뜀
+	@Test
+	void 표시_확인이_커밋되기_전에_시작한_후보_생성은_기다렸다가_연속_DRIFT_제한을_적용한다() throws Exception {
+		UUID next = completedDrift(nextWindow(sessionId));
+		registerTask(next);
+		Pause pause = pauseAtShownResponse();
+
+		Future<MockHttpServletResponse> showing = async(() ->
+			shown(sessionId, alert.getAlertId(), alert.getCreatedAt()).andReturn().getResponse());
+		pause.awaitPaused();
+		Future<?> candidate = async(() -> {
+			alertTaskProcessor.process(next);
+			return null;
+		});
+		assertWaiting(candidate, next);
+
+		pause.resume();
+		assertThat(showing.get(10, TimeUnit.SECONDS).getStatus()).isEqualTo(200);
+		candidate.get(10, TimeUnit.SECONDS);
+
+		assertSkipped(next, "DRIFT_FLOW_CONTINUES");
+		assertThat(notificationRepository.count()).isEqualTo(1);
+	}
+
+	@Test
+	void 표시_확인이_커밋되기_전에_시작한_후보_생성은_기다렸다가_최소_간격_제한을_적용한다() throws Exception {
+		completedNormal(nextWindow(sessionId));
+		UUID next = completedDrift(nextWindow(sessionId));
+		registerTask(next);
+		Pause pause = pauseAtShownResponse();
+
+		Future<MockHttpServletResponse> showing = async(() ->
+			shown(sessionId, alert.getAlertId(), now.get()).andReturn().getResponse());
+		pause.awaitPaused();
+		Future<?> candidate = async(() -> {
+			alertTaskProcessor.process(next);
+			return null;
+		});
+		assertWaiting(candidate, next);
+
+		pause.resume();
+		assertThat(showing.get(10, TimeUnit.SECONDS).getStatus()).isEqualTo(200);
+		candidate.get(10, TimeUnit.SECONDS);
+
+		assertSkipped(next, "MIN_INTERVAL_NOT_PASSED");
+		assertThat(notificationRepository.count()).isEqualTo(1);
+	}
+
+	// 응답 API가 shownAt을 처음 저장하는 경우도 같은 세션 배타 잠금으로 직렬화된다
+	@Test
+	void 응답이_shownAt을_처음_저장하는_동안_시작한_후보_생성도_기다렸다가_제한을_적용한다() throws Exception {
+		UUID next = completedDrift(nextWindow(sessionId));
+		registerTask(next);
+		CountDownLatch paused = new CountDownLatch(1);
+		CountDownLatch resume = new CountDownLatch(1);
+		doAnswer(invocation -> {
+			paused.countDown();
+			assertThat(resume.await(10, TimeUnit.SECONDS)).isTrue();
+			return delegate(invocation);
+		}).when(responseRepository).saveAndFlush(any());
+
+		Future<MockHttpServletResponse> responding = async(() -> respond(sessionId, alert.getAlertId(), "RETURN_TO_GOAL",
+			alert.getCreatedAt(), alert.getCreatedAt()).andReturn().getResponse());
+		assertThat(paused.await(5, TimeUnit.SECONDS)).isTrue();
+		Future<?> candidate = async(() -> {
+			alertTaskProcessor.process(next);
+			return null;
+		});
+		assertWaiting(candidate, next);
+
+		resume.countDown();
+		assertThat(responding.get(10, TimeUnit.SECONDS).getStatus()).isEqualTo(201);
+		candidate.get(10, TimeUnit.SECONDS);
+
+		assertSkipped(next, "DRIFT_FLOW_CONTINUES");
+		assertThat(storedShownAt()).isEqualTo(alert.getCreatedAt());
+		assertThat(notificationRepository.count()).isEqualTo(1);
+	}
+
+	// 후보 생성이 먼저 끝나 후보가 이미 있을 수 있다. 이후 표시 확인이 반영되면 조회의 재검증으로 그 후보는 반환되지 않는다
+	@Test
+	void 후보가_먼저_생긴_뒤_표시_확인이_반영되면_조회에서_부적격_후보를_반환하지_않는다() throws Exception {
+		Notification newer = alertService.createAiCandidate(sessionId, completedDrift(nextWindow(sessionId))).orElseThrow();
+		mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", sessionId))
+			.andExpect(jsonPath("$.alert.alertId").value(newer.getAlertId().toString()));
+
+		shown(sessionId, alert.getAlertId(), alert.getCreatedAt()).andExpect(status().isOk());
+
+		mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", sessionId))
+			.andExpect(jsonPath("$.alert").value(nullValue()));
+		Notification kept = notificationRepository.findById(newer.getAlertId()).orElseThrow();
+		assertThat(kept.getShownAt()).isNull();
+	}
+
+	private record Pause(CountDownLatch pausedLatch, CountDownLatch resumeLatch) {
+
+		void awaitPaused() throws InterruptedException {
+			assertThat(pausedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+		}
+
+		void resume() {
+			resumeLatch.countDown();
+		}
+	}
+
+	// markShown이 shownAt을 바꾼 뒤 응답을 만들 때(커밋 전) 멈춘다
+	private Pause pauseAtShownResponse() {
+		Pause pause = new Pause(new CountDownLatch(1), new CountDownLatch(1));
+		AlertService target = AopTestUtils.getUltimateTargetObject(alertService);
+		doAnswer(invocation -> {
+			pause.pausedLatch().countDown();
+			assertThat(pause.resumeLatch().await(10, TimeUnit.SECONDS)).isTrue();
+			return invocation.callRealMethod();
+		}).when(target).toResponse(any(), any());
+		return pause;
+	}
+
+	// 후보 생성은 작업을 가져간(RUNNING) 뒤 세션 잠금을 기다리며 끝나지 않아야 한다
+	private void assertWaiting(Future<?> candidate, UUID analysisId) throws InterruptedException {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		while (!"RUNNING".equals(taskStatus(analysisId)) && System.nanoTime() < deadline) {
+			Thread.sleep(10);
+		}
+		assertThat(taskStatus(analysisId)).isEqualTo("RUNNING");
+		Thread.sleep(300);
+		assertThat(candidate.isDone()).isFalse();
+	}
+
+	private String taskStatus(UUID analysisId) {
+		return jdbcTemplate.queryForObject("select status from alert_candidate_task where analysis_id = ?", String.class,
+			analysisId.toString());
+	}
+
+	private void assertSkipped(UUID analysisId, String reason) {
+		AlertCandidateTask task = taskRepository.findById(analysisId).orElseThrow();
+		assertThat(task.getStatus()).isEqualTo(AlertTaskStatus.SKIPPED);
+		assertThat(task.getSkipReason()).isEqualTo(reason);
+		assertThat(task.getErrorCode()).isNull();
+		assertThat(notificationRepository.findByAnalysisId(analysisId)).isEmpty();
+	}
+
+	private void registerTask(UUID analysisId) {
+		taskRepository.save(AlertCandidateTask.pending(analysisId, sessionId, now.get()));
+	}
+
+	private <T> Future<T> async(java.util.concurrent.Callable<T> task) {
+		ExecutorService executor = Executors.newSingleThreadExecutor();
+		Future<T> future = executor.submit(task);
+		executor.shutdown();
+		return future;
+	}
+
+	// Spring Data 저장소 스파이는 callRealMethod를 쓸 수 없어 같은 EntityManager로 만든 실제 저장소에 넘긴다
+	private Object delegate(InvocationOnMock invocation) throws Throwable {
+		NotificationResponseRepository real = new JpaRepositoryFactory(entityManager)
+			.getRepository(NotificationResponseRepository.class);
+		try {
+			return invocation.getMethod().invoke(real, invocation.getArguments());
+		} catch (InvocationTargetException e) {
+			throw e.getCause();
+		}
+	}
+
+	private AnalysisWindow nextWindow(UUID session) throws Exception {
+		saveVisit(session, (int) jdbcTemplate.queryForObject(
+			"select count(*) from page_visit where session_id = ?", Long.class, session.toString()).longValue() + 1);
+		return latestWindow(session);
+	}
+
+	private void completedNormal(AnalysisWindow window) {
+		AnalysisResult analysis = AnalysisResult.request(UUID.randomUUID(), window.getWindowId(), "{}", now.get());
+		analysis.start(now.get());
+		analysis.finish(new AiAnalysisOutcome(null, "NORMAL", 0.7, 0.2, 0.1, false, null, null, "{\"c\":\"rf\"}", now.get()),
+			now.get());
+		analysisResultRepository.save(analysis);
 	}
 
 	private interface Task<T> {

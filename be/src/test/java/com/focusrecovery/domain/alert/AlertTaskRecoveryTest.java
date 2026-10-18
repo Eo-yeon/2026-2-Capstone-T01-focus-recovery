@@ -558,10 +558,11 @@ class AlertTaskRecoveryTest {
 		return jdbcTemplate.queryForObject("select count(*) from notification", Long.class);
 	}
 
+	// H2는 JSON 컬럼을 byte[]로 돌려주므로 DB와 무관하게 비교할 수 있도록 문자열로 바꾼다
 	private Map<String, Object> analysisRow(UUID analysisId) {
 		Map<String, Object> row = jdbcTemplate.queryForMap("select analysis_id, processing_status, result, p_drift, "
-			+ "error_code, completed_at, cast(input_snapshot as varchar(1000)) snapshot from analysis_result where analysis_id = ?",
-			analysisId.toString());
+			+ "error_code, completed_at, input_snapshot from analysis_result where analysis_id = ?", analysisId.toString());
+		row.replaceAll((column, value) -> value instanceof byte[] bytes ? new String(bytes, java.nio.charset.StandardCharsets.UTF_8) : value);
 		return row;
 	}
 
