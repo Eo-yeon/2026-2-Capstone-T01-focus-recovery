@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
+import com.focusrecovery.domain.alert.exception.AlertNotFoundException;
 import com.focusrecovery.domain.analysis.exception.AnalysisNotFoundException;
 import com.focusrecovery.domain.session.exception.IdempotencyKeyMismatchException;
 import com.focusrecovery.domain.session.exception.SessionNotFoundException;
@@ -68,6 +69,12 @@ public class GlobalExceptionHandler {
 	@ResponseStatus(HttpStatus.NOT_FOUND)
 	public ErrorResponse handleVisitNotFound(VisitNotFoundException e) {
 		return ErrorResponse.of("VISIT_NOT_FOUND", e.getMessage());
+	}
+
+	@ExceptionHandler(AlertNotFoundException.class)
+	@ResponseStatus(HttpStatus.NOT_FOUND)
+	public ErrorResponse handleAlertNotFound(AlertNotFoundException e) {
+		return ErrorResponse.of("ALERT_NOT_FOUND", e.getMessage());
 	}
 
 	@ExceptionHandler(AnalysisNotFoundException.class)

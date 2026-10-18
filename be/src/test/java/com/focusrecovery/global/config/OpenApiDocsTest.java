@@ -62,4 +62,17 @@ class OpenApiDocsTest {
 		}
 		result.andExpect(jsonPath("$.components.schemas.JsonNode").doesNotExist());
 	}
+
+	// FE가 시각 입력 형식(밀리초까지, 초과 정밀도는 400)과 잠정 허용치를 알 수 있어야 한다
+	@Test
+	void OpenAPI_문서에_알림_시각_입력_형식과_잠정_허용치가_포함된다() throws Exception {
+		var result = mockMvc.perform(get("/v3/api-docs")).andExpect(status().isOk());
+		for (String path : new String[] {"$.paths['/api/sessions/{sessionId}/alerts/{alertId}/shown'].patch.description",
+			"$.paths['/api/sessions/{sessionId}/alerts/{alertId}/responses'].post.description"}) {
+			result.andExpect(jsonPath(path, allOf(containsString("밀리초(소수점 3자리)까지만 허용"),
+				containsString("최종 합의 전 잠정 설정 5초"), containsString("이번 작업에서 확정한 구현 정책"))));
+		}
+		result.andExpect(jsonPath("$.components.schemas.ShownRequest.properties.shownAt.description",
+			containsString("더 세밀하면 400")));
+	}
 }

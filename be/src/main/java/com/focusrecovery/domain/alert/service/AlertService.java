@@ -76,7 +76,9 @@ public class AlertService {
 
 	// 처리할 때마다 현재 상태로 다시 판단한다(잠정 정책): 같은 분석의 후보가 이미 있으면 그것을 쓰고, 아니면
 	// AI 모드, ACTIVE 세션, COMPLETED·DRIFT, 실제 analysis_window의 최신 구간, 실제 표시 이력·최소 간격 조건을 모두 통과해야 만든다.
-	// 잠금은 세션(공유) → 분석 행 순서이며, 같은 분석의 동시 호출은 분석 행 잠금에서 직렬화되어 후보는 하나만 생긴다
+	// 잠금은 세션(공유) → 분석 행 순서이며, 같은 분석의 동시 호출은 분석 행 잠금에서 직렬화되어 후보는 하나만 생긴다.
+	// 공유 잠금으로 충분하다: 판단에 쓰는 표시 이력을 바꾸는 표시 확인·사용자 응답은 세션 배타 잠금을 잡으므로 서로 직렬화되고,
+	// 후보 생성끼리는 같은 분석이면 분석 행에서, 다른 분석이면 최신 구간 조건으로 갈리므로 세션 단위로 막을 필요가 없다
 	@Transactional(propagation = Propagation.MANDATORY)
 	public AiDecision decideAiCandidate(UUID sessionId, UUID analysisId) {
 		WorkSession session = workSessionRepository.findForShareBySessionId(sessionId).orElse(null);
@@ -120,6 +122,9 @@ public class AlertService {
 
 	// 실제 표시된 AI 알림이 없으면 허용(null). 있으면 그 구간 뒤에 정상 복귀(NORMAL·TRANSITION 완료)가 있어야 하고
 	// (실패·PENDING·RUNNING·분석 없음은 복귀로 보지 않음) 마지막 shownAt부터 최소 간격이 지나야 한다. 순서는 windowIndex 기준
+	// 두 기준은 의도적으로 따로 계산한다(같은 알림에서 나올 필요 없음). 확인 요청의 도착 시각은 어느 기준에도 쓰지 않는다:
+	// - 연속 DRIFT: 표시된 AI 알림 중 최대 windowIndex. 작은 구간의 확인이 늦게 도착해도 기준이 뒤로 돌아가지 않는다
+	// - 최소 간격: 표시된 AI 알림 중 최대 shownAt. 같은 shownAt 재전송·늦은 확인은 이 시작 시각을 바꾸지 않는다
 	private String driftFlowBlockReason(UUID sessionId, int windowIndex) {
 		Optional<Integer> lastShownWindow = notificationRepository.findLastShownAiWindowIndex(sessionId);
 		if (lastShownWindow.isEmpty()) {
@@ -199,6 +204,15 @@ public class AlertService {
 				.filter(notification -> driftFlowBlockReason(session.getSessionId(), latest.getWindowIndex()) == null)
 				.map(notification -> AlertResponse.of(notification, latest.getWindowIndex(), session.getGoalText())))
 			.orElse(null);
+	}
+
+	// 알림 응답(Alert). AI 알림은 연결된 분석의 구간 순서를 windowIndex로 채운다
+	public AlertResponse toResponse(Notification notification, String goalText) {
+		Integer windowIndex = notification.getAnalysisId() == null ? null
+			: analysisResultRepository.findById(notification.getAnalysisId())
+				.flatMap(analysis -> analysisWindowRepository.findById(analysis.getWindowId()))
+				.map(AnalysisWindow::getWindowIndex).orElse(null);
+		return AlertResponse.of(notification, windowIndex, goalText);
 	}
 
 	private int latestWindowIndex(UUID sessionId) {

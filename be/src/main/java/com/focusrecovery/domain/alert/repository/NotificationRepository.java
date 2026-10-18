@@ -5,14 +5,20 @@ import java.util.Optional;
 import java.util.UUID;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 
 import com.focusrecovery.domain.alert.entity.AlertType;
 import com.focusrecovery.domain.alert.entity.Notification;
 
+import jakarta.persistence.LockModeType;
+
 public interface NotificationRepository extends JpaRepository<Notification, UUID> {
 
 	Optional<Notification> findByAnalysisId(UUID analysisId);
+
+	@Lock(LockModeType.PESSIMISTIC_WRITE)
+	Optional<Notification> findForUpdateByAlertId(UUID alertId);
 
 	Optional<Notification> findByAnalysisIdAndShownAtIsNull(UUID analysisId);
 

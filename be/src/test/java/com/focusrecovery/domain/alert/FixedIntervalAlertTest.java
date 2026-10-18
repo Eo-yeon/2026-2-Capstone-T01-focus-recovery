@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -166,10 +167,14 @@ class FixedIntervalAlertTest {
 	void 표시_시각과_무관하게_다음_회차는_시작_시각_기준으로_정해진다() throws Exception {
 		now.set(startedAt.plus(INTERVAL));
 		String first = alertId(request(sessionId).andExpect(status().isCreated()));
-		markShown(first, startedAt.plus(Duration.ofMinutes(12)));
-
-		// 현재 회차(10분)가 이미 표시됐으므로 다음 예정 시각 전까지 409
+		// 실제 표시 확인 API로 12분에 표시했다고 기록한다
 		now.set(startedAt.plus(Duration.ofMinutes(13)));
+		mockMvc.perform(patch("/api/sessions/{sessionId}/alerts/{alertId}/shown", sessionId, first)
+				.contentType(MediaType.APPLICATION_JSON)
+				.content("{\"shownAt\":\"" + MILLIS_UTC.format(startedAt.plus(Duration.ofMinutes(12))) + "\"}"))
+			.andExpect(status().isOk());
+
+		// 현재 회차(10분)가 이미 표시됐으므로 다음 예정 시각(20분) 전까지 409
 		request(sessionId).andExpect(status().isConflict())
 			.andExpect(jsonPath("$.code").value("ALERT_INTERVAL_NOT_REACHED"));
 		now.set(startedAt.plus(Duration.ofMinutes(20)).minusMillis(1));
