@@ -198,4 +198,189 @@ describe('real Background with IndexedDB', () => {
     expect((await raw()).value.collection.candidates.map((c: any) => c.visitId)).toEqual([id]);
   });
 
+  it('A-2 keeps a committed local stop when removing the local metadata fails', async () => {
+    await visit();
+    const original = (await raw()).value.collection.candidates[0];
+    const receipt = structuredClone(local.activeSession.startRequest);
+    chromeApi.storage.local.remove.mockImplementation(async (keys: string | string[]) => {
+      if ([keys].flat().includes('activeSession')) throw Error('synthetic mirror remove failure');
+      for (const key of [keys].flat()) delete local[key];
+    });
+    await message({ type: 'stop' });
+    const stopped = await raw();
+    expect(stopped.value.collection.session).toBeNull();
+    expect(stopped.value.activeSession).toBeUndefined();
+    expect(stopped.value.collection.candidates[0]).toMatchObject({ visitId: original.visitId, sequence: 1, activeDurationMs: original.activeDurationMs });
+    expect(local.activeSession.startRequest).toEqual(receipt);
+    chromeApi.storage.local.remove.mockImplementation(area(local).remove);
+    await restart();
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.visitDelivery!.visits[0].phase).toBe('acked'));
+    const recovered = (await message({ type: 'status' })).status!;
+    expect(recovered.session).toBeNull(); expect(recovered.sessionStartRecovery).toEqual({ kind: 'none' });
+    expect(local.activeSession).toBeUndefined();
+    expect((await message({ type: 'start', goalText: '종료 복구 후 새로운 세션' })).ok).toBe(true);
+  });
+  it('A-3 distinguishes an older interrupted mirror from a committed resume before local set', async () => {
+    await visit(); const original = (await raw()).value.collection.candidates[0];
+    local.activeSession.interrupted = true;
+    await restart(); expect((await message({ type: 'status' })).status!.sessionStartRecovery!.kind).toBe('pending');
+    const receipt = structuredClone(local.activeSession.startRequest);
+    let reached!: () => void; const saved = new Promise<void>(resolve => { reached = resolve; });
+    chromeApi.storage.local.set.mockImplementation(async (value: any) => {
+      if (value.activeSession) { reached(); await new Promise(() => undefined); }
+      else Object.assign(local, structuredClone(value));
+    });
+    void message({ type: 'start', goalText: receipt.goalText }); await saved;
+    expect((await raw()).value.collection.session.sessionId).toBe(SERVER_SESSION_ID);
+    expect(local.activeSession.interrupted).toBe(true);
+    chromeApi.storage.local.set.mockImplementation(area(local).set);
+    await restart(); const recovered = (await message({ type: 'status' })).status!;
+    expect(recovered.session?.sessionId).toBe(SERVER_SESSION_ID);
+    expect(recovered.sessionStartRecovery).toEqual({ kind: 'none' });
+    expect(recovered.candidates[0].visitId).toBe(original.visitId);
+    expect(local.activeSession.startRequest.idempotencyKey).toBe(receipt.idempotencyKey);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('A-3 preserves a different local session instead of deleting it beside a stopped aggregate', async () => {
+    await visit(); await message({ type: 'stop' });
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.visitDelivery!.visits[0].phase).toBe('acked'));
+    const before = await raw(); const response = serverSession('별도 서버 세션 확인하기');
+    local.activeSession = { ...response, source: 'server', startRequest: { idempotencyKey: crypto.randomUUID(), goalText: response.goalText, apiBaseUrl: 'http://localhost:8080', response } };
+    const other = structuredClone(local.activeSession); await restart();
+    const reply = await message({ type: 'status' });
+    expect(reply.status!.storage!.phase).toBe('failed');
+    expect(local.activeSession).toEqual(other); expect(await raw()).toEqual(before);
+  });
+
+  it('A-1 restores a committed active session and receipt after local set rejects', async () => {
+    await visit(); const original = await raw(), receipt = structuredClone(local.activeSession.startRequest);
+    chromeApi.storage.local.set.mockRejectedValueOnce(Error('synthetic local failure'));
+    const failed = await message({ type: 'status' });
+    expect(failed.ok).toBe(false); expect(failed.status!.storage).toMatchObject({ phase: 'ready', metadataSyncPending: true });
+    const saved = await raw(); expect(saved.revision).toBe(original.revision + 1);
+    expect(saved.value.collection.session.sessionId).toBe(SERVER_SESSION_ID);
+    expect(saved.value.collection.candidates[0].visitId).toBe(original.value.collection.candidates[0].visitId);
+    expect(saved.value.activeSession.startRequest).toEqual(receipt);
+    await restart(); const restored = (await message({ type: 'status' })).status!;
+    expect(restored.session?.sessionId).toBe(SERVER_SESSION_ID); expect(restored.sessionStartRecovery).toEqual({ kind: 'none' });
+    expect(local.activeSession.startRequest).toEqual(receipt); expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('A-3 restores a stop committed before local removal starts, preserving its finalized visit and budget', async () => {
+    await visit(); const receipt = structuredClone(local.activeSession);
+    let reached!: () => void; const gate = new Promise<void>(resolve => { reached = resolve; });
+    chromeApi.storage.local.remove.mockImplementation(async (key: string) => {
+      if (key === 'activeSession') { reached(); await new Promise(() => undefined); } else delete local[key];
+    });
+    void message({ type: 'stop' }); await gate;
+    const committedStop = await raw(); expect(committedStop.value.activeSession).toBeUndefined();
+    expect(local.activeSession).toEqual(receipt);
+    chromeApi.storage.local.remove.mockImplementation(area(local).remove); await restart();
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.visitDelivery!.visits[0].phase).toBe('acked'));
+    const saved = await raw(); expect(saved.revision).toBeGreaterThan(committedStop.revision);
+    expect(saved.value.visitDelivery.entries[0]).toMatchObject({ visitId: committedStop.value.collection.candidates[0].visitId, sequence: 1, attempts: 1, phase: 'acked' });
+    expect(saved.value.visitDelivery.entries[0].visit.activeDurationMs).toBe(committedStop.value.collection.candidates[0].activeDurationMs);
+    expect(saved.value.collection.session).toBeNull(); expect(local.activeSession).toBeUndefined();
+  });
+  it('A-4 reuses the pre-HTTP key when saving the server response receipt fails', async () => {
+    const set = area(local).set; let failed = false;
+    chromeApi.storage.local.set.mockImplementation(async (value: any) => {
+      if (value.pendingSessionStart?.response && !failed) { failed = true; throw Error('synthetic receipt failure'); }
+      await set(value);
+    });
+    expect((await message({ type: 'start', goalText: '영수증 쓰기 중단 검증하기' })).ok).toBe(false);
+    const original = structuredClone(local.pendingSessionStart);
+    expect(original.response).toBeUndefined(); expect(original.idempotencyKey).toBeTruthy();
+    await restart(); expect((await message({ type: 'start', goalText: original.goalText })).ok).toBe(true);
+    expect(vi.mocked(fetch).mock.calls.map(([, init]) => new Headers(init!.headers).get('Idempotency-Key'))).toEqual([original.idempotencyKey, original.idempotencyKey]);
+    expect((await raw()).value.activeSession.startRequest.response.sessionId).toBe(SERVER_SESSION_ID);
+    expect(local.pendingSessionStart).toBeUndefined();
+  });
+  it('keeps a durable POST ACK usable when only its local mirror fails', async () => {
+    const clock = await visit(); let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.mocked(fetch).mockImplementation(async (_url, init) => {
+      await gate; const body = JSON.parse(init!.body as string);
+      return new Response(JSON.stringify({ ...body, sessionId: SERVER_SESSION_ID, updatedAt: null }), { status: 201 });
+    });
+    chromeApi.tabs.onRemoved.listeners[0](1); await message({ type: 'status' });
+    await vi.waitFor(async () => expect((await raw()).value.visitDelivery.entries[0].phase).toBe('sending'));
+    chromeApi.storage.local.set.mockRejectedValue(Error('synthetic mirror failure')); release();
+    await vi.waitFor(async () => expect((await raw()).value.visitDelivery.entries[0].phase).toBe('acked'));
+    expect((await raw()).value.behaviorDelivery.entries[0].ack).toBeDefined();
+    chromeApi.storage.local.set.mockImplementation(area(local).set); clock.mockReturnValue(500000);
+    await restart(); await message({ type: 'status' });
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/visits'))).toHaveLength(1);
+  });
+  it.each(['valid', 'pending', 'unavailable-content', 'finalized'] as const)('C preserves the %s prefix policy with a subsequent valid visit', async kind => {
+    let clock = vi.spyOn(Date, 'now').mockReturnValue(10000);
+    if (kind === 'valid' || kind === 'finalized') clock = await visit();
+    else {
+      await message({ type: 'start', goalText: '공개 합성 문서 조사하기' }); await message({ type: 'context' }, true);
+      if (kind === 'unavailable-content') await message({ type: 'snapshot', sessionId: SERVER_SESSION_ID, snapshot: null, reason: kind }, true);
+    }
+    if (kind === 'finalized') {
+      chromeApi.tabs.onRemoved.listeners[0](1); await message({ type: 'status' });
+      await vi.waitFor(async () => expect((await raw()).value.visitDelivery.entries[0].phase).toBe('acked'));
+    }
+    const original = (await raw()).value.collection.candidates[0];
+    frame = { documentId: 'new-document', url: 'https://example.com/next' }; clock.mockReturnValue(500000); await restart();
+    await message({ type: 'context' }, true); clock.mockReturnValue(501500);
+    await message({ type: 'snapshot', sessionId: SERVER_SESSION_ID, snapshot: { ...(await describeUrl(frame.url))!, title: '다음 공개 문서', content: '다른 공개 합성 본문 '.repeat(20) } }, true);
+    chromeApi.tabs.onRemoved.listeners[0](1); const beforeStop = (await message({ type: 'status' })).status!;
+    expect(beforeStop.candidates[0]).toMatchObject({ visitId: original.visitId, activeDurationMs: original.activeDurationMs, behaviorVersion: original.behaviorVersion });
+    expect(beforeStop.candidates[1]).toMatchObject({ finalized: true, state: 'valid', sequence: kind === 'finalized' ? 2 : null });
+    if (kind !== 'finalized') { expect(beforeStop.recoveryCandidates).toBe(1); expect(beforeStop.visitDelivery!.visits).toEqual([]); }
+    const stopped = (await message({ type: 'stop' })).status!;
+    expect(stopped.candidates[0].visitId).toBe(original.visitId);
+    if (kind === 'valid' || kind === 'finalized') {
+      expect(stopped.readyVisits.map(v => v.sequence)).toEqual([1, 2]);
+      await vi.waitFor(async () => expect((await raw()).value.visitDelivery.entries.filter((e: any) => e.phase === 'acked')).toHaveLength(2));
+      const bodies = vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/visits')).map(([, init]) => JSON.parse(init!.body as string));
+      expect(bodies.map(body => body.visitId)).toEqual(stopped.readyVisits.map(v => v.visitId));
+    } else {
+      expect(stopped.readyVisits).toEqual([]); expect(stopped.recoveryCandidates).toBe(1);
+      expect(stopped.candidates[0]).toMatchObject({ finalized: false, sequence: null, recoveryRequired: true });
+      expect((await message({ type: 'start', goalText: '새로운 세션 차단 확인' })).ok).toBe(false);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('B keeps a committed migration available when removing legacy keys partially fails', async () => {
+    await visit(); const saved = (await raw()).value;
+    Object.assign(legacy, { collection: saved.collection, visitDelivery: saved.visitDelivery, behaviorDelivery: saved.behaviorDelivery });
+    chromeApi.storage.session.remove.mockImplementation(async () => { delete legacy.visitDelivery; throw Error('synthetic partial cleanup'); });
+    await restart(); const restored = (await message({ type: 'status' })).status!;
+    expect(restored.storage!.phase).toBe('ready'); expect(restored.session?.sessionId).toBe(SERVER_SESSION_ID);
+    expect(restored.candidates[0].visitId).toBe(saved.collection.candidates[0].visitId);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(restored.storage!.legacyCleanupPending).toBe(true);
+    await restart(); expect((await message({ type: 'status' })).status!.storage!.phase).toBe('ready');
+    chromeApi.storage.session.remove.mockImplementation(area(legacy).remove); await restart();
+    expect((await message({ type: 'status' })).status!.storage!.phase).toBe('ready'); expect(Object.keys(legacy)).toEqual([]);
+  });
+  it('A-1 retains POST ACK and an in-flight PATCH snapshot when local metadata set fails', async () => {
+    await visit(); let releasePost!: () => void;
+    const postGate = new Promise<void>(resolve => { releasePost = resolve; });
+    const patches: any[] = [];
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      const body = JSON.parse(init!.body as string);
+      if (String(url).endsWith('/visits')) { await postGate; return new Response(JSON.stringify({ ...body, sessionId: SERVER_SESSION_ID, updatedAt: null }), { status: 201 }); }
+      patches.push(body);
+      if (patches.length === 1) await new Promise(() => undefined);
+      return new Response(JSON.stringify({ ...body, visitId: (await raw()).value.visitDelivery.entries[0].visitId, applied: false, updatedAt: '2026-10-18T01:23:45.678Z' }));
+    });
+    chromeApi.tabs.onRemoved.listeners[0](1); await message({ type: 'status' });
+    await vi.waitFor(async () => expect((await raw()).value.visitDelivery.entries[0].phase).toBe('sending'));
+    chromeApi.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 }); await message({ type: 'status' }); releasePost();
+    await vi.waitFor(() => expect(patches).toHaveLength(1)); await message({ type: 'status' });
+    const before = await raw(); chromeApi.storage.local.set.mockRejectedValueOnce(Error('synthetic mirror failure'));
+    expect((await message({ type: 'status' })).ok).toBe(false);
+    const committed = await raw(); expect(committed.value.visitDelivery).toEqual(before.value.visitDelivery);
+    expect(committed.value.behaviorDelivery).toEqual(before.value.behaviorDelivery);
+    await restart();
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.behaviorDelivery!.visits[0].phase).toBe('acked'));
+    expect(patches).toHaveLength(2); expect(patches[1]).toEqual(patches[0]);
+    expect((await raw()).value.visitDelivery.entries[0].phase).toBe('acked');
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/visits'))).toHaveLength(1);
+  });
+
 });

@@ -89,7 +89,7 @@ export interface BehaviorDeliveryStatus {
     error?: string; code?: string; retryable?: boolean; nextRetryAt?: number }[];
 }
 export interface DevStatus {
-  storage?: { phase: 'initializing' | 'ready' | 'failed'; recovered: boolean; error?: string };
+  storage?: { phase: 'initializing' | 'ready' | 'failed'; recovered: boolean; error?: string; metadataSyncPending?: boolean; legacyCleanupPending?: boolean };
   recoveryCandidates?: number;
   session: ServerSession | null;
   sessionStartRecovery?: SessionStartRecovery;

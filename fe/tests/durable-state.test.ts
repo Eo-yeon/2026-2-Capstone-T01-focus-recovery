@@ -144,6 +144,65 @@ describe('migration and corruption', () => {
     expect(restored).toEqual(state.collection); expect(restored.candidates.map(c => c.sequence)).toEqual([null, null, null]);
     expect(restored.candidates[1].state).toBe('excluded'); expect(restored.candidates[2].finalized).toBe(true);
   });
+  it.each(['collection', 'visitDelivery', 'behaviorDelivery'] as const)('B-3 resumes committed migration after cleanup leaves only %s and the queue has advanced', async remaining => {
+    const legacy = await fixture(); await repository.initialize(legacy);
+    const next = structuredClone(legacy); next.visitDelivery!.entries[0].attempts = 2;
+    await repository.save(next); const before = await read();
+    const restored = await repo().initialize({ [remaining]: legacy[remaining] });
+    expect(restored.value).toEqual(next); expect(await read()).toEqual(before);
+  });
+  it('B-3 recognizes an unchanged old aggregate-only migration receipt after partial cleanup', async () => {
+    const legacy = await fixture(); await repository.initialize(legacy);
+    const old = await read(); delete old.migrationParts; await seed(old);
+    expect((await repo().initialize({ collection: legacy.collection })).value).toEqual(legacy);
+  });
+
+  it.each(['collection', 'post-api', 'post-ack', 'patch-ack'] as const)('B-4 preserves both sources on a changed %s migration remainder', async kind => {
+    const legacy = await fixture(); await repository.initialize(legacy); const before = await read();
+    const changed = structuredClone(legacy);
+    if (kind === 'collection') changed.collection.candidates[0].visitId = crypto.randomUUID();
+    if (kind === 'post-api') changed.visitDelivery!.apiBaseUrl = 'https://other.example';
+    if (kind === 'post-ack') changed.visitDelivery!.entries[0].phase = 'acked';
+    if (kind === 'patch-ack') changed.behaviorDelivery!.entries[0].ack = changed.behaviorDelivery!.entries[0].initial;
+    const key = kind === 'collection' ? 'collection' : kind === 'patch-ack' ? 'behaviorDelivery' : 'visitDelivery';
+    const source = structuredClone(changed[key]);
+    await expect(repo().initialize({ [key]: source })).rejects.toBeDefined();
+    expect(await read()).toEqual(before); expect(changed[key]).toEqual(source);
+  });
+  it('B-3 blocks an evolved old aggregate-only receipt with unverifiable partial remnants', async () => {
+    const legacy = await fixture(); await repository.initialize(legacy);
+    const old = await read(); delete old.migrationParts; old.value.visitDelivery.entries[0].attempts++;
+    await seed(old); await expect(repo().initialize({ collection: legacy.collection })).rejects.toMatchObject({ code: 'conflict' });
+    expect(await read()).toEqual(old);
+  });
+  it('B validates a full legacy body even if a matching hash receipt was forged', async () => {
+    const legacy = await fixture(); await repository.initialize(legacy);
+    const corrupt = structuredClone(legacy); corrupt.visitDelivery!.entries[0].visit.content = 'invalid body';
+    const raw = await read();
+    const canonical = (value: unknown) => JSON.stringify(value, (_key, v) => v && typeof v === 'object' && !Array.isArray(v)
+      ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b))) : v);
+    raw.migrationParts.visitDelivery = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical(corrupt.visitDelivery))))).map(v => v.toString(16).padStart(2, '0')).join('');
+    await seed(raw); await expect(repo().initialize(corrupt)).rejects.toBeDefined(); expect(await read()).toEqual(raw);
+  });
+  it('B-3 blocks incomplete unmigrated checkpoints without committing an empty queue', async () => {
+    const legacy = await fixture(); delete legacy.visitDelivery;
+    await expect(repository.initialize(legacy)).rejects.toBeDefined(); expect(await read()).toBeUndefined();
+  });
+  it('B-5 repeats migrated initialization without changing snapshots, ACKs, attempts or revision', async () => {
+    const legacy = await fixture(); await repository.initialize(legacy); const before = await read();
+    for (let i = 0; i < 3; i++) expect((await repo().initialize(legacy)).value).toEqual(legacy);
+    expect(await read()).toEqual(before);
+  });
+
+  it.each(['localMirror', 'migrationParts', 'migrated'] as const)('preserves an invalid optional %s recovery receipt', async field => {
+    await repository.initialize(await fixture()); const raw = await read();
+    if (field === 'localMirror') raw.value.localMirror = { previous: { sessionId: 'broken' } };
+    if (field === 'migrationParts') raw.migrationParts = [];
+    if (field === 'migrated') raw.migrated = 'not-a-sha256';
+    await seed(raw); await expect(repo().initialize({})).rejects.toMatchObject({ code: 'corrupt' });
+    expect(await read()).toEqual(raw);
+  });
+
 });
 
 describe('durable delivery boundaries', () => {

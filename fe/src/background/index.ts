@@ -1,4 +1,4 @@
-import { DurableRepository, LEGACY_KEYS, StorageFailure, isStartRecord, validActiveMetadata, type DurableState } from './durable-state';
+import { DurableRepository, LEGACY_KEYS, StorageFailure, isStartRecord, validActiveMetadata, staleLocalMirror, canonical, type DurableState } from './durable-state';
 import { Collector, emptyState } from './collector';
 import { serialExecutor } from './serial';
 import { BehaviorDelivery } from './behavior-delivery';
@@ -13,8 +13,25 @@ import { normalizeGoal, validGoal } from '../shared/goal';
 const enqueue = serialExecutor();
 const collector = new Collector();
 const repository = new DurableRepository();
-let storage: { phase: 'initializing' | 'ready' | 'failed'; recovered: boolean; error?: string } = { phase: 'initializing', recovered: false };
+let storage: { phase: 'initializing' | 'ready' | 'failed'; recovered: boolean; error?: string; metadataSyncPending?: boolean; legacyCleanupPending?: boolean } = { phase: 'initializing', recovered: false };
 let committed: DurableState | undefined;
+let localMirror: unknown;
+class MetadataMirrorFailure extends Error {}
+async function syncLocalMirror(value: unknown) {
+  try {
+    if (value === undefined) await chrome.storage.local.remove('activeSession');
+    else await chrome.storage.local.set({ activeSession: value });
+    localMirror = structuredClone(value);
+    storage.metadataSyncPending = false;
+  } catch {
+    storage.metadataSyncPending = true;
+    throw new MetadataMirrorFailure();
+  }
+}
+async function persistDelivery() {
+  try { await persist(); }
+  catch (error) { if (!(error instanceof MetadataMirrorFailure)) throw error; }
+}
 let durablePostAcks = new Set<string>();
 function storageFailure(error: unknown) {
   storage = { ...storage, phase: 'failed', error: error instanceof StorageFailure ? error.code : 'storage' };
@@ -41,13 +58,13 @@ const activeWindowTabs = new Map<number, number>();
 const delivery = new VisitDelivery(operation => enqueue(async () => {
   await ready;
   const result = operation();
-  await persist();
+  await persistDelivery();
   return result;
 }).then(result => { behaviors.kick(); return result; }), () => storage.phase === 'ready' && !pendingStart && !invalidRecovery);
 const behaviors = new BehaviorDelivery(operation => enqueue(async () => {
   await ready;
   const result = operation();
-  await persist();
+  await persistDelivery();
   return result;
 }), visitId => storage.phase === 'ready' && !pendingStart && !invalidRecovery && !delivery.blocked && durablePostAcks.has(visitId));
 function suspend(now: number) {
@@ -84,14 +101,19 @@ const ready = (async () => {
     if (value !== undefined) Object.assign(legacy, { [key]: value });
   }
   const localMetadata = (await chrome.storage.local.get('activeSession')).activeSession as (ServerSession & { startRequest?: PendingSessionStart; interrupted?: boolean }) | undefined;
+  localMirror = structuredClone(localMetadata);
   if (!validActiveMetadata(localMetadata)) {
     // Preserve malformed recovery metadata; it must not be silently overwritten by a disk mirror.
     if (localMetadata && ('startRequest' in localMetadata || 'interrupted' in localMetadata)) invalidRecovery = 'corrupted-record';
   }
   const hydrated = await repository.initialize({ ...legacy, activeSession: localMetadata });
   const durableMetadata = hydrated.value.activeSession as (ServerSession & { startRequest?: PendingSessionStart }) | undefined;
-  if (durableMetadata && localMetadata && (durableMetadata.sessionId !== localMetadata.sessionId
-    || durableMetadata.startRequest?.idempotencyKey !== localMetadata.startRequest?.idempotencyKey)) throw new StorageFailure('conflict');
+  const staleMirror = staleLocalMirror(hydrated.value, localMetadata);
+  if (!invalidRecovery && !staleMirror && localMetadata) {
+    const withoutInterruption = (value: unknown) => value && typeof value === 'object'
+      ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'interrupted')) : value;
+    if (canonical(withoutInterruption(durableMetadata)) !== canonical(withoutInterruption(localMetadata))) throw new StorageFailure('conflict');
+  }
   const metadata = hydrated.value.activeSession;
   committed = structuredClone(hydrated.value);
   storage = { phase: 'ready', recovered: hydrated.recovered };
@@ -103,7 +125,7 @@ const ready = (async () => {
   if (isWorkSession(metadata) && 'source' in metadata && metadata.source === 'server') {
     retainedSession = metadata as ServerSession;
     const saved = metadata as ServerSession & { startRequest?: unknown; interrupted?: unknown };
-    interrupted = saved.interrupted === true || localMetadata?.interrupted === true;
+    interrupted = saved.interrupted === true || (!staleMirror && localMetadata?.interrupted === true);
     if (saved.interrupted !== undefined && typeof saved.interrupted !== 'boolean') invalidRecovery = 'corrupted-record';
     if (saved.startRequest !== undefined) {
       if (isStartRecord(saved.startRequest) && saved.startRequest.response?.status === 'ACTIVE'
@@ -131,12 +153,25 @@ const ready = (async () => {
   if (activeStart && ((collector.state.session && collector.state.session.sessionId !== expectedSessionId)
     || collector.state.candidates.some(candidate => candidate.sessionId !== expectedSessionId))) invalidRecovery = 'conflicting-records';
   if (retainedSession && !pendingStart && !activeStart) invalidRecovery ??= 'missing-request';
+  // A committed active receipt proves that pending-key removal was the only unfinished step.
+  if (!invalidRecovery && !interrupted && !delivery.blocked && !behaviors.blocked && activeStart?.apiBaseUrl === API_BASE_URL
+    && hydrated.value.localMirror && collector.state.session
+    && pendingStart && canonical(pendingStart) === canonical(activeStart)) {
+    try { await chrome.storage.local.remove('pendingSessionStart'); pendingStart = undefined; }
+    catch { storage.metadataSyncPending = true; }
+  }
   if (invalidRecovery || pendingStart || interrupted || (!collector.state.session && activeStart)
     || (activeStart && activeStart.apiBaseUrl !== API_BASE_URL)) {
     collector.reconcileForeground(null, Date.now());
     suspend(Date.now());
-  } else if (!collector.state.session) await chrome.storage.local.remove('activeSession');
-  if (!invalidRecovery && !delivery.blocked && !behaviors.blocked) await chrome.storage.session.remove(LEGACY_KEYS);
+  }
+  if (!invalidRecovery && (staleMirror || !collector.state.session && !activeStart && !pendingStart)) {
+    try { await syncLocalMirror(metadata); } catch (error) { if (!(error instanceof MetadataMirrorFailure)) throw error; }
+  }
+  if (!invalidRecovery && !delivery.blocked && !behaviors.blocked) {
+    try { await chrome.storage.session.remove(LEGACY_KEYS); }
+    catch { storage.legacyCleanupPending = true; }
+  }
 })().catch(error => {
   storageFailure(error);
   // Keep unread storage untouched and expose a blocked state instead of poisoning every dispatch.
@@ -149,6 +184,7 @@ async function persist(explicitClear = false) {
   if (delivery.blocked || behaviors.blocked || (invalidRecovery && !explicitClear)) return;
   behaviors.collect(collector.status(Date.now(), false).readyVisits, delivery.checkpoint.entries);
   const value: DurableState = {
+    localMirror: { previous: structuredClone(localMirror) },
     collection: collector.state, visitDelivery: delivery.checkpoint, behaviorDelivery: behaviors.checkpoint,
     activeSession: collector.state.session ? { ...collector.state.session, ...(activeStart ? { startRequest: activeStart } : {}) }
       : pendingStart || invalidRecovery ? retainedSession && { ...retainedSession, ...(activeStart ? { startRequest: activeStart } : {}), interrupted: true } : undefined,
@@ -160,8 +196,8 @@ async function persist(explicitClear = false) {
   if (invalidRecovery) return;
   if (collector.state.session) {
     retainedSession = collector.state.session;
-    await chrome.storage.local.set({ activeSession: value.activeSession });
-  } else if (!pendingStart && !activeStart && !invalidRecovery) await chrome.storage.local.remove('activeSession');
+    await syncLocalMirror(value.activeSession);
+  } else if (!pendingStart && !activeStart && !invalidRecovery) await syncLocalMirror(undefined);
 }
 // Document IDs, unlike tab IDs and URLs alone, identify the same live Chrome document.
 async function reconcileDocuments() {
@@ -204,12 +240,17 @@ function dispatch<T>(operation: (now: number) => Promise<T>, foregroundEvent = f
       }
       return result;
     } catch (error) {
+      // The aggregate already committed: a mirror failure must not rewrite a completed stop or ACK.
+      if (error instanceof MetadataMirrorFailure) {
+        if (collector.state.session) { retainedSession = collector.state.session; suspend(Date.now()); }
+        throw error;
+      }
       // Stop collection independently of the durable request/response receipt.
       retainedSession ??= collector.state.session ?? undefined;
       try { suspend(Date.now()); }
       catch { collector.state = emptyState(); }
       if (retainedSession && (!invalidRecovery || invalidRecovery === 'missing-request')) {
-        await chrome.storage.local.set({ activeSession: { ...retainedSession, ...(activeStart ? { startRequest: activeStart } : {}), interrupted: true } }).catch(() => undefined);
+        await syncLocalMirror({ ...retainedSession, ...(activeStart ? { startRequest: activeStart } : {}), interrupted: true }).catch(() => undefined);
       }
       if (storage.phase === 'ready') await persist().catch(() => undefined);
       throw error;
@@ -361,7 +402,11 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
           const stoppedStart = activeStart;
           activeStart = undefined;
           try { await persist(); }
-          catch (error) { activeStart = stoppedStart; throw error; }
+          catch (error) {
+            if (error instanceof MetadataMirrorFailure) retainedSession = undefined;
+            else activeStart = stoppedStart;
+            throw error;
+          }
           retainedSession = undefined;
         }
         await broadcast();
@@ -410,8 +455,8 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
       collector.observe(tabId, sender.documentId, message.sessionId, snapshot, message.reason, now);
     }
     return { ok: true, sessionId: collector.state.session?.sessionId ?? null };
-  }).then(reply).catch(() => {
-    reply({ ok: false, error: '요청 처리에 실패해 수집을 중단했습니다. 기존 세션의 복구 상태를 확인해 주세요.', status: status(Date.now()) });
+  }).then(reply).catch(error => {
+    reply({ ok: false, error: error instanceof MetadataMirrorFailure ? 'IndexedDB 저장은 완료했지만 로컬 메타데이터 동기화에 실패했습니다. 상태를 다시 확인해 주세요.' : '요청 처리에 실패해 수집을 중단했습니다. 기존 세션의 복구 상태를 확인해 주세요.', status: status(Date.now()) });
   });
   return true;
 });

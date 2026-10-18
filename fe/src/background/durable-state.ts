@@ -17,12 +17,15 @@ export interface DurableState {
   visitDelivery?: VisitDelivery['checkpoint'];
   behaviorDelivery?: BehaviorDelivery['checkpoint'];
   activeSession?: unknown;
+  // Exact pre-commit mirror proves a delayed local write without choosing a timestamp.
+  localMirror?: { previous?: unknown };
 }
 interface RecordState {
   format: 1;
   revision: number;
   sessionId: string | null;
   migrated?: string;
+  migrationParts?: Record<string, string>;
   value: DurableState;
 }
 export class StorageFailure extends Error {
@@ -44,6 +47,18 @@ export function validActiveMetadata(value: unknown): boolean {
     && (saved.startRequest === undefined || isStartRecord(saved.startRequest)
       && saved.startRequest.response?.status === 'ACTIVE' && saved.startRequest.response.sessionId === value.sessionId
       && saved.startRequest.response.startedAt === value.startedAt && saved.startRequest.goalText === value.goalText);
+}
+// Canonical keys make receipts independent of Chrome's property enumeration order.
+export function canonical(value: unknown): string | undefined {
+  return JSON.stringify(value, function (_key, v) {
+    return v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b))) : v;
+  });
+}
+async function hash(value: unknown): Promise<string> {
+  return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical(value))))).map(v => v.toString(16).padStart(2, '0')).join('');
+}
+export function staleLocalMirror(value: DurableState, local: unknown): boolean {
+  return value.localMirror !== undefined && canonical(local) === canonical(value.localMirror.previous);
 }
 function assertCollection(state: CollectionState) {
   if (!state || !Array.isArray(state.candidates) || state.candidates.length > MAX_CANDIDATES
@@ -79,6 +94,8 @@ function assertCollection(state: CollectionState) {
 }
 export function validateState(value: DurableState) {
   assertCollection(value?.collection);
+  if (value.localMirror !== undefined && (!value.localMirror || typeof value.localMirror !== 'object'
+    || Array.isArray(value.localMirror) || !validActiveMetadata(value.localMirror.previous))) throw new StorageFailure('corrupt');
   if (!validActiveMetadata(value.activeSession)) throw new StorageFailure('corrupt');
   const collector = new Collector(structuredClone(value.collection));
   const posts = new VisitDelivery(async operation => operation(), () => false);
@@ -117,6 +134,7 @@ export class DurableRepository {
   private revision = 0;
   private initialization?: Promise<{ value: DurableState; recovered: boolean }>;
   private migrated?: string;
+  private migrationParts?: Record<string, string>;
   private open() {
     return this.opening ??= new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -148,24 +166,42 @@ export class DurableRepository {
     const saved = await this.read();
     const hasLegacy = LEGACY_KEYS.some(key => legacy[key as keyof DurableState] !== undefined);
     const imported = { ...legacy, collection: legacy.collection ?? emptyState() };
-    // Canonical keys make the receipt independent of Chrome's property enumeration order.
-    const canonical = (value: unknown): string => JSON.stringify(value, function (_key, v) {
-      return v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b))) : v;
-    });
     const legacyData = Object.fromEntries(LEGACY_KEYS.map(key => [key, legacy[key as keyof DurableState]]));
-    const digest = hasLegacy ? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical(legacyData))))).map(v => v.toString(16).padStart(2, '0')).join('') : undefined;
+    const digest = hasLegacy ? await hash(legacyData) : undefined;
+    const parts = async (value: Partial<DurableState>) => Object.fromEntries(await Promise.all(LEGACY_KEYS
+      .filter(key => value[key as keyof DurableState] !== undefined)
+      .map(async key => [key, await hash(value[key as keyof DurableState])])));
     if (saved) {
-      if (saved.format !== 1 || !Number.isSafeInteger(saved.revision) || saved.revision < 1) throw new StorageFailure('corrupt');
+      if (saved.format !== 1 || !Number.isSafeInteger(saved.revision) || saved.revision < 1
+        || (saved.migrated !== undefined && (typeof saved.migrated !== 'string' || !/^[a-f0-9]{64}$/.test(saved.migrated)))) throw new StorageFailure('corrupt');
       validateState(saved.value);
       const sessionId = saved.value.collection.session?.sessionId ?? saved.value.collection.candidates[0]?.sessionId ?? null;
       if (saved.sessionId !== sessionId) throw new StorageFailure('conflict');
-      if (hasLegacy && saved.migrated !== digest
-        && canonical(legacyData) !== canonical(Object.fromEntries(LEGACY_KEYS.map(key => [key, saved.value[key as keyof DurableState]])))) throw new StorageFailure('conflict');
-      this.revision = saved.revision; this.migrated = saved.migrated;
+      if (saved.migrationParts !== undefined && (!saved.migrationParts || typeof saved.migrationParts !== 'object' || Array.isArray(saved.migrationParts)
+        || Object.entries(saved.migrationParts).some(([key, value]) => !LEGACY_KEYS.includes(key) || !/^[a-f0-9]{64}$/.test(value)))) throw new StorageFailure('corrupt');
+      let receipt = saved.migrationParts, migrated = saved.migrated;
+      // Older v1 receipts can prove a partial cleanup only while their complete source is reconstructible.
+      const currentData = Object.fromEntries(LEGACY_KEYS.map(key => [key, saved.value[key as keyof DurableState]]));
+      if (!receipt && saved.migrated && await hash(currentData) === saved.migrated) receipt = await parts(saved.value);
+      if (hasLegacy) {
+        const incomingParts = await parts(legacy);
+        const provenRemainder = receipt && Object.entries(incomingParts).every(([key, value]) => receipt?.[key] === value);
+        if (!provenRemainder && saved.migrated !== digest && canonical(legacyData) !== canonical(currentData)) throw new StorageFailure('conflict');
+        if (legacy.collection !== undefined) assertCollection(legacy.collection);
+        if (LEGACY_KEYS.every(key => legacy[key as keyof DurableState] !== undefined)) validateState({ ...legacy, collection: legacy.collection! });
+        if (!provenRemainder) {
+          validateState({ ...legacy, collection: legacy.collection ?? emptyState() });
+          receipt = incomingParts; migrated = digest;
+        }
+      }
+      this.revision = saved.revision; this.migrated = migrated; this.migrationParts = receipt;
+      // Commit any reconstructed receipt before Background may remove even one legacy key.
+      if (canonical(saved.migrationParts) !== canonical(receipt) || saved.migrated !== migrated) await this.save(saved.value);
       return { value: saved.value, recovered: Boolean(sessionId) };
     }
     validateState(imported);
     this.migrated = digest;
+    this.migrationParts = hasLegacy ? await parts(legacy) : undefined;
     await this.save(imported);
     return { value: imported, recovered: Boolean(imported.collection.session || imported.collection.candidates.length) };
   }
@@ -178,7 +214,7 @@ export class DurableRepository {
     const expectedRevision = this.revision, revision = expectedRevision + 1;
     request.onsuccess = () => {
       if ((request.result?.revision ?? 0) !== expectedRevision) { tx.abort(); return; }
-      try { store.put({ format: 1, revision, migrated: this.migrated,
+      try { store.put({ format: 1, revision, migrated: this.migrated, migrationParts: this.migrationParts,
         sessionId: snapshot.collection.session?.sessionId ?? snapshot.collection.candidates[0]?.sessionId ?? null, value: snapshot } satisfies RecordState, 'current'); } catch { tx.abort(); }
     };
     await completed;

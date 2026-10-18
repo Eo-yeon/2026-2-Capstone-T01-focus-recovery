@@ -15,6 +15,9 @@ function App() {
   const invalid = recovery?.kind === 'invalid' ? recovery : undefined;
   const storage = status?.storage;
   const storageBlocked = !storage || storage.phase !== 'ready';
+  const held = status?.candidates.filter(candidate => candidate.recoveryRequired) ?? [];
+  const stoppable = held.filter(candidate => candidate.state === 'valid').length;
+  const sequenceWaiting = status?.visits.filter(visit => visit.sequence === null).length ?? 0;
   const delivery = status?.visitDelivery;
   const behavior = status?.behaviorDelivery;
   const pendingBehavior = behavior?.visits.filter(visit => visit.phase !== 'acked') ?? [];
@@ -51,7 +54,14 @@ function App() {
     <button disabled={busy} onClick={() => void allowSite()}>현재 사이트 수집 허용</button>
     <p>IndexedDB: {storage?.phase ?? 'initializing'} / {storage?.recovered ? '이전 작업 복구됨' : '이전 작업 없음'}</p>
     {storage?.phase === 'failed' && <p role="alert">영속 저장·복구 실패 ({storage.error}). 서버 오류와 별개로 전송을 차단했습니다. 원본을 보존했으며 Worker 재시작 후 확인이 필요합니다.</p>}
-    {Boolean(status?.recoveryCandidates) && <p role="alert">동일한 Chrome 문서를 확인하지 못한 후보 {status?.recoveryCandidates}건을 보존했습니다. 활성시간·순서를 임의 확정하지 않습니다. 확인 필요 후보가 남으면 신규 세션을 시작할 수 없습니다.</p>}
+    {storage?.metadataSyncPending && <p role="alert">IndexedDB 데이터는 저장됐지만 local 세션 메타데이터 동기화가 남았습니다. 서버 저장 오류와 구분하며, 상태 새로고침 또는 Worker 재시작에서 같은 영수증으로 확인합니다.</p>}
+    {storage?.legacyCleanupPending && <p role="alert">검증된 이전 데이터는 IndexedDB에 저장됐지만 legacy 키 정리가 남았습니다. Worker 재시작에서 이전 해시를 확인한 뒤 정리를 재시도합니다.</p>}
+    {held.length > 0 && <div role="alert">
+      <p>동일한 Chrome 문서를 확인하지 못한 후보 {held.length}건을 보존했습니다. 유효 방문 중 순서 미확정 {sequenceWaiting}건은 앞 후보의 판정이 끝날 때까지 POST를 기다립니다. 확인 필요 후보가 남으면 신규 세션을 시작할 수 없습니다.</p>
+      {stoppable > 0 && <p>이미 유효했던 {stoppable}건은 명시적 로컬 수집 종료에서 마지막 저장 누적값으로 확정할 수 있습니다.</p>}
+      {held.length > stoppable && <p>판정 미완료·복구 가능한 제외 후보 {held.length - stoppable}건은 로컬 종료로 해결되지 않습니다. 자동 판정이나 임의 재연결 기능은 없으며 원본을 보존합니다.</p>}
+      <p>로컬 기록 삭제는 이 후보와 뒤에서 대기 중인 방문·미확인 요청도 버립니다. 서버 데이터는 삭제하지 않습니다.</p>
+    </div>}
     <p>상태: {status?.session ? '서버 세션으로 수집 중' : invalid ? '시작 요청 복구 필요' : pending ? '이전 시작 요청 확인 필요' : '수집 중지'}</p>
     {invalid && <div role="alert">
       <p>{invalid.reason === 'initialization-failed' ? '저장된 상태를 확인할 수 없습니다. 확장 프로그램과 저장소 상태를 확인한 뒤 Worker를 재시작해 주세요.'

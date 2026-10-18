@@ -43,10 +43,16 @@ try {
     args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
   });
   context = await launch();
-  // Command-line loading bypasses developer mode initially; a real reload enforces it.
-  const settings = await context.newPage(); await settings.goto('chrome://extensions');
-  await settings.evaluate(() => chrome.developerPrivate.updateProfileConfiguration({ inDeveloperMode: true }));
-  await settings.close();
+  async function enableDeveloperMode() {
+    // A killed browser may not flush this profile preference; reload still enforces it.
+    const settings = await context.newPage(); await settings.goto('chrome://extensions');
+    const before = await settings.evaluate(() => chrome.developerPrivate.getProfileConfiguration());
+    await settings.evaluate(() => chrome.developerPrivate.updateProfileConfiguration({ inDeveloperMode: true }));
+    assert.equal((await settings.evaluate(() => chrome.developerPrivate.getProfileConfiguration())).inDeveloperMode, true);
+    if (!before.inDeveloperMode) console.log('TEST SETUP: enabled developer mode in this disposable browser profile');
+    await settings.close();
+  }
+  await enableDeveloperMode();
   let [worker] = context.serviceWorkers(); worker ??= await context.waitForEvent('serviceworker');
   let popup = await context.newPage();
   await popup.goto(`chrome-extension://${worker.url().split('/')[2]}/popup.html`);
@@ -60,6 +66,12 @@ try {
       await wait(100);
     }
     assert.fail('Timed out waiting for behavior state');
+  }
+  async function assertMetadata() {
+    const saved = (await readDurable(popup)).value;
+    const local = (await popup.evaluate(() => chrome.storage.local.get('activeSession'))).activeSession;
+    assert.deepEqual(local, saved.activeSession);
+    assert.equal(saved.collection.session?.sessionId, saved.activeSession?.sessionId);
   }
   async function db(visitId) {
     assert.match(visitId, /^[a-f0-9-]{36}$/i);
@@ -85,6 +97,7 @@ try {
       await deadline(disconnected); await context.close().catch(() => undefined);
       assert.equal(browser.isConnected(), false, 'the complete persistent browser process exited');
       context = await launch();
+      await enableDeveloperMode();
       [worker] = context.serviceWorkers(); worker ??= await context.waitForEvent('serviceworker');
       popup = await context.newPage();
       await popup.goto(`chrome-extension://${worker.url().split('/')[2]}/popup.html`);
@@ -238,6 +251,7 @@ try {
     const countBefore = proxy.requests.length;
     await restart(mode); committed.release();
     const done = await until(s => s.visitDelivery.visits[0]?.phase === 'acked');
+    await assertMetadata();
     const restored = (await readDurable(popup, 'visitDelivery')).entries[0];
     assert.deepEqual(restored.visit, first.visit); assert.equal(restored.attempts, 2);
     const replay = proxy.requests.slice(countBefore).find(r => r.body.visitId === first.visitId);
@@ -284,10 +298,41 @@ try {
     if (!candidate.finalized) assert.equal(current.recoveryRequired, true);
   }
   assert.ok(recovered.recoveryCandidates > 0);
+  await assertMetadata();
+  const afterRecovery = await context.newPage(); await afterRecovery.goto(`${origin}/after-recovery`); await afterRecovery.bringToFront();
+  const continuedHold = await until(s => s.visits.some(v => v.normalizedUrl === `${origin}/after-recovery` && v.activeDurationMs >= 1500));
+  const afterId = continuedHold.visits.find(v => v.normalizedUrl === `${origin}/after-recovery`).visitId;
+  await afterRecovery.close();
+  const held = await until(s => s.candidates.some(c => c.visitId === afterId && c.finalized));
+  assert.equal(held.candidates.find(c => c.visitId === afterId).sequence, null);
+  assert.equal(held.visitDelivery.visits.some(v => v.visitId === afterId), false);
+  await popup.getByRole('button', { name: '상태 새로고침' }).click();
+  await popup.getByText(/판정 미완료·복구 가능한 제외 후보/).waitFor();
+  assert.ok((await popup.locator('main').innerText()).includes('앞 후보의 판정이 끝날 때까지 POST를 기다립니다'));
   await request({ type: 'stop' }); assert.equal((await request({ type: 'start', goalText: '확인 필요 후보 중 신규 시작' })).ok, false);
   await request({ type: 'clear' });
   assert.equal((await readDurable(popup, 'collection')).candidates.length, 0);
   console.log('PASS D-COLLECTOR: extension reload keeps open visit IDs; full browser exit retains unresolved candidates/sequence/version/duration, marks unmatched documents, blocks new session, explicit clear removes disk samples');
+
+  const validA = await context.newPage(); await validA.goto(`${origin}/valid-before-restart`); await validA.bringToFront();
+  assert.equal((await request({ type: 'start', goalText: '유효 분리 후보의 명시적 종료 검증하기' })).ok, true);
+  const validState = await until(s => s.visits.some(v => v.normalizedUrl === `${origin}/valid-before-restart` && v.activeDurationMs >= 1500));
+  const validId = validState.visits.find(v => v.normalizedUrl === `${origin}/valid-before-restart`).visitId;
+  const persistedA = (await readDurable(popup, 'collection')).candidates.find(c => c.visitId === validId);
+  await restart('browser');
+  const detached = await status(); await assertMetadata();
+  assert.ok(detached.candidates.find(c => c.visitId === validId).recoveryRequired);
+  const validB = await context.newPage(); await validB.goto(`${origin}/valid-after-restart`); await validB.bringToFront();
+  const nextState = await until(s => s.visits.some(v => v.normalizedUrl === `${origin}/valid-after-restart` && v.activeDurationMs >= 1500));
+  const nextId = nextState.visits.find(v => v.normalizedUrl === `${origin}/valid-after-restart`).visitId;
+  await validB.close(); await until(s => s.candidates.some(c => c.visitId === nextId && c.finalized));
+  assert.equal((await status()).candidates.find(c => c.visitId === nextId).sequence, null);
+  assert.equal((await request({ type: 'stop' })).ok, true);
+  const complete = await until(s => s.visitDelivery.visits.length === 2 && s.visitDelivery.visits.every(v => v.phase === 'acked') && s.behaviorDelivery.visits.every(v => v.phase === 'acked'));
+  assert.deepEqual(complete.readyVisits.map(v => [v.visitId, v.sequence]), [[validId, 1], [nextId, 2]]);
+  assert.equal(complete.readyVisits[0].activeDurationMs, persistedA.activeDurationMs);
+  assert.equal((await db(validId)).activeDurationMs, persistedA.activeDurationMs); await assertMetadata();
+  console.log('PASS REVIEW-C: real browser restart holds A and subsequent B; explicit stop finalizes valid A at committed duration with original IDs/sequences 1,2 and SQL ACK; pending prefix remains held; Popup explains limits; IDB/local metadata agree');
 
 } finally {
   await context?.close(); await proxy.close(); await new Promise(resolve => fixture.close(resolve)); await rm(root, { recursive: true, force: true });
