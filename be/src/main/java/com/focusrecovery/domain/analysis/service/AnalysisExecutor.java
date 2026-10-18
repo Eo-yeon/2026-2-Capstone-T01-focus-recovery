@@ -15,7 +15,7 @@ import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 import org.springframework.transaction.support.TransactionTemplate;
 
-import com.focusrecovery.domain.alert.service.AlertService;
+import com.focusrecovery.domain.alert.service.AlertTaskProcessor;
 import com.focusrecovery.domain.analysis.client.AiAnalysisClient;
 import com.focusrecovery.domain.analysis.client.AiAnalysisOutcome;
 import com.focusrecovery.domain.analysis.entity.AnalysisStatus;
@@ -39,12 +39,12 @@ public class AnalysisExecutor {
 	private final TransactionTemplate transactionTemplate;
 	private final TransactionTemplate newTransactionTemplate;
 	private final TaskExecutor analysisTaskExecutor;
-	private final AlertService alertService;
+	private final AlertTaskProcessor alertTaskProcessor;
 
 	public AnalysisExecutor(AnalysisResultRepository analysisResultRepository,
 		AnalysisWindowRepository analysisWindowRepository, AiAnalysisClient aiAnalysisClient,
 		TransactionTemplate transactionTemplate, PlatformTransactionManager transactionManager,
-		TaskExecutor analysisTaskExecutor, AlertService alertService) {
+		TaskExecutor analysisTaskExecutor, AlertTaskProcessor alertTaskProcessor) {
 		this.analysisResultRepository = analysisResultRepository;
 		this.analysisWindowRepository = analysisWindowRepository;
 		this.aiAnalysisClient = aiAnalysisClient;
@@ -52,7 +52,7 @@ public class AnalysisExecutor {
 		this.newTransactionTemplate = new TransactionTemplate(transactionManager);
 		this.newTransactionTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
 		this.analysisTaskExecutor = analysisTaskExecutor;
-		this.alertService = alertService;
+		this.alertTaskProcessor = alertTaskProcessor;
 	}
 
 	// 커밋 직후 요청 스레드에서 실행된다. 분석마다 따로 실행기에 넣고, 어떤 예외도 이미 커밋된 요청의 응답으로 올리지 않는다
@@ -91,8 +91,8 @@ public class AnalysisExecutor {
 				log.error("AI 호출 중 예상하지 못한 예외 analysisId={}", analysisId, e);
 				outcome = AiAnalysisOutcome.failed(INTERNAL_ERROR);
 			}
-			if (finish(analysisId, outcome) && outcome.errorCode() == null && "DRIFT".equals(outcome.result())) {
-				createAlertCandidate(claim.sessionId(), analysisId);
+			if (finish(analysisId, claim.sessionId(), outcome) && isDrift(outcome)) {
+				processAlertTask(analysisId);
 			}
 		} catch (RuntimeException e) {
 			// 상태 전이 DB 오류 등: 남은 PENDING·RUNNING은 AnalysisRecovery가 제한 시간 뒤 FAILED로 확정한다
@@ -100,25 +100,32 @@ public class AnalysisExecutor {
 		}
 	}
 
-	// RUNNING을 완료·실패로 바꿨으면 true
-	private boolean finish(UUID analysisId, AiAnalysisOutcome outcome) {
+	// RUNNING을 완료·실패로 바꿨으면 true. DRIFT로 완료하면 같은 트랜잭션에서 알림 후보 작업을 등록해,
+	// 결과 저장 직후 서버가 멈춰도 후보 처리가 누락되지 않게 한다(작업은 AlertTaskProcessor가 다시 찾는다)
+	private boolean finish(UUID analysisId, UUID sessionId, AiAnalysisOutcome outcome) {
 		return Boolean.TRUE.equals(transactionTemplate.execute(status -> analysisResultRepository
 			.findForUpdateByAnalysisId(analysisId)
 			.filter(analysis -> analysis.getProcessingStatus() == AnalysisStatus.RUNNING)
 			.map(analysis -> {
 				analysis.finish(outcome, now());
+				if (isDrift(outcome)) {
+					alertTaskProcessor.register(analysisId, sessionId);
+				}
 				return true;
 			})
 			.orElse(false)));
 	}
 
-	// 결과 저장이 커밋된 뒤 별도 트랜잭션에서 만든다: 후보 생성이 실패해도 저장된 분석 결과는 그대로이고(재시도 없음),
-	// 그사이 세션이 종료되거나 더 최신 구간이 생겼으면 AlertService가 후보를 만들지 않는다
-	private void createAlertCandidate(UUID sessionId, UUID analysisId) {
+	private static boolean isDrift(AiAnalysisOutcome outcome) {
+		return outcome.errorCode() == null && "DRIFT".equals(outcome.result());
+	}
+
+	// 결과 저장이 커밋된 뒤 바로 처리한다. 실패해도 저장된 분석 결과는 그대로이며 작업은 재시도·복구 대상으로 남는다
+	private void processAlertTask(UUID analysisId) {
 		try {
-			alertService.createAiCandidate(sessionId, analysisId);
+			alertTaskProcessor.process(analysisId);
 		} catch (RuntimeException e) {
-			log.error("AI 알림 후보 생성 실패 analysisId={}", analysisId, e);
+			log.error("AI 알림 후보 작업 처리 실패 analysisId={}", analysisId, e);
 		}
 	}
 

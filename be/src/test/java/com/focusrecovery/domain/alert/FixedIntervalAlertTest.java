@@ -41,8 +41,12 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
+import com.focusrecovery.domain.alert.repository.AlertCandidateTaskRepository;
 import com.focusrecovery.domain.alert.repository.NotificationRepository;
+import com.focusrecovery.domain.alert.entity.AlertCandidateTask;
+import com.focusrecovery.domain.alert.entity.AlertTaskStatus;
 import com.focusrecovery.domain.alert.service.AlertService;
+import com.focusrecovery.domain.alert.service.AlertTaskProcessor;
 import com.focusrecovery.domain.analysis.client.AiAnalysisOutcome;
 import com.focusrecovery.domain.analysis.entity.AnalysisResult;
 import com.focusrecovery.domain.analysis.repository.AnalysisResultRepository;
@@ -75,6 +79,9 @@ class FixedIntervalAlertTest {
 	private AlertService alertService;
 
 	@Autowired
+	private AlertTaskProcessor alertTaskProcessor;
+
+	@Autowired
 	private WorkSessionRepository workSessionRepository;
 
 	@Autowired
@@ -88,6 +95,9 @@ class FixedIntervalAlertTest {
 
 	@Autowired
 	private NotificationRepository notificationRepository;
+
+	@Autowired
+	private AlertCandidateTaskRepository alertCandidateTaskRepository;
 
 	@MockitoBean
 	private Clock clock;
@@ -246,6 +256,12 @@ class FixedIntervalAlertTest {
 		analysisResultRepository.save(analysis);
 
 		assertThat(alertService.createAiCandidate(sessionId, analysis.getAnalysisId())).isEmpty();
+		// 복구 작업도 오류가 아니라 모드 불일치로 건너뛴 것으로 기록한다
+		alertTaskProcessor.recover();
+		AlertCandidateTask task = alertCandidateTaskRepository.findById(analysis.getAnalysisId()).orElseThrow();
+		assertThat(task.getStatus()).isEqualTo(AlertTaskStatus.SKIPPED);
+		assertThat(task.getSkipReason()).isEqualTo("MODE_NOT_AI");
+		assertThat(task.getErrorCode()).isNull();
 		mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", sessionId))
 			.andExpect(jsonPath("$.alert").value(nullValue()))
 			.andExpect(jsonPath("$.latestCompletedAnalysis.result").value("DRIFT"));
@@ -267,6 +283,7 @@ class FixedIntervalAlertTest {
 	}
 
 	private void cleanUp() {
+		alertCandidateTaskRepository.deleteAll();
 		notificationRepository.deleteAll();
 		analysisResultRepository.deleteAll();
 		analysisWindowRepository.deleteAll();

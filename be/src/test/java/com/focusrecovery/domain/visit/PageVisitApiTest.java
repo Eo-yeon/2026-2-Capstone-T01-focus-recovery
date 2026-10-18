@@ -36,6 +36,7 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
+import com.focusrecovery.domain.alert.repository.AlertCandidateTaskRepository;
 import com.focusrecovery.domain.alert.repository.NotificationRepository;
 import com.focusrecovery.domain.analysis.repository.AnalysisResultRepository;
 import com.focusrecovery.domain.session.entity.WorkSession;
@@ -71,10 +72,14 @@ class PageVisitApiTest {
 	@Autowired
 	private NotificationRepository notificationRepository;
 
+	@Autowired
+	private AlertCandidateTaskRepository alertCandidateTaskRepository;
+
 	private UUID sessionId;
 
 	@BeforeEach
 	void setUp() {
+		alertCandidateTaskRepository.deleteAll();
 		notificationRepository.deleteAll();
 		analysisResultRepository.deleteAll();
 		analysisWindowRepository.deleteAll();
@@ -86,6 +91,7 @@ class PageVisitApiTest {
 	// 다른 테스트 클래스가 세션을 지울 때 외래키에 걸리지 않도록 방문 기록을 남기지 않는다
 	@AfterEach
 	void tearDown() {
+		alertCandidateTaskRepository.deleteAll();
 		notificationRepository.deleteAll();
 		analysisResultRepository.deleteAll();
 		analysisWindowRepository.deleteAll();

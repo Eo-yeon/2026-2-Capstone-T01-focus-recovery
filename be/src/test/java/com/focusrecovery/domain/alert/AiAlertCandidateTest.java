@@ -40,8 +40,11 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
+import com.focusrecovery.domain.alert.entity.AlertCandidateTask;
+import com.focusrecovery.domain.alert.entity.AlertTaskStatus;
 import com.focusrecovery.domain.alert.entity.AlertType;
 import com.focusrecovery.domain.alert.entity.Notification;
+import com.focusrecovery.domain.alert.repository.AlertCandidateTaskRepository;
 import com.focusrecovery.domain.alert.repository.NotificationRepository;
 import com.focusrecovery.domain.alert.service.AlertService;
 import com.focusrecovery.domain.analysis.client.AiAnalysisOutcome;
@@ -99,6 +102,9 @@ class AiAlertCandidateTest {
 
 	@Autowired
 	private NotificationRepository notificationRepository;
+
+	@Autowired
+	private AlertCandidateTaskRepository alertCandidateTaskRepository;
 
 	// 알림 간격 판단 시각만 고정한다(다른 코드는 실제 시각 사용)
 	@MockitoBean
@@ -410,6 +416,11 @@ class AiAlertCandidateTest {
 		assertThat(analysis.getResult()).isEqualTo("DRIFT");
 		assertThat(alert.getAnalysisId()).isEqualTo(analysis.getAnalysisId());
 		assertThat(alert.getAlertType()).isEqualTo(AlertType.AI);
+		// 분석 완료 트랜잭션에서 등록된 작업이 후보 생성으로 끝난다
+		AlertCandidateTask task = alertCandidateTaskRepository.findById(analysis.getAnalysisId()).orElseThrow();
+		assertThat(task.getStatus()).isEqualTo(AlertTaskStatus.CREATED);
+		assertThat(task.getAlertId()).isEqualTo(alert.getAlertId());
+		assertThat(task.getAttempts()).isEqualTo(1);
 		mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", sessionId))
 			.andExpect(jsonPath("$.alert.alertId").value(alert.getAlertId().toString()));
 	}
@@ -429,6 +440,9 @@ class AiAlertCandidateTest {
 		assertThat(analysis.getProcessingStatus()).isEqualTo(AnalysisStatus.COMPLETED);
 		assertThat(analysis.getResult()).isEqualTo("DRIFT");
 		assertThat(notificationRepository.count()).isZero();
+		AlertCandidateTask task = alertCandidateTaskRepository.findById(analysis.getAnalysisId()).orElseThrow();
+		assertThat(task.getStatus()).isEqualTo(AlertTaskStatus.SKIPPED);
+		assertThat(task.getSkipReason()).isEqualTo("SESSION_ENDED");
 	}
 
 	private Notification awaitNotification() throws InterruptedException {
@@ -534,6 +548,7 @@ class AiAlertCandidateTest {
 	}
 
 	private void cleanUp() {
+		alertCandidateTaskRepository.deleteAll();
 		notificationRepository.deleteAll();
 		analysisResultRepository.deleteAll();
 		analysisWindowRepository.deleteAll();

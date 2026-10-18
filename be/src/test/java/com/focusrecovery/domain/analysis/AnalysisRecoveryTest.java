@@ -34,6 +34,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 
+import com.focusrecovery.domain.alert.repository.AlertCandidateTaskRepository;
 import com.focusrecovery.domain.alert.repository.NotificationRepository;
 import com.focusrecovery.domain.analysis.client.AiAnalysisClient;
 import com.focusrecovery.domain.analysis.client.AiProperties;
@@ -92,6 +93,9 @@ class AnalysisRecoveryTest {
 
 	@Autowired
 	private NotificationRepository notificationRepository;
+
+	@Autowired
+	private AlertCandidateTaskRepository alertCandidateTaskRepository;
 
 	@Autowired
 	private AnalysisExecutor analysisExecutor;
@@ -361,6 +365,7 @@ class AnalysisRecoveryTest {
 	}
 
 	private void cleanUp() {
+		alertCandidateTaskRepository.deleteAll();
 		notificationRepository.deleteAll();
 		analysisResultRepository.deleteAll();
 		analysisWindowRepository.deleteAll();

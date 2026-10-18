@@ -7,6 +7,7 @@ import java.util.Optional;
 import java.util.UUID;
 
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.focusrecovery.domain.alert.dto.AlertResponse;
@@ -53,42 +54,69 @@ public class AlertService {
 	public record FixedIntervalResult(AlertResponse alert, boolean created) {
 	}
 
-	// 분석 결과가 COMPLETED·DRIFT로 커밋된 뒤 별도 트랜잭션에서 호출된다. 조건을 통과하면 AI 후보를 만든다(잠정 정책):
-	// AI 모드, ACTIVE 세션, 분석 구간이 실제 analysis_window의 최신 구간, 같은 분석의 후보 없음,
-	// 실제 표시된 AI 알림이 있으면 그 뒤에 NORMAL·TRANSITION으로 완료된 구간이 있고 마지막 shownAt부터 최소 간격이 지났을 것
-	@Transactional
-	public Optional<Notification> createAiCandidate(UUID sessionId, UUID analysisId) {
-		WorkSession session = workSessionRepository.findForShareBySessionId(sessionId).orElse(null);
-		if (properties.mode() != AlertType.AI || session == null || session.getStatus() != WorkSessionStatus.ACTIVE) {
-			return Optional.empty();
+	// AI 후보 판단 결과: 새로 만들었거나 이미 있으면 notification, 정책 조건 미충족이면 skipReason
+	public record AiDecision(Notification notification, boolean newlyCreated, String skipReason) {
+
+		static AiDecision created(Notification notification, boolean newlyCreated) {
+			return new AiDecision(notification, newlyCreated, null);
 		}
-		// 세션 → 분석 행 순서로 잠근다: 같은 분석의 동시 호출은 여기서 직렬화되어 후보 존재를 확인한 뒤 하나만 만든다
-		AnalysisResult analysis = analysisResultRepository.findForUpdateByAnalysisId(analysisId)
-			.filter(found -> found.getProcessingStatus() == AnalysisStatus.COMPLETED && "DRIFT".equals(found.getResult()))
-			.orElse(null);
-		if (analysis == null || notificationRepository.existsByAnalysisId(analysisId)) {
-			return Optional.empty();
+
+		static AiDecision skipped(String reason) {
+			return new AiDecision(null, false, reason);
 		}
-		int windowIndex = analysisWindowRepository.findById(analysis.getWindowId()).orElseThrow().getWindowIndex();
-		if (latestWindowIndex(sessionId) != windowIndex || !driftFlowAllowsAlert(sessionId, windowIndex)) {
-			return Optional.empty();
-		}
-		return Optional.of(notificationRepository.save(Notification.ai(sessionId, analysisId, AI_MESSAGE, now())));
 	}
 
-	// 실제 표시된 AI 알림이 없으면 허용한다. 있으면 그 구간 뒤에 정상 복귀(NORMAL·TRANSITION 완료)가 있어야 하고
+	@Transactional
+	public Optional<Notification> createAiCandidate(UUID sessionId, UUID analysisId) {
+		AiDecision decision = decideAiCandidate(sessionId, analysisId);
+		return decision.newlyCreated() ? Optional.of(decision.notification()) : Optional.empty();
+	}
+
+	// 처리할 때마다 현재 상태로 다시 판단한다(잠정 정책): 같은 분석의 후보가 이미 있으면 그것을 쓰고, 아니면
+	// AI 모드, ACTIVE 세션, COMPLETED·DRIFT, 실제 analysis_window의 최신 구간, 실제 표시 이력·최소 간격 조건을 모두 통과해야 만든다.
+	// 잠금은 세션(공유) → 분석 행 순서이며, 같은 분석의 동시 호출은 분석 행 잠금에서 직렬화되어 후보는 하나만 생긴다
+	@Transactional(propagation = Propagation.MANDATORY)
+	public AiDecision decideAiCandidate(UUID sessionId, UUID analysisId) {
+		WorkSession session = workSessionRepository.findForShareBySessionId(sessionId).orElse(null);
+		AnalysisResult analysis = analysisResultRepository.findForUpdateByAnalysisId(analysisId).orElse(null);
+		Optional<Notification> existing = notificationRepository.findByAnalysisId(analysisId);
+		if (existing.isPresent()) {
+			return AiDecision.created(existing.get(), false);
+		}
+		if (session == null || session.getStatus() != WorkSessionStatus.ACTIVE) {
+			return AiDecision.skipped("SESSION_ENDED");
+		}
+		if (properties.mode() != AlertType.AI) {
+			return AiDecision.skipped("MODE_NOT_AI");
+		}
+		if (analysis == null || analysis.getProcessingStatus() != AnalysisStatus.COMPLETED
+			|| !"DRIFT".equals(analysis.getResult())) {
+			return AiDecision.skipped("NOT_COMPLETED_DRIFT");
+		}
+		int windowIndex = analysisWindowRepository.findById(analysis.getWindowId()).orElseThrow().getWindowIndex();
+		if (latestWindowIndex(sessionId) != windowIndex) {
+			return AiDecision.skipped("NOT_LATEST_WINDOW");
+		}
+		String flowBlock = driftFlowBlockReason(sessionId, windowIndex);
+		if (flowBlock != null) {
+			return AiDecision.skipped(flowBlock);
+		}
+		return AiDecision.created(notificationRepository.save(Notification.ai(sessionId, analysisId, AI_MESSAGE, now())), true);
+	}
+
+	// 실제 표시된 AI 알림이 없으면 허용(null). 있으면 그 구간 뒤에 정상 복귀(NORMAL·TRANSITION 완료)가 있어야 하고
 	// (실패·PENDING·RUNNING·분석 없음은 복귀로 보지 않음) 마지막 shownAt부터 최소 간격이 지나야 한다. 순서는 windowIndex 기준
-	private boolean driftFlowAllowsAlert(UUID sessionId, int windowIndex) {
+	private String driftFlowBlockReason(UUID sessionId, int windowIndex) {
 		Optional<Integer> lastShownWindow = notificationRepository.findLastShownAiWindowIndex(sessionId);
 		if (lastShownWindow.isEmpty()) {
-			return true;
+			return null;
 		}
 		if (!analysisResultRepository.existsCompletedBetween(sessionId, lastShownWindow.get(), windowIndex,
 			AnalysisStatus.COMPLETED)) {
-			return false;
+			return "DRIFT_FLOW_CONTINUES";
 		}
 		Instant lastShownAt = notificationRepository.findLastShownAt(sessionId, AlertType.AI).orElseThrow();
-		return !now().isBefore(lastShownAt.plus(properties.ai().minInterval()));
+		return now().isBefore(lastShownAt.plus(properties.ai().minInterval())) ? "MIN_INTERVAL_NOT_PASSED" : null;
 	}
 
 	// 신규 201 / 미표시 후보 재반환 200. 세션 쓰기 잠금으로 동시 요청을 직렬화해 후보를 하나만 만든다
@@ -136,7 +164,7 @@ public class AlertService {
 					&& "DRIFT".equals(analysis.getResult()))
 				.flatMap(analysis -> notificationRepository.findByAnalysisIdAndShownAtIsNull(analysis.getAnalysisId()))
 				// 후보 생성 뒤 다른 알림이 실제 표시되었을 수 있으므로 현재 표시 이력·최소 간격으로 다시 확인한다(필터링만 함)
-				.filter(notification -> driftFlowAllowsAlert(session.getSessionId(), latest.getWindowIndex()))
+				.filter(notification -> driftFlowBlockReason(session.getSessionId(), latest.getWindowIndex()) == null)
 				.map(notification -> AlertResponse.of(notification, latest.getWindowIndex(), session.getGoalText())))
 			.orElse(null);
 	}

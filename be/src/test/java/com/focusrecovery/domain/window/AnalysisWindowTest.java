@@ -41,6 +41,7 @@ import org.springframework.test.util.AopTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
+import com.focusrecovery.domain.alert.repository.AlertCandidateTaskRepository;
 import com.focusrecovery.domain.alert.repository.NotificationRepository;
 import com.focusrecovery.domain.analysis.repository.AnalysisResultRepository;
 import com.focusrecovery.domain.session.entity.WorkSession;
@@ -75,6 +76,9 @@ class AnalysisWindowTest {
 	@Autowired
 	private NotificationRepository notificationRepository;
 
+	@Autowired
+	private AlertCandidateTaskRepository alertCandidateTaskRepository;
+
 	// 기본은 실제 메서드를 그대로 호출한다. 구간 저장 실패 복구 테스트에서만 오류를 주입한다
 	@MockitoSpyBean
 	private AnalysisWindowService analysisWindowService;
@@ -83,6 +87,7 @@ class AnalysisWindowTest {
 
 	@BeforeEach
 	void setUp() {
+		alertCandidateTaskRepository.deleteAll();
 		notificationRepository.deleteAll();
 		analysisResultRepository.deleteAll();
 		analysisWindowRepository.deleteAll();
@@ -94,6 +99,7 @@ class AnalysisWindowTest {
 	// 다른 테스트 클래스가 세션을 지울 때 외래키에 걸리지 않도록 구간과 방문 기록을 남기지 않는다
 	@AfterEach
 	void tearDown() {
+		alertCandidateTaskRepository.deleteAll();
 		notificationRepository.deleteAll();
 		analysisResultRepository.deleteAll();
 		analysisWindowRepository.deleteAll();

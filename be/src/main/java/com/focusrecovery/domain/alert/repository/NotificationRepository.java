@@ -12,7 +12,7 @@ import com.focusrecovery.domain.alert.entity.Notification;
 
 public interface NotificationRepository extends JpaRepository<Notification, UUID> {
 
-	boolean existsByAnalysisId(UUID analysisId);
+	Optional<Notification> findByAnalysisId(UUID analysisId);
 
 	Optional<Notification> findByAnalysisIdAndShownAtIsNull(UUID analysisId);
 

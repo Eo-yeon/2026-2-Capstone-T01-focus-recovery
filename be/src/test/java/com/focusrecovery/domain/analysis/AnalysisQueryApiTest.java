@@ -39,6 +39,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
+import com.focusrecovery.domain.alert.repository.AlertCandidateTaskRepository;
 import com.focusrecovery.domain.alert.repository.NotificationRepository;
 import com.focusrecovery.domain.analysis.client.AiAnalysisClient;
 import com.focusrecovery.domain.analysis.client.AiAnalysisOutcome;
@@ -81,6 +82,9 @@ class AnalysisQueryApiTest {
 
 	@Autowired
 	private NotificationRepository notificationRepository;
+
+	@Autowired
+	private AlertCandidateTaskRepository alertCandidateTaskRepository;
 
 	// 조회가 AI를 호출하지 않는지 확인한다(실제 메서드는 그대로 호출)
 	@MockitoSpyBean
@@ -602,6 +606,7 @@ class AnalysisQueryApiTest {
 	}
 
 	private void cleanUp() {
+		alertCandidateTaskRepository.deleteAll();
 		notificationRepository.deleteAll();
 		analysisResultRepository.deleteAll();
 		analysisWindowRepository.deleteAll();

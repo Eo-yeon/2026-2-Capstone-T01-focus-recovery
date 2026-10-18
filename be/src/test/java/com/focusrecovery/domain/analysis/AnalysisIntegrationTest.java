@@ -41,6 +41,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import com.focusrecovery.domain.alert.repository.AlertCandidateTaskRepository;
 import com.focusrecovery.domain.alert.repository.NotificationRepository;
 import com.focusrecovery.domain.analysis.entity.AnalysisResult;
 import com.focusrecovery.domain.analysis.entity.AnalysisStatus;
@@ -98,6 +99,9 @@ class AnalysisIntegrationTest {
 
 	@Autowired
 	private NotificationRepository notificationRepository;
+
+	@Autowired
+	private AlertCandidateTaskRepository alertCandidateTaskRepository;
 
 	@Autowired
 	private AnalysisExecutor analysisExecutor;
@@ -519,6 +523,7 @@ class AnalysisIntegrationTest {
 	}
 
 	private void cleanUp() {
+		alertCandidateTaskRepository.deleteAll();
 		notificationRepository.deleteAll();
 		analysisResultRepository.deleteAll();
 		analysisWindowRepository.deleteAll();
