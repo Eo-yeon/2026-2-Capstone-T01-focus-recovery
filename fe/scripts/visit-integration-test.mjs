@@ -1,3 +1,4 @@
+import { readDurable } from './durable-test-utils.mjs';
 // Real BE test: requires an explicit disposable API server; no API request mocking.
 import { chromium } from 'playwright';
 import assert from 'node:assert/strict';
@@ -83,7 +84,7 @@ try {
   assert.equal((await request({ type: 'stop' })).ok, true);
   const complete = await until(state => state.visitDelivery.visits.length === 6 && state.visitDelivery.visits.every(visit => visit.phase === 'acked'));
   assert.deepEqual(complete.readyVisits.map(visit => visit.sequence), [1, 2, 3, 4, 5, 6]);
-  const checkpoint = await popup.evaluate(() => chrome.storage.session.get('visitDelivery').then(saved => saved.visitDelivery));
+  const checkpoint = await readDurable(popup, 'visitDelivery');
   const list = async () => {
     const reply = await fetch(`${apiUrl.origin}/api/sessions/${sessionId}/visits?size=100`);
     assert.equal(reply.status, 200); return reply.json();
@@ -114,7 +115,7 @@ try {
     ? 'PASS: real MySQL before/after duplicate replays: six unique visits, two unique Windows, [1,2,3,4,5] and [2,3,4,5,6]'
     : 'SKIP: DB Window contents/counts require INTEGRATION_MYSQL_CONTAINER (disposable MySQL with passwordless test root).');
 
-  const readCheckpoint = () => popup.evaluate(() => chrome.storage.session.get('visitDelivery').then(saved => saved.visitDelivery));
+  const readCheckpoint = () => readDurable(popup, 'visitDelivery');
   const allAck = count => until(state => state.visitDelivery.visits.length === count && state.visitDelivery.visits.every(visit => visit.phase === 'acked'));
   const visitList = async id => {
     const reply = await fetch(`${apiUrl.origin}/api/sessions/${id}/visits?size=100`);

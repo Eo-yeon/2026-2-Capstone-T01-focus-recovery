@@ -276,7 +276,7 @@ try {
   assert.deepEqual(visitRequests.filter((request, index) => index === 0 || request.visitId !== visitRequests[index - 1].visitId).map(request => request.sequence), stopped.readyVisits.map(visit => visit.sequence));
   console.log('PASS: MV3 visit HTTP delivery, lost response, duplicate 200 replay, sequence order, ACK and worker checkpoint recovery (synthetic API)');
   assert.equal([...sessions.values()].every(session => session.status === 'ACTIVE'), true, 'local stop does not claim server termination');
-  assert.equal(stopped.readyVisits.length, stopped.visits.length, 'stop finalizes every valid visit');
+  assert.equal(stopped.readyVisits.length, stopped.visits.length, `stop finalizes every valid visit: ${JSON.stringify(result.candidates.map(c => ({state:c.state,reason:c.reason,finalized:c.finalized,sequence:c.sequence,recoveryRequired:c.recoveryRequired})))}`);
   assert.deepEqual(stopped.readyVisits.map(v => v.sequence), stopped.readyVisits.map((_, i) => i + 1), 'excluded candidates never consume server sequences');
   assert.equal(stopped.candidates.some(c => c.state === 'excluded'), true, 'exclusion cases were actually exercised');
   const windows = stopped.readyVisits.slice(4).map((_, i) => stopped.readyVisits.slice(i, i + 5).map(v => v.visitId));
@@ -347,10 +347,12 @@ try {
   assert.ok(activeWorker, 'active extension worker exists');
   // Inject one storage failure in the real worker; HTTP still uses the fixture above.
   await activeWorker.evaluate(() => {
-    const original = chrome.storage.session.set.bind(chrome.storage.session);
-    chrome.storage.session.set = async (...args) => {
-      chrome.storage.session.set = original;
-      throw new Error('SYNTHETIC_CHECKPOINT_FAILURE');
+    const original = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (...args) {
+      IDBObjectStore.prototype.put = original;
+      const request = original.apply(this, args);
+      request.addEventListener('success', () => this.transaction.abort());
+      return request;
     };
   });
   const failed = await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'status' }));

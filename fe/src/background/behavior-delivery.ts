@@ -10,7 +10,6 @@ type Entry = BehaviorDeliveryStatus['visits'][number] & { sessionId: string; ini
 interface Checkpoint { apiBaseUrl: string; entries: Entry[] }
 const phases = ['waiting-post', 'queued', 'sending', 'retry-wait', 'failed', 'acked'];
 export class BehaviorDelivery {
-  // shortcut: session storage recovers worker interruption only; durable browser recovery needs IndexedDB.
   checkpoint: Checkpoint = { apiBaseUrl: API_BASE_URL, entries: [] };
   blocked: string | undefined;
   private running = false;

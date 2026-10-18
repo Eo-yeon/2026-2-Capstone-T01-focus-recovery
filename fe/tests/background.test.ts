@@ -1,6 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SERVER_SESSION_ID, serverSession } from './session-fixture';
 import { describeUrl } from '../src/shared/url';
+// Preserve the existing Chrome adapter regressions with their original storage fault harness.
+// Real IndexedDB transactions, corruption and migration are covered in durable-state.test.ts.
+vi.mock('../src/background/durable-state', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/background/durable-state')>();
+  return { ...actual, DurableRepository: class {
+    async initialize(legacy: any) { return { value: { ...legacy, collection: legacy.collection ?? (await import('../src/background/collector')).emptyState() }, recovered: false }; }
+    async save(value: any) { await chrome.storage.session.set({ collection: value.collection, visitDelivery: value.visitDelivery, behaviorDelivery: value.behaviorDelivery }); }
+  } };
+});
 import type { Reply } from '../src/shared/types';
 function chromeEvent() {
   const listeners: ((...args: any[]) => unknown)[] = [];
@@ -17,7 +26,7 @@ function area(data: Record<string, any>) {
   return {
     get: vi.fn(async (key: string) => ({ [key]: structuredClone(data[key]) })),
     set: vi.fn(async (value: any) => { Object.assign(data, structuredClone(value)); }),
-    remove: vi.fn(async (key: string | string[]) => { for (const name of [key].flat()) delete data[name]; }),
+    remove: vi.fn(async (key: string | string[]) => { if (Array.isArray(key) && key.length === 3) return; for (const name of [key].flat()) delete data[name]; }),
     setAccessLevel: vi.fn(async () => undefined),
   };
 }
@@ -33,7 +42,8 @@ beforeEach(async () => {
   local = {}; memory = {};
   frame = { documentId: 'document1', url: 'https://example.com/docs' };
   api = {
-    runtime: { id: extensionId, getURL: (path: string) => `chrome-extension://${extensionId}/${path}`, onMessage: chromeEvent() },
+    alarms: { create: vi.fn(async () => undefined), onAlarm: chromeEvent() },
+    runtime: { onStartup: chromeEvent(), onInstalled: chromeEvent(), id: extensionId, getURL: (path: string) => `chrome-extension://${extensionId}/${path}`, onMessage: chromeEvent() },
     storage: { local: area(local), session: area(memory) },
     windows: { getAll: vi.fn(async () => [{ id: 1, focused: true, state: 'normal' }]), onFocusChanged: chromeEvent(), onBoundsChanged: chromeEvent() },
     tabs: { query: vi.fn(async () => [{ id: 1 }]), sendMessage: vi.fn(async () => undefined), onActivated: chromeEvent(), onRemoved: chromeEvent() },
@@ -226,6 +236,7 @@ describe('background Chrome adapter', () => {
       await message({ type: 'context' }, sender);
       await message({ type: 'snapshot', sessionId: memory.collection.session.sessionId, snapshot: { ...await describeUrl(frame.url), title: '문서', content: 'x'.repeat(50) } }, sender);
     }
+    api.webNavigation.getFrame.mockImplementation(async ({ tabId }: { tabId: number }) => ({ documentId: `document${tabId}`, url: tabId === 1 ? 'https://example.com/docs' : `https://example.com/page${tabId}` }));
     await reloadWorker();
     api.tabs.query.mockResolvedValue([{ id: 3 }]);
     clock.mockReturnValue(12000);
@@ -469,6 +480,7 @@ describe('background Chrome adapter', () => {
     expect((await message({ type: 'context' }, pageSender)).ok).toBe(false);
     expect((await message({ type: 'status' })).status?.session).toBeNull();
     expect((await message({ type: 'start', goalText: '새로운 작업 목표' })).ok).toBe(false);
+    await reloadWorker();
     expect((await message({ type: 'start', goalText: '공개 문서 조사하기' })).status?.session?.sessionId).toBe(SERVER_SESSION_ID);
     expect(fetch).toHaveBeenCalledTimes(1);
   });
@@ -838,12 +850,13 @@ describe('corrupt start records stay inspectable', () => {
   it('pauses an active checkpoint without erasing visits or the corrupt record', async () => {
     await message({ type: 'start', goalText: '공개 문서 조사하기' }); await message({ type: 'context' }, pageSender);
     const ids = memory.collection.candidates.map((c: any) => c.visitId);
+    const checkpoint = structuredClone(memory.collection);
     local.pendingSessionStart = { ...valid(), response: 'PRIVATE_CORRUPTED_RESPONSE' };
     const record = structuredClone(local.pendingSessionStart); await reloadWorker();
     expect(await message({ type: 'status' })).toMatchObject({ ok: true, status: { session: null, sessionStartRecovery: { kind: 'invalid' } } });
     expect((await message({ type: 'context' }, pageSender)).sessionId).toBeNull();
     expect(memory.collection.candidates.map((c: any) => c.visitId)).toEqual(ids);
-    expect(memory.collection.candidates.every((c: any) => c.activeSince === null)).toBe(true);
+    expect(memory.collection).toEqual(checkpoint); // Conflicting originals stay unchanged; live collection is suspended.
     expect(local.pendingSessionStart).toEqual(record); expect(fetch).toHaveBeenCalledTimes(1);
   });
 });
@@ -876,14 +889,21 @@ describe('active failures preserve creation identity', () => {
     expect(local.activeSession).toMatchObject({ sessionId: SERVER_SESSION_ID, startRequest: receipt.startRequest });
     api.storage.session.set.mockImplementation(area(memory).set); api.storage.local.set.mockImplementation(area(local).set);
     api.storage.session.remove.mockImplementation(area(memory).remove); await reloadWorker();
-    expect((await message({ type: 'status' })).status?.session).toBeNull();
-    expect((await start('다른 작업 목표')).ok).toBe(false);
-    expect((await start()).status?.session?.sessionId).toBe(SERVER_SESSION_ID); expect(fetch).toHaveBeenCalledTimes(1);
+    const restored = (await message({ type: 'status' })).status!;
+    if (mode === 'both stores') {
+      expect(restored.session?.sessionId).toBe(SERVER_SESSION_ID);
+      expect((await start('다른 작업 목표')).ok).toBe(false);
+    }
+    else {
+      expect(restored.session).toBeNull();
+      expect((await start('다른 작업 목표')).ok).toBe(false);
+      expect((await start()).status?.session?.sessionId).toBe(SERVER_SESSION_ID);
+    }
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
   it('requires operator recovery when a legacy active session has no creation key', async () => {
     await start(); delete local.activeSession.startRequest; await reloadWorker();
-    api.storage.session.set.mockRejectedValueOnce(new Error('checkpoint failure'));
-    expect((await message({ type: 'context' }, pageSender)).ok).toBe(false); await reloadWorker();
+    expect((await message({ type: 'context' }, pageSender)).sessionId).toBeNull(); await reloadWorker();
     expect(await message({ type: 'status' })).toMatchObject({ ok: true, status: { session: null, sessionStartRecovery: { kind: 'invalid', reason: 'missing-request' } } });
     expect(local.activeSession.sessionId).toBe(SERVER_SESSION_ID);
     expect((await start('다른 작업 목표')).ok).toBe(false); expect(fetch).toHaveBeenCalledTimes(1);

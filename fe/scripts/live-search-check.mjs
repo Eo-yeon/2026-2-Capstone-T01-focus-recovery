@@ -1,3 +1,4 @@
+import { readDurable } from './durable-test-utils.mjs';
 // Opt-in live-service probe. Uses a temporary profile; prints counts/flags only.
 import { chromium } from 'playwright';
 import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -34,7 +35,7 @@ try {
     const last = state.candidates.at(-1);
     const visit = state.visits.find(v => v.visitId === last?.visitId);
     const advertisingContainers = await page.evaluate(() => document.querySelectorAll('#power_link,.ad_section,[data-ad],#tads,#tadsb').length);
-    const evidence = await popup.evaluate(() => chrome.storage.session.get('collection'));
+    const evidence = { collection: await readDurable(popup, 'collection') };
     const candidate = evidence.collection.candidates.find(c => c.visitId === last?.visitId);
     console.log(JSON.stringify({ label, state: last?.state, reason: last?.reason, supportedLocation: /^(www\.google\.com|search\.naver\.com)$/.test(new URL(page.url()).hostname) && ['/search', '/search.naver'].includes(new URL(page.url()).pathname), queryMatches: visit ? visit.searchQuery === expectedQuery : false, advertisingContainers, organicResultCount: candidate?.snapshot?.organicResultCount ?? 0, contentLength: visit ? [...visit.content].length : 0 }));
     return visit;
