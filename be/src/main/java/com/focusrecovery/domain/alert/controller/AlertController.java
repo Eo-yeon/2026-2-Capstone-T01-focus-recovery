@@ -80,6 +80,14 @@ public class AlertController {
 			- AI·FIXED_INTERVAL 알림을 모두 포함합니다. 미표시 후보도 포함하며 shownAt=null로 구분합니다. 표시됐지만 선택이 없으면 response=null입니다.
 			- 현재 후보 여부·서버 알림 모드·표시 가능 조건으로 이력을 제외하지 않습니다. 해당 세션의 알림과 그 알림에 연결된 선택만 반환합니다.
 			- 조회만 하며 AI 호출·후보 생성·shownAt 기록·복구 처리를 하지 않습니다.
+
+			**offset 페이지네이션의 한계 (활성 세션)**
+			- 각 페이지는 요청 시점의 데이터로 따로 조회합니다. 페이지를 넘기는 사이 새 알림이 생기면 기존 항목이 뒤 페이지로 밀려 페이지 간에 같은 알림이 다시 나오거나,
+			  totalElements·hasNext 등 조회 결과가 달라질 수 있습니다. 예) 0페이지 조회 후 새 알림이 생기면 1페이지 첫 항목이 0페이지 마지막 항목과 같을 수 있습니다.
+			- createdAt·alertId 정렬은 같은 데이터에서의 순서를 정할 뿐, 여러 요청 사이의 스냅샷 일관성은 보장하지 않습니다.
+			- alertId로 중복을 걸러도 여러 페이지를 합친 결과가 특정 시점의 전체 이력과 같다는 보장은 없습니다. 특정 시점의 전체 이력이 필요하면 세션 종료 후 조회하거나,
+			  새 알림 여부를 확인해(totalElements 변화 등) 0페이지부터 다시 조회해야 합니다.
+			- 일관된 연속 조회를 위한 (createdAt, alertId) 커서 방식은 후속 개선 항목이며, 현재 page·size 계약은 그대로입니다.
 			""")
 	@ApiResponse(responseCode = "200", description = "조회 성공")
 	@ApiResponse(responseCode = "400", description = "잘못된 UUID 또는 페이지네이션 값(page 0 이상, size 1~100, page × size가 int 범위 이내)",

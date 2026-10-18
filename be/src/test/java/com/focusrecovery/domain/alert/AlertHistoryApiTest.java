@@ -196,6 +196,32 @@ class AlertHistoryApiTest {
 			.andExpect(jsonPath("$.totalElements").value(5));
 	}
 
+	// 0페이지 조회 → 새 알림 생성 → 1페이지 조회: 기존 항목이 한 칸 밀려 0페이지 마지막 항목이 1페이지 첫 항목으로 다시 나온다.
+	// 정렬은 같은 데이터에서의 순서만 정하며 요청 사이의 스냅샷 일관성은 보장하지 않는다(Swagger에 명시한 한계)
+	@Test
+	void 페이지를_넘기는_사이_새_알림이_생기면_중복과_결과_변동이_생길_수_있다() throws Exception {
+		List<String> ids = new ArrayList<>();
+		for (int i = 0; i < 5; i++) {
+			ids.add(0, save(Notification.fixedInterval(sessionId, "알림 " + i, BASE.plusSeconds(i), BASE.plusSeconds(600L * (i + 1))),
+				null).getAlertId().toString());
+		}
+		String page0 = mockMvc.perform(get("/api/sessions/{sessionId}/alerts", sessionId).param("size", "2"))
+			.andExpect(jsonPath("$.items[*].alertId", contains(ids.get(0), ids.get(1))))
+			.andExpect(jsonPath("$.totalElements").value(5))
+			.andReturn().getResponse().getContentAsString();
+
+		String added = save(Notification.fixedInterval(sessionId, "새 알림", BASE.plusSeconds(100), BASE.plusSeconds(6000)), null)
+			.getAlertId().toString();
+
+		mockMvc.perform(get("/api/sessions/{sessionId}/alerts", sessionId).param("page", "1").param("size", "2"))
+			.andExpect(jsonPath("$.items[*].alertId", contains(ids.get(1), ids.get(2))))
+			.andExpect(jsonPath("$.totalElements").value(6));
+		// 새 알림은 0페이지를 다시 조회해야 보인다
+		assertThat(page0).doesNotContain(added);
+		mockMvc.perform(get("/api/sessions/{sessionId}/alerts", sessionId).param("size", "2"))
+			.andExpect(jsonPath("$.items[0].alertId").value(added));
+	}
+
 	@ParameterizedTest
 	@ValueSource(strings = {"page=-1", "size=0", "size=101", "page=abc", "size=1.5", "page=21474837&size=100"})
 	void 잘못된_페이지_값은_400이다(String query) throws Exception {

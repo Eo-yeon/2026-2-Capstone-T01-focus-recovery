@@ -75,4 +75,13 @@ class OpenApiDocsTest {
 		result.andExpect(jsonPath("$.components.schemas.ShownRequest.properties.shownAt.description",
 			containsString("더 세밀하면 400")));
 	}
+
+	@Test
+	void OpenAPI_문서에_알림_이력_offset_페이지네이션_한계가_포함된다() throws Exception {
+		mockMvc.perform(get("/v3/api-docs"))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.paths['/api/sessions/{sessionId}/alerts'].get.description",
+				allOf(containsString("offset 페이지네이션의 한계"), containsString("스냅샷 일관성은 보장하지 않습니다"),
+					containsString("alertId로 중복을 걸러도"), containsString("커서 방식은 후속 개선"))));
+	}
 }
