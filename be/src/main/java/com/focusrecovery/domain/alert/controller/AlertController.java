@@ -4,20 +4,25 @@ import java.util.Map;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.focusrecovery.domain.alert.dto.AlertHistoryPageResponse;
 import com.focusrecovery.domain.alert.dto.AlertResponse;
 import com.focusrecovery.domain.alert.dto.AlertResponseRequest;
 import com.focusrecovery.domain.alert.dto.NotificationResponseResponse;
 import com.focusrecovery.domain.alert.dto.ShownRequest;
 import com.focusrecovery.domain.alert.service.AlertDisplayService;
+import com.focusrecovery.domain.alert.service.AlertHistoryService;
 import com.focusrecovery.domain.alert.service.AlertService;
 import com.focusrecovery.global.exception.ErrorResponse;
+import com.focusrecovery.global.util.Pages;
 import com.focusrecovery.global.util.Uuids;
 
 import io.swagger.v3.oas.annotations.Operation;
@@ -29,7 +34,7 @@ import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 
-@Tag(name = "목표 복귀 알림", description = "알림 후보 생성·실제 표시 확인·사용자 선택 저장 API")
+@Tag(name = "목표 복귀 알림", description = "알림 후보 생성·실제 표시 확인·사용자 선택 저장·이력 조회 API")
 @RestController
 @RequestMapping("/api/sessions/{sessionId}/alerts")
 public class AlertController {
@@ -56,10 +61,52 @@ public class AlertController {
 
 	private final AlertService alertService;
 	private final AlertDisplayService alertDisplayService;
+	private final AlertHistoryService alertHistoryService;
 
-	public AlertController(AlertService alertService, AlertDisplayService alertDisplayService) {
+	public AlertController(AlertService alertService, AlertDisplayService alertDisplayService,
+		AlertHistoryService alertHistoryService) {
 		this.alertService = alertService;
 		this.alertDisplayService = alertDisplayService;
+		this.alertHistoryService = alertHistoryService;
+	}
+
+	@Operation(
+		summary = "알림·사용자 선택 이력 조회",
+		description = """
+			세션의 알림 후보와 사용자 선택을 함께 조회합니다. 종료된 세션도 조회할 수 있습니다.
+
+			- 각 항목은 Alert의 모든 필드에 response(사용자 선택: feedbackId, alertId, action, selectedAt)를 더한 형태입니다. 선택이 없으면 response는 null입니다.
+			- 정렬: createdAt 내림차순, 같으면 alertId 내림차순입니다.
+			- AI·FIXED_INTERVAL 알림을 모두 포함합니다. 미표시 후보도 포함하며 shownAt=null로 구분합니다. 표시됐지만 선택이 없으면 response=null입니다.
+			- 현재 후보 여부·서버 알림 모드·표시 가능 조건으로 이력을 제외하지 않습니다. 해당 세션의 알림과 그 알림에 연결된 선택만 반환합니다.
+			- 조회만 하며 AI 호출·후보 생성·shownAt 기록·복구 처리를 하지 않습니다.
+
+			**offset 페이지네이션의 한계 (활성 세션)**
+			- 각 페이지는 요청 시점의 데이터로 따로 조회합니다. 페이지를 넘기는 사이 새 알림이 생기면 기존 항목이 뒤 페이지로 밀려 페이지 간에 같은 알림이 다시 나오거나,
+			  totalElements·hasNext 등 조회 결과가 달라질 수 있습니다. 예) 0페이지 조회 후 새 알림이 생기면 1페이지 첫 항목이 0페이지 마지막 항목과 같을 수 있습니다.
+			- createdAt·alertId 정렬은 같은 데이터에서의 순서를 정할 뿐, 여러 요청 사이의 스냅샷 일관성은 보장하지 않습니다.
+			- alertId로 중복을 걸러도 여러 페이지를 합친 결과가 특정 시점의 전체 이력과 같다는 보장은 없습니다. 특정 시점의 전체 이력이 필요하면 세션 종료 후 조회하거나,
+			  새 알림 여부를 확인해(totalElements 변화 등) 0페이지부터 다시 조회해야 합니다.
+			- 일관된 연속 조회를 위한 (createdAt, alertId) 커서 방식은 후속 개선 항목이며, 현재 page·size 계약은 그대로입니다.
+			""")
+	@ApiResponse(responseCode = "200", description = "조회 성공")
+	@ApiResponse(responseCode = "400", description = "잘못된 UUID 또는 페이지네이션 값(page 0 이상, size 1~100, page × size가 int 범위 이내)",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "INVALID_REQUEST", "message": "size는 1 이상 100 이하여야 합니다.", "fieldErrors": []}""")))
+	@ApiResponse(responseCode = "404", description = "세션이 존재하지 않음",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "SESSION_NOT_FOUND", "message": "작업 세션을 찾을 수 없습니다.", "fieldErrors": []}""")))
+	@GetMapping
+	public AlertHistoryPageResponse history(
+		@Parameter(description = "작업 세션 ID (UUID)", example = "1ba72f77-c166-4e06-88c7-1d6ed919cd9b")
+		@PathVariable String sessionId,
+		@Parameter(description = "페이지 번호 (0부터)", example = "0")
+		@RequestParam(defaultValue = "0") int page,
+		@Parameter(description = "페이지 크기 (1~100)", example = "20")
+		@RequestParam(defaultValue = "20") int size
+	) {
+		Pages.validate(page, size);
+		return alertHistoryService.history(Uuids.parse(sessionId, INVALID_SESSION_ID), page, size);
 	}
 
 	@Operation(
