@@ -1,5 +1,7 @@
 package com.focusrecovery.global.exception;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -8,12 +10,15 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
+import com.focusrecovery.domain.analysis.exception.AnalysisNotFoundException;
 import com.focusrecovery.domain.session.exception.IdempotencyKeyMismatchException;
 import com.focusrecovery.domain.session.exception.SessionNotFoundException;
 import com.focusrecovery.domain.visit.exception.VisitNotFoundException;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+	private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
 	private static final String INVALID_REQUEST = "INVALID_REQUEST";
 
@@ -63,6 +68,20 @@ public class GlobalExceptionHandler {
 	@ResponseStatus(HttpStatus.NOT_FOUND)
 	public ErrorResponse handleVisitNotFound(VisitNotFoundException e) {
 		return ErrorResponse.of("VISIT_NOT_FOUND", e.getMessage());
+	}
+
+	@ExceptionHandler(AnalysisNotFoundException.class)
+	@ResponseStatus(HttpStatus.NOT_FOUND)
+	public ErrorResponse handleAnalysisNotFound(AnalysisNotFoundException e) {
+		return ErrorResponse.of("ANALYSIS_NOT_FOUND", e.getMessage());
+	}
+
+	// 저장 데이터 오류는 사용자 요청 오류가 아니므로 500으로 처리하고, 저장 원문·내부 예외 내용은 로그에만 남긴다
+	@ExceptionHandler(StoredDataException.class)
+	@ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+	public ErrorResponse handleStoredData(StoredDataException e) {
+		log.error(e.getMessage(), e);
+		return ErrorResponse.of("INTERNAL_ERROR", "서버 내부 오류가 발생했습니다.");
 	}
 
 	@ExceptionHandler(ConflictException.class)

@@ -1,15 +1,20 @@
 package com.focusrecovery.domain.analysis.repository;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 
+import com.focusrecovery.domain.analysis.dto.AnalysisSummaryResponse;
 import com.focusrecovery.domain.analysis.entity.AnalysisResult;
+import com.focusrecovery.domain.analysis.entity.AnalysisStatus;
 
 import jakarta.persistence.LockModeType;
 
@@ -20,6 +25,26 @@ public interface AnalysisResultRepository extends JpaRepository<AnalysisResult, 
 	Optional<AnalysisResult> findForUpdateByAnalysisId(UUID analysisId);
 
 	Optional<AnalysisResult> findByWindowId(UUID windowId);
+
+	// 목록·최신 상태는 큰 JSON 컬럼(input_snapshot 등)을 읽지 않도록 요약 필드만 조회한다. 최신 여부는 windowIndex로만 판단한다
+	@Query(value = """
+		select new com.focusrecovery.domain.analysis.dto.AnalysisSummaryResponse(
+			r.analysisId, r.windowId, w.windowIndex, r.processingStatus, r.result, r.pNormal, r.pTransition, r.pDrift,
+			r.requestedAt, r.analyzedAt, r.completedAt, r.errorCode)
+		from AnalysisResult r join AnalysisWindow w on w.windowId = r.windowId
+		where w.sessionId = :sessionId order by w.windowIndex desc""",
+		countQuery = """
+			select count(r) from AnalysisResult r join AnalysisWindow w on w.windowId = r.windowId
+			where w.sessionId = :sessionId""")
+	Page<AnalysisSummaryResponse> findSummariesBySessionId(UUID sessionId, Pageable pageable);
+
+	@Query("""
+		select new com.focusrecovery.domain.analysis.dto.AnalysisSummaryResponse(
+			r.analysisId, r.windowId, w.windowIndex, r.processingStatus, r.result, r.pNormal, r.pTransition, r.pDrift,
+			r.requestedAt, r.analyzedAt, r.completedAt, r.errorCode)
+		from AnalysisResult r join AnalysisWindow w on w.windowId = r.windowId
+		where w.sessionId = :sessionId and r.processingStatus = :status order by w.windowIndex desc""")
+	List<AnalysisSummaryResponse> findSummariesBySessionIdAndStatus(UUID sessionId, AnalysisStatus status, Pageable pageable);
 
 	// 조건부 갱신이라 그사이 완료·실패로 바뀐 분석은 건드리지 않는다
 	@Modifying
