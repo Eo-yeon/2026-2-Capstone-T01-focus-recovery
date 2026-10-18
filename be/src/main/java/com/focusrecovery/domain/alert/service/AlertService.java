@@ -24,6 +24,7 @@ import com.focusrecovery.domain.session.repository.WorkSessionRepository;
 import com.focusrecovery.domain.window.entity.AnalysisWindow;
 import com.focusrecovery.domain.window.repository.AnalysisWindowRepository;
 import com.focusrecovery.global.exception.ConflictException;
+import com.focusrecovery.global.exception.StoredDataException;
 
 // 알림 후보 생성. 후보 생성과 실제 표시는 별개이며, shownAt이 없는 후보는 표시된 것으로 보지 않는다.
 // 잠금 순서는 다른 쓰기와 같이 세션 → 나머지다(종료·방문 저장은 세션 쓰기 잠금, AI 후보는 세션 공유 잠금, 고정 주기는 세션 쓰기 잠금)
@@ -79,8 +80,20 @@ public class AlertService {
 	public AiDecision decideAiCandidate(UUID sessionId, UUID analysisId) {
 		WorkSession session = workSessionRepository.findForShareBySessionId(sessionId).orElse(null);
 		AnalysisResult analysis = analysisResultRepository.findForUpdateByAnalysisId(analysisId).orElse(null);
+		// windowIndex는 세션마다 따로 매겨지므로 번호 비교로는 소속을 알 수 없다. 분석 → 구간 → 세션 연결을
+		// windowIndex 비교·기존 후보 재사용보다 먼저 확인하며, 불일치는 조건 미충족이 아니라 데이터 정합성 오류다
+		AnalysisWindow window = analysis == null ? null
+			: analysisWindowRepository.findById(analysis.getWindowId()).orElseThrow();
+		if (window != null && !window.getSessionId().equals(sessionId)) {
+			throw new StoredDataException("분석이 요청한 세션에 속하지 않습니다. analysisId=" + analysisId
+				+ " sessionId=" + sessionId);
+		}
 		Optional<Notification> existing = notificationRepository.findByAnalysisId(analysisId);
 		if (existing.isPresent()) {
+			if (!existing.get().getSessionId().equals(sessionId)) {
+				throw new StoredDataException("기존 후보가 요청한 세션에 속하지 않습니다. analysisId=" + analysisId
+					+ " alertId=" + existing.get().getAlertId());
+			}
 			return AiDecision.created(existing.get(), false);
 		}
 		if (session == null || session.getStatus() != WorkSessionStatus.ACTIVE) {
@@ -93,7 +106,7 @@ public class AlertService {
 			|| !"DRIFT".equals(analysis.getResult())) {
 			return AiDecision.skipped("NOT_COMPLETED_DRIFT");
 		}
-		int windowIndex = analysisWindowRepository.findById(analysis.getWindowId()).orElseThrow().getWindowIndex();
+		int windowIndex = window.getWindowIndex();
 		if (latestWindowIndex(sessionId) != windowIndex) {
 			return AiDecision.skipped("NOT_LATEST_WINDOW");
 		}

@@ -1,6 +1,8 @@
 package com.focusrecovery.domain.alert;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.doAnswer;
@@ -8,6 +10,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.lang.reflect.InvocationTargetException;
@@ -63,6 +66,7 @@ import com.focusrecovery.domain.session.repository.WorkSessionRepository;
 import com.focusrecovery.domain.visit.repository.PageVisitRepository;
 import com.focusrecovery.domain.window.entity.AnalysisWindow;
 import com.focusrecovery.domain.window.repository.AnalysisWindowRepository;
+import com.focusrecovery.global.exception.StoredDataException;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
@@ -323,6 +327,82 @@ class AlertTaskRecoveryTest {
 			Thread.sleep(10);
 		}
 		assertThat(taskRow(analysisId)).isEqualTo(expected);
+	}
+
+	// 세션 A·B 모두 구간 1(같은 windowIndex)이 최신이며 COMPLETED·DRIFT다
+	private UUID[] twoSessionsWithSameWindowIndex() throws Exception {
+		UUID sessionA = sessionId;
+		UUID analysisA = driftOnLatestWindow();
+		UUID sessionB = workSessionRepository.save(WorkSession.start("다른 세션 목표", null)).getSessionId();
+		sessionId = sessionB;
+		UUID analysisB = driftOnLatestWindow();
+		sessionId = sessionA;
+		assertThat(analysisWindowRepository.findFirstBySessionIdOrderByWindowIndexDesc(sessionA).orElseThrow().getWindowIndex())
+			.isEqualTo(analysisWindowRepository.findFirstBySessionIdOrderByWindowIndexDesc(sessionB).orElseThrow().getWindowIndex());
+		return new UUID[] {sessionA, analysisA, sessionB, analysisB};
+	}
+
+	@Test
+	void 다른_세션의_분석으로는_windowIndex가_같아도_후보를_만들지_않는다() throws Exception {
+		UUID[] ids = twoSessionsWithSameWindowIndex();
+		Map<String, Object> analysisB = analysisRow(ids[3]);
+
+		assertThatThrownBy(() -> alertService.createAiCandidate(ids[0], ids[3]))
+			.isInstanceOf(StoredDataException.class)
+			.hasMessageContaining("세션에 속하지 않습니다");
+
+		assertThat(notificationCount()).isZero();
+		assertThat(analysisRow(ids[3])).isEqualTo(analysisB);
+		// 같은 세션 호출은 기존대로 동작한다
+		Notification a = alertService.createAiCandidate(ids[0], ids[1]).orElseThrow();
+		Notification b = alertService.createAiCandidate(ids[2], ids[3]).orElseThrow();
+		assertThat(a.getSessionId()).isEqualTo(ids[0]);
+		assertThat(b.getSessionId()).isEqualTo(ids[2]);
+		assertThat(notificationCount()).isEqualTo(2);
+	}
+
+	@Test
+	void 다른_세션의_기존_후보는_재사용하지_않고_변경하지도_않는다() throws Exception {
+		UUID[] ids = twoSessionsWithSameWindowIndex();
+		Notification b = alertService.createAiCandidate(ids[2], ids[3]).orElseThrow();
+		List<Map<String, Object>> notificationsBefore = jdbcTemplate.queryForList("select * from notification");
+		Map<String, Object> analysisB = analysisRow(ids[3]);
+
+		assertThatThrownBy(() -> alertService.createAiCandidate(ids[0], ids[3]))
+			.isInstanceOf(StoredDataException.class);
+
+		assertThat(jdbcTemplate.queryForList("select * from notification")).isEqualTo(notificationsBefore);
+		assertThat(analysisRow(ids[3])).isEqualTo(analysisB);
+		mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", ids[0]))
+			.andExpect(jsonPath("$.alert").value(nullValue()));
+		mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", ids[2]))
+			.andExpect(jsonPath("$.alert.alertId").value(b.getAlertId().toString()));
+	}
+
+	@Test
+	void 작업의_세션과_분석의_세션이_다르면_정합성_오류로_바로_FAILED이고_후보를_연결하지_않는다() throws Exception {
+		UUID[] ids = twoSessionsWithSameWindowIndex();
+		Notification b = alertService.createAiCandidate(ids[2], ids[3]).orElseThrow();
+		// 작업 행이 잘못된 세션(A)으로 기록된 상황(외래키는 모두 유효)
+		taskRepository.save(AlertCandidateTask.pending(ids[3], ids[0], now.get()));
+		List<Map<String, Object>> notificationsBefore = jdbcTemplate.queryForList("select * from notification");
+		Map<String, Object> analysisB = analysisRow(ids[3]);
+
+		processor.process(ids[3]);
+
+		AlertCandidateTask task = task(ids[3]);
+		assertThat(task.getStatus()).isEqualTo(AlertTaskStatus.FAILED);
+		assertThat(task.getErrorCode()).isEqualTo("ALERT_DATA_INTEGRITY_ERROR");
+		assertThat(task.getAttempts()).isEqualTo(1);
+		assertThat(task.getAlertId()).isNull();
+		assertThat(task.getSkipReason()).isNull();
+		assertThat(jdbcTemplate.queryForList("select * from notification")).isEqualTo(notificationsBefore);
+		assertThat(analysisRow(ids[3])).isEqualTo(analysisB);
+		assertThat(notificationRepository.findById(b.getAlertId()).orElseThrow().getSessionId()).isEqualTo(ids[2]);
+		// 재시도하지 않는다
+		now.set(now.get().plus(Duration.ofHours(1)));
+		processor.recover();
+		assertThat(task(ids[3]).getAttempts()).isEqualTo(1);
 	}
 
 	@Test

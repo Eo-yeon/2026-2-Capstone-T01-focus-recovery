@@ -22,6 +22,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import com.focusrecovery.domain.alert.entity.AlertCandidateTask;
 import com.focusrecovery.domain.alert.entity.AlertTaskStatus;
 import com.focusrecovery.domain.alert.repository.AlertCandidateTaskRepository;
+import com.focusrecovery.global.exception.StoredDataException;
 
 // AI 알림 후보 처리 작업 실행·복구. 후보 생성만 다시 시도하며 AI는 다시 호출하지 않는다.
 // 각 단계는 짧은 트랜잭션이다: 가져가기(PENDING→RUNNING) → 판단·기록(세션 → 분석 행 → 작업 행 순서로 잠금) → 오류 기록
@@ -31,6 +32,7 @@ public class AlertTaskProcessor {
 	static final String DB_ERROR = "ALERT_DB_ERROR";
 	static final String INTERNAL_ERROR = "ALERT_INTERNAL_ERROR";
 	static final String INTERRUPTED = "ALERT_TASK_INTERRUPTED";
+	static final String DATA_INTEGRITY_ERROR = "ALERT_DATA_INTEGRITY_ERROR";
 	private static final int BATCH = 100;
 
 	private static final Logger log = LoggerFactory.getLogger(AlertTaskProcessor.class);
@@ -126,10 +128,15 @@ public class AlertTaskProcessor {
 		} catch (OwnershipLostException e) {
 			// 후보 저장까지 롤백됐다. 작업은 새 소유자가 처리하므로 실패로 기록하지 않는다
 			log.warn(e.getMessage());
+		} catch (StoredDataException e) {
+			// 분석·후보의 세션 소속 불일치 등 데이터 정합성 오류: 재시도해도 같으므로 바로 FAILED로 확정한다
+			log.error("알림 후보 작업 데이터 정합성 오류 analysisId={}", analysisId, e);
+			recordFailure(analysisId, claim.attempt(), DATA_INTEGRITY_ERROR, true);
 		} catch (RuntimeException e) {
 			log.error("알림 후보 생성 실패 analysisId={} attempt={}", analysisId, claim.attempt(), e);
 			recordFailure(analysisId, claim.attempt(),
-				e instanceof DataAccessException || e instanceof TransactionException ? DB_ERROR : INTERNAL_ERROR);
+				e instanceof DataAccessException || e instanceof TransactionException ? DB_ERROR : INTERNAL_ERROR,
+				claim.attempt() >= properties.maxAttempts());
 		}
 	}
 
@@ -146,10 +153,10 @@ public class AlertTaskProcessor {
 	}
 
 	// 실패 기록도 DB의 현재 상태·시도 번호 조건으로 갱신한다. 기록마저 못 하면 RUNNING으로 남고 recoverStaleRunning이 다시 찾는다
-	private void recordFailure(UUID analysisId, int attempt, String errorCode) {
+	private void recordFailure(UUID analysisId, int attempt, String errorCode, boolean finalFailure) {
 		try {
 			transactionTemplate.executeWithoutResult(status -> {
-				if (attempt >= properties.maxAttempts()) {
+				if (finalFailure) {
 					taskRepository.markFailed(analysisId, attempt, errorCode, now());
 				} else {
 					taskRepository.markRetry(analysisId, attempt, errorCode, now().plus(retryDelay(attempt)));
