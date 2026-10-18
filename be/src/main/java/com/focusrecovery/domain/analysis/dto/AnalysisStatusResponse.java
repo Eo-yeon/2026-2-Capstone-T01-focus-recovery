@@ -3,6 +3,7 @@ package com.focusrecovery.domain.analysis.dto;
 import java.util.UUID;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.focusrecovery.domain.alert.dto.AlertResponse;
 import com.focusrecovery.domain.session.entity.WorkSessionStatus;
 
 import io.swagger.v3.oas.annotations.media.Schema;
@@ -20,9 +21,9 @@ public record AnalysisStatusResponse(
 		+ "latestAnalysis와 windowIndex가 다르면 이전 구간의 결과이며, 같아도 그것만으로 알림을 허용하지 않는다. 없으면 null",
 		nullable = true)
 	AnalysisSummaryResponse latestCompletedAnalysis,
-	@Schema(description = "알림 후보. 실제 알림 표시는 이 값을 기준으로 하며 FE는 표시 직전에 ACTIVE 세션·alertId 중복을 확인한다. "
-		+ "알림 기능은 아직 구현되지 않아 항상 null이며, 분석 결과가 DRIFT여도 이 응답만으로 알림을 표시하지 않는다",
-		types = {"object", "null"})
-	Object alert
+	@Schema(description = "실제 표시할 수 있는 알림 후보. 실제 알림 표시는 이 값을 기준으로 하며 FE는 표시 직전에 ACTIVE 세션·alertId 중복을 확인한다. "
+		+ "현재 활성화된 방식(서버 설정 AI 또는 FIXED_INTERVAL)의 미표시 후보만 반환한다. AI 후보는 실제 최신 구간의 DRIFT 분석에 연결된 것만 반환하며, "
+		+ "없거나 세션이 종료됐으면 null", nullable = true)
+	AlertResponse alert
 ) {
 }

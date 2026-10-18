@@ -11,6 +11,7 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.focusrecovery.domain.alert.service.AlertService;
 import com.focusrecovery.domain.analysis.dto.AnalysisDetailResponse;
 import com.focusrecovery.domain.analysis.dto.AnalysisPageResponse;
 import com.focusrecovery.domain.analysis.dto.AnalysisStatusResponse;
@@ -39,24 +40,27 @@ public class AnalysisQueryService {
 	private final AnalysisWindowRepository analysisWindowRepository;
 	private final PageVisitRepository pageVisitRepository;
 	private final StoredJsonReader storedJsonReader;
+	private final AlertService alertService;
 
 	public AnalysisQueryService(WorkSessionRepository workSessionRepository,
 		AnalysisResultRepository analysisResultRepository, AnalysisWindowRepository analysisWindowRepository,
-		PageVisitRepository pageVisitRepository, StoredJsonReader storedJsonReader) {
+		PageVisitRepository pageVisitRepository, StoredJsonReader storedJsonReader, AlertService alertService) {
 		this.workSessionRepository = workSessionRepository;
 		this.analysisResultRepository = analysisResultRepository;
 		this.analysisWindowRepository = analysisWindowRepository;
 		this.pageVisitRepository = pageVisitRepository;
 		this.storedJsonReader = storedJsonReader;
+		this.alertService = alertService;
 	}
 
-	// 최신 여부는 windowIndex로만 판단한다(완료 시각·응답 도착 순서 무관). 알림은 별도 기능이라 항상 null
+	// 최신 여부는 windowIndex로만 판단한다(완료 시각·응답 도착 순서 무관). alert는 읽기만 하며 후보를 만들지 않는다
 	public AnalysisStatusResponse status(UUID sessionId) {
 		WorkSession session = workSessionRepository.findById(sessionId).orElseThrow(SessionNotFoundException::new);
 		AnalysisSummaryResponse latest = first(analysisResultRepository.findSummariesBySessionId(sessionId, FIRST).getContent());
 		AnalysisSummaryResponse latestCompleted = first(
 			analysisResultRepository.findSummariesBySessionIdAndStatus(sessionId, AnalysisStatus.COMPLETED, FIRST));
-		return new AnalysisStatusResponse(sessionId, session.getStatus(), latest, latestCompleted, null);
+		return new AnalysisStatusResponse(sessionId, session.getStatus(), latest, latestCompleted,
+			alertService.currentCandidate(session));
 	}
 
 	public AnalysisPageResponse list(UUID sessionId, int page, int size) {
