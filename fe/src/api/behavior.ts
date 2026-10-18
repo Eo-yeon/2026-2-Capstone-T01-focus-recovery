@@ -21,7 +21,7 @@ export function coversBehavior(server: UpdateVisitBehaviorRequest, request: Upda
 export function matchesBehaviorResponse(value: unknown, visitId: string, request: UpdateVisitBehaviorRequest): value is VisitBehaviorResponse {
   if (!validBehavior(value)) return false;
   const v = value as VisitBehaviorResponse;
-  return v.visitId === visitId && typeof v.applied === 'boolean' && (v.updatedAt === null || validTime(v.updatedAt))
+  return v.visitId === visitId && typeof v.applied === 'boolean' && (validTime(v.updatedAt) || (!v.applied && v.updatedAt === null))
     && (v.applied ? sameBehavior(v, request) : coversBehavior(v, request));
 }
 const codes = ['INVALID_REQUEST', 'SESSION_NOT_FOUND', 'VISIT_NOT_FOUND', 'SESSION_ENDED', 'BEHAVIOR_VERSION_CONFLICT', 'BEHAVIOR_COUNTER_DECREASED'];

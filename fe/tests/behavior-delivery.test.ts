@@ -173,4 +173,92 @@ describe('behavior delivery ordering and recovery', () => {
     expect(delivery.hasUnconfirmed()).toBe(true); expect(delivery.status().blocked).toContain('저장하지 못했습니다');
   });
 
+  it('B-2: keeps attempt 3 interrupted after two failures unconfirmed until explicit retry', async () => {
+    const { delivery, send, posts, collect, visit } = setup(), pending = gate<ReturnType<typeof ack>>();
+    send.mockRejectedValueOnce(new VisitApiError('network', '첫 실패', true))
+      .mockRejectedValueOnce(new VisitApiError('timeout', '둘째 실패', true)).mockImplementationOnce(() => pending.promise);
+    collect(); delivery.kick(); await flush(); await vi.advanceTimersByTimeAsync(3000); await flush();
+    expect(send).toHaveBeenCalledTimes(3);
+    const saved = structuredClone(delivery.checkpoint);
+    expect(saved.entries[0]).toMatchObject({ phase: 'sending', attempts: 3, request: latest() });
+    delivery.clear();
+    const replay = vi.fn(async (_s: string, id: string, value: VisitBehavior) => ({ ...ack(id, value), applied: false }));
+    const restored = new BehaviorDelivery(serial(), () => true, replay); restored.restore(saved, posts.checkpoint.entries);
+    restored.collect([{ ...visit, ...latest(2) }], posts.checkpoint.entries); restored.kick(); await flush();
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(replay).not.toHaveBeenCalled();
+    expect(restored.status().visits[0]).toMatchObject({ phase: 'failed', attempts: 3, request: latest(), latest: latest(2), retryable: true });
+    expect(restored.status().visits[0].error).toContain('서버에 반영되었을 수');
+    expect(restored.hasUnconfirmed()).toBe(true);
+    restored.retry(); restored.kick(); await flush();
+    expect(replay.mock.calls.map(c => c[2])).toEqual([latest(), latest(2)]);
+    expect(restored.hasUnconfirmed()).toBe(false);
+    pending.resolve(ack(visit.visitId, latest())); await flush();
+  });
+  it('B-3: repeated interruptions consume one budget across Worker lifetimes without reset or unbounded sends', async () => {
+    const { delivery, collect, posts } = setup(); collect();
+    let checkpoint = structuredClone(delivery.checkpoint);
+    const requests: VisitBehavior[] = [];
+    for (let restart = 0; restart < 6; restart++) {
+      const worker = new BehaviorDelivery(serial(), () => true, async (_s, _id, value) => {
+        requests.push(value); return new Promise(() => {});
+      });
+      worker.restore(checkpoint, posts.checkpoint.entries); worker.kick(); await flush();
+      checkpoint = structuredClone(worker.checkpoint);
+      expect(checkpoint.entries[0].attempts).toBe(Math.min(restart + 1, 3));
+      expect(checkpoint.entries[0].request).toEqual(latest());
+      worker.clear();
+    }
+    expect(requests).toEqual([latest(), latest(), latest()]);
+    expect(checkpoint.entries[0]).toMatchObject({ phase: 'failed', attempts: 3, retryable: true });
+  });
+
+  it.each(['queued', 'retry-wait', 'sending'] as const)('also holds exhausted legacy %s checkpoints without resetting their attempt count', async phase => {
+    const { delivery, collect, posts } = setup(); collect();
+    const saved = structuredClone(delivery.checkpoint);
+    Object.assign(saved.entries[0], { phase, attempts: 4, request: latest(), nextRetryAt: Date.now() + 1000 });
+    const send = vi.fn(), restored = new BehaviorDelivery(serial(), () => true, send);
+    restored.restore(saved, posts.checkpoint.entries); restored.kick(); await flush(); await vi.advanceTimersByTimeAsync(10000);
+    expect(send).not.toHaveBeenCalled(); expect(restored.status().visits[0]).toMatchObject({ phase: 'failed', attempts: 4, request: latest(), retryable: true });
+    expect(restored.status().visits[0].nextRetryAt).toBeUndefined();
+  });
+  it('continues another visit while an interrupted request has exhausted its budget', async () => {
+    const { delivery, collect, posts, visit } = setup(), second = pageVisit(2); collect();
+    const saved = structuredClone(delivery.checkpoint); Object.assign(saved.entries[0], { phase: 'sending', attempts: 3, request: latest() });
+    posts.collect([second]); posts.checkpoint.entries[1].phase = 'acked';
+    const send = vi.fn(async (_s: string, id: string, value: VisitBehavior) => ack(id, value));
+    const restored = new BehaviorDelivery(serial(), () => true, send); restored.restore(saved, posts.checkpoint.entries);
+    restored.collect([{ ...visit, ...latest() }, { ...second, ...latest(2) }], posts.checkpoint.entries); restored.kick(); await flush();
+    expect(send).toHaveBeenCalledExactlyOnceWith(second.sessionId, second.visitId, latest(2));
+    expect(restored.status().visits.map(e => e.phase)).toEqual(['failed', 'acked']);
+  });
+
+  it('restores the POST dependency, accepts its HTTP 200 replay, then sends PATCH only after ACK', async () => {
+    const original = pageVisit(), postGate = gate<void>(), queue = serial();
+    const seedPost = new VisitDelivery(queue, () => false); seedPost.collect([original]);
+    Object.assign(seedPost.checkpoint.entries[0], { phase: 'sending', attempts: 1 });
+    const seedBehavior = new BehaviorDelivery(queue, () => false);
+    seedBehavior.collect([{ ...original, ...latest() }], seedPost.checkpoint.entries);
+    const posts = new VisitDelivery(queue, () => true);
+    posts.restore(structuredClone(seedPost.checkpoint));
+    const delivery = new BehaviorDelivery(queue, () => posts.checkpoint.entries[0].phase === 'acked');
+    delivery.restore(structuredClone(seedBehavior.checkpoint), posts.checkpoint.entries);
+    const fetcher = vi.fn(async (_url: string, init: RequestInit) => {
+      if (init.method === 'POST') { await postGate.promise; return new Response(JSON.stringify({ ...original, updatedAt: null }), { status: 200 }); }
+      expect(posts.status().visits[0].phase).toBe('acked');
+      return new Response(JSON.stringify(ack(original.visitId, JSON.parse(init.body as string))), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetcher);
+    try {
+      posts.kick(); delivery.kick(); await flush();
+      expect(fetcher.mock.calls.map(c => c[1].method)).toEqual(['POST']);
+      expect(delivery.status().visits[0].phase).toBe('waiting-post');
+      postGate.resolve(); await flush();
+      expect(posts.status().visits[0].phase).toBe('acked');
+      delivery.collect([{ ...original, ...latest() }], posts.checkpoint.entries); delivery.kick(); await flush();
+      expect(fetcher.mock.calls.map(c => c[1].method)).toEqual(['POST', 'PATCH']);
+      expect(delivery.status().visits[0]).toMatchObject({ phase: 'acked', ack: latest() });
+    } finally { vi.unstubAllGlobals(); }
+  });
+
 });

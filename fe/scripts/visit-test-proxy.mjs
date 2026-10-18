@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 export async function visitTestProxy(apiOrigin) {
   let arm, behaviorArm;
   const held = new Set();
-  const proxy = { requests: [], behaviorRequests: [], sessionRequests: 0, failVisits: false, onVisit: async () => undefined };
+  const proxy = { requests: [], behaviorRequests: [], sessionRequests: 0, failVisits: false, failBehaviors: 0, onVisit: async () => undefined };
   const server = createServer(async (req, res) => {
     try {
       const chunks = []; for await (const chunk of req) chunks.push(chunk);
@@ -21,6 +21,10 @@ export async function visitTestProxy(apiOrigin) {
       if (record && proxy.failVisits) {
         // An explicit injected transport failure, never reported as a real BE result.
         record.status = 503; record.injected = true;
+        res.writeHead(503, { 'Content-Type': 'application/json' }); res.end('{}'); return;
+      }
+      if (behavior && proxy.failBehaviors > 0) {
+        proxy.failBehaviors--; behavior.status = 503; behavior.injected = true; behavior.delivered = true;
         res.writeHead(503, { 'Content-Type': 'application/json' }); res.end('{}'); return;
       }
       const headers = { 'Content-Type': 'application/json' };

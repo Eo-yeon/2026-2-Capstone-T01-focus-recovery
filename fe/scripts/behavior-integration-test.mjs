@@ -1,4 +1,4 @@
-// Real Chrome events and HTTP → disposable Spring Boot/MySQL. No collector or API mocks.
+// Real Chrome events → disposable Spring Boot/MySQL; only explicitly counted proxy 503 faults are injected.
 import { chromium } from 'playwright';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -45,10 +45,10 @@ try {
   await popup.goto(`chrome-extension://${worker.url().split('/')[2]}/popup.html`);
   const request = value => popup.evaluate(value => chrome.runtime.sendMessage(value), value);
   const status = async () => { const reply = await request({ type: 'status' }); assert.equal(reply.ok, true); return reply.status; };
-  async function until(check) {
+  async function until(check, allowFailure = false) {
     for (let n = 0; n < 150; n++) {
       const state = await status(); assert.equal(state.visitDelivery.blocked, undefined); assert.equal(state.behaviorDelivery.blocked, undefined);
-      assert.equal(state.behaviorDelivery.visits.some(e => e.phase === 'failed'), false, 'behavior delivery must not fail');
+      if (!allowFailure) assert.equal(state.behaviorDelivery.visits.some(e => e.phase === 'failed'), false, 'behavior delivery must not fail');
       if (check(state)) return state;
       await wait(100);
     }
@@ -79,7 +79,13 @@ try {
       assert.fail('Worker target was not terminated');
     } finally { await connection.detach(); }
   }
-  for (const holdPost of [false, true]) {
+  for (const { label, holdPost, failures, interruptions } of [
+    { label: 'B-1 normal POST ACK', holdPost: false, failures: 0, interruptions: 1 },
+    { label: 'B-1 held POST ACK', holdPost: true, failures: 0, interruptions: 1 },
+    { label: 'B-2 third attempt interruption', holdPost: false, failures: 2, interruptions: 1 },
+    { label: 'B-3 repeated interruptions', holdPost: false, failures: 0, interruptions: 3 },
+  ]) {
+    proxy.failBehaviors = failures;
     // Chrome's tab removal and replacement activation can finalize A before its switch count arrives.
     const a = await context.newPage(); await a.goto(`${origin}/a`); await a.bringToFront();
     const started = await request({ type: 'start', goalText: '공개 합성 문서의 행동 누적값 통합 검증하기' }); assert.equal(started.ok, true);
@@ -97,9 +103,16 @@ try {
     await until(s => s.readyVisits[0]?.tabSwitchCount > post.body.tabSwitchCount);
     if (holdPost) {
       assert.equal(proxy.behaviorRequests.filter(r => r.sessionId === sessionId).length, 0, 'no PATCH before POST ACK');
+      assert.equal((await db(visitId)).updatedAt, 'NULL');
+      for (const version of [post.body.behaviorVersion, post.body.behaviorVersion - 1]) {
+        const initialReplay = await patch(sessionId, visitId, { ...values(post.body), behaviorVersion: version });
+        assert.equal(initialReplay.status, 200); assert.equal(initialReplay.body.applied, false);
+        assert.equal(initialReplay.body.updatedAt, null, 'initial POST can have null time even when returning a higher version');
+        assert.deepEqual(values(initialReplay.body), values(post.body));
+      }
       committed.release();
     }
-    const patchHold = await deadline(heldPatch);
+    let patchHold = await deadline(heldPatch);
     assert.equal(patchHold.record.status, 200); assert.equal(patchHold.record.response.applied, true); assert.equal(patchHold.record.delivered, false);
     assert.deepEqual(Object.keys(patchHold.record.body).sort(), ['activeDurationMs', 'behaviorVersion', 'tabSwitchCount']);
     assert.ok(patchHold.record.body.tabSwitchCount > post.body.tabSwitchCount);
@@ -107,13 +120,53 @@ try {
     assert.deepEqual(values(await db(visitId)), patchHold.record.body);
     assert.equal((await request({ type: 'stop' })).ok, true);
     assert.equal((await request({ type: 'start', goalText: '미확인 행동 갱신 중 신규 세션' })).ok, false);
-    await restart();
-    patchHold.release();
+    const firstSnapshot = structuredClone(patchHold.record.body), committedState = await db(visitId);
+    const firstAttempt = failures + 1;
+    for (let interrupt = 0; interrupt < interruptions; interrupt++) {
+      const expectedAttempt = firstAttempt + interrupt;
+      const saved = await popup.evaluate(() => chrome.storage.session.get('behaviorDelivery').then(s => s.behaviorDelivery));
+      const current = saved.entries.find(e => e.visitId === visitId);
+      assert.equal(current.phase, 'sending'); assert.equal(current.attempts, expectedAttempt);
+      assert.deepEqual(current.request, firstSnapshot);
+      const holdAgain = interrupt + 1 < interruptions ? proxy.holdNextBehavior(visitId) : undefined;
+      await restart(); patchHold.release();
+      if (holdAgain) {
+        await status();
+        patchHold = await deadline(holdAgain);
+        assert.equal(patchHold.record.response.applied, false);
+        assert.deepEqual(await db(visitId), committedState);
+      }
+    }
+    const exhausted = firstAttempt + interruptions - 1 >= 3;
+    if (exhausted) {
+      const failed = await until(s => s.behaviorDelivery.visits[0]?.phase === 'failed', true);
+      assert.equal(failed.behaviorDelivery.visits[0].attempts, 3);
+      assert.equal(failed.behaviorDelivery.visits[0].retryable, true);
+      assert.match(failed.behaviorDelivery.visits[0].error, /서버에 반영되었을 수/);
+      assert.deepEqual(failed.behaviorDelivery.visits[0].request, firstSnapshot);
+      const attemptsBefore = proxy.behaviorRequests.filter(r => r.visitId === visitId).length;
+      assert.equal(attemptsBefore, 3);
+      for (let repeat = 0; repeat < 2; repeat++) {
+        await restart(); await status(); await wait(1100); await status();
+      }
+      assert.equal(proxy.behaviorRequests.filter(r => r.visitId === visitId).length, attemptsBefore, 'no extra automatic requests after budget exhaustion');
+      assert.equal((await request({ type: 'start', goalText: '예산 소진 후 새 세션 차단' })).ok, false);
+      await popup.reload();
+      await popup.getByRole('button', { name: '같은 행동 갱신 재시도', exact: true }).waitFor();
+      assert.equal(await popup.getByRole('button', { name: '같은 행동 갱신 재시도', exact: true }).isEnabled(), true);
+      await popup.getByText(/마지막 요청은 서버에 반영되었을 수 있습니다/).waitFor();
+      await popup.getByRole('button', { name: '같은 행동 갱신 재시도', exact: true }).click();
+    }
     const done = await until(s => s.behaviorDelivery.visits.every(e => e.phase === 'acked'));
     assert.equal(done.session, null);
     const attempts = proxy.behaviorRequests.filter(r => r.visitId === visitId);
-    assert.equal(attempts.length, 2); assert.deepEqual(attempts.map(r => r.body), [patchHold.record.body, patchHold.record.body]);
-    assert.deepEqual(attempts.map(r => r.response.applied), [true, false]);
+    assert.equal(attempts.length, exhausted ? 4 : 2);
+    assert.equal(attempts.every(r => JSON.stringify(r.body) === JSON.stringify(firstSnapshot)), true, 'all attempts preserve the original snapshot');
+    const realAttempts = attempts.filter(r => !r.injected);
+    assert.equal(attempts.filter(r => r.injected).length, failures);
+    assert.deepEqual(realAttempts.map(r => r.response.applied), [true, ...Array(realAttempts.length - 1).fill(false)]);
+    for (const record of realAttempts) assert.match(record.response.updatedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.deepEqual(await db(visitId), committedState, 'replay and manual retry never update the already committed behavior/time');
     const stored = await db(visitId), entry = done.behaviorDelivery.visits.find(e => e.visitId === visitId);
     assert.deepEqual(values(stored), entry.ack); assert.deepEqual(entry.ack, entry.latest);
     const duplicate = await patch(sessionId, visitId, entry.ack); assert.equal(duplicate.status, 200); assert.equal(duplicate.body.applied, false);
@@ -126,7 +179,7 @@ try {
     assert.equal(decrease.status, 409); assert.equal(decrease.body.code, 'BEHAVIOR_COUNTER_DECREASED');
     assert.deepEqual(await db(visitId), stored);
     await restart(); assert.deepEqual((await status()).behaviorDelivery.visits.find(e => e.visitId === visitId).ack, entry.ack);
-    console.log(`PASS ${holdPost ? 'held POST ACK' : 'normal POST ACK'}: real Chrome dwell/tab close/replacement activation → POST ACK → PATCH; MySQL counters/version; committed PATCH response loss + Worker restart identical replay applied=false; final local stop ACK; duplicate/stale preserve DB; real 409 codes; ACK recovery`);
+    console.log(`PASS ${label}: real Chrome → POST ACK → PATCH/SQL; ${failures} injected 503 failures, ${interruptions} actual Worker interruption(s); preserved attempts/snapshot, ${exhausted ? 'automatic budget stops at 3, two more restarts send nothing, explicit retry' : 'automatic identical replay'}; no duplicate DB/time updates; final ACK; real 409/stale contract`);
   }
 } finally {
   await context?.close(); await proxy.close(); await new Promise(resolve => fixture.close(resolve)); await rm(root, { recursive: true, force: true });

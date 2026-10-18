@@ -1242,4 +1242,40 @@ describe('behavior PATCH integration in Background', () => {
     await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.behaviorDelivery!.visits[0].phase).toBe('acked'));
     expect(memory.behaviorDelivery.entries[0].ack).toEqual(snapshot);
   });
+  it('never ACKs applied=true with a null timestamp in the real Background adapter', async () => {
+    const run = await prepare();
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.visitDelivery!.visits[0].phase).toBe('acked'));
+    vi.mocked(fetch).mockImplementation(async (_url, init) => new Response(JSON.stringify({ visitId: run.original.visitId,
+      ...JSON.parse(init!.body as string), applied: true, updatedAt: null })));
+    await run.activate(); await message({ type: 'stop' });
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.behaviorDelivery!.visits[0]).toMatchObject({ phase: 'failed', retryable: false }));
+    expect(memory.behaviorDelivery.entries[0].ack.tabSwitchCount).toBe(0);
+    expect(memory.behaviorDelivery.entries[0].latest.tabSwitchCount).toBe(1);
+    expect((await message({ type: 'start', goalText: '잘못된 ACK 이후 새 세션' })).ok).toBe(false);
+  });
+  it.each(['POST', 'PATCH'])('restores exhausted %s as unconfirmed, blocks new sessions, and only sends on explicit retry', async method => {
+    const run = await prepare(method === 'POST', true); await run.activate();
+    if (method === 'PATCH') await vi.waitFor(() => expect(run.requests).toHaveLength(2));
+    await message({ type: 'stop' });
+    const key = method === 'POST' ? 'visitDelivery' : 'behaviorDelivery';
+    // Model a durable checkpoint taken during the third request; actual attempts are exercised in delivery tests.
+    memory[key].entries[0].attempts = 3;
+    const snapshot = structuredClone(method === 'POST' ? memory[key].entries[0].visit : memory[key].entries[0].request);
+    const before = run.requests.length;
+    await reloadWorker(); await message({ type: 'status' });
+    await vi.waitFor(() => expect(memory[key].entries[0]).toMatchObject({ phase: 'failed', attempts: 3, retryable: true }));
+    await reloadWorker(); await message({ type: 'status' });
+    expect(run.requests).toHaveLength(before);
+    expect((await message({ type: 'start', goalText: '시도 소진 후 신규 세션' })).ok).toBe(false);
+    if (method === 'POST') expect(memory.behaviorDelivery.entries[0].phase).toBe('waiting-post');
+    else expect(memory.behaviorDelivery.entries[0].ack.tabSwitchCount).toBe(0);
+    expect(memory[key].entries[0].error).toContain('서버에 반영되었을 수');
+    await message({ type: method === 'POST' ? 'retry-visits' : 'retry-behaviors' });
+    await vi.waitFor(() => expect(run.requests).toHaveLength(before + 1));
+    expect(run.requests.at(-1)!.body).toEqual(method === 'POST' ? Object.fromEntries(Object.entries(snapshot).filter(([key]) => key !== 'sessionId')) : snapshot);
+    run.releasePost(); run.releasePatch();
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.behaviorDelivery!.visits[0].phase).toBe('acked'));
+    expect(memory.visitDelivery.entries[0].phase).toBe('acked');
+  });
+
 });

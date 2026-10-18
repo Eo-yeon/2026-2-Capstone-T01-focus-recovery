@@ -1,3 +1,4 @@
+import { MAX_DELIVERY_ATTEMPTS, stopExhaustedDelivery } from './delivery-retry';
 import { API_BASE_URL } from '../api/client';
 import { savePageVisit, VisitApiError } from '../api/visit';
 import { UUID } from '../api/session';
@@ -6,7 +7,6 @@ import type { VisitBehavior, PageVisit, VisitDeliveryStatus } from '../shared/ty
 
 type Entry = { visit: PageVisit; serverBehavior?: VisitBehavior } & VisitDeliveryStatus['visits'][number];
 interface Checkpoint { apiBaseUrl: string; entries: Entry[] }
-const MAX_ATTEMPTS = 3;
 function isSnapshot(visit: PageVisit) {
   return visit && typeof visit.visitId === 'string' && UUID.test(visit.visitId)
     && typeof visit.sessionId === 'string' && UUID.test(visit.sessionId)
@@ -82,6 +82,7 @@ export class VisitDelivery {
           if (this.blocked || !this.canSend()) return;
           const first = this.checkpoint.entries.find(entry => entry.phase !== 'acked');
           if (!first || first.phase === 'failed' || first.phase === 'sending') return;
+          if (stopExhaustedDelivery(first)) return;
           if (first.phase === 'retry-wait' && first.nextRetryAt! > Date.now()) {
             this.timer = setTimeout(() => this.kick(), first.nextRetryAt! - Date.now());
             return;
@@ -107,7 +108,8 @@ export class VisitDelivery {
             entry.phase = 'acked'; delete entry.error; delete entry.code; delete entry.nextRetryAt; delete entry.retryable;
           } else {
             entry.error = failure.message; entry.code = failure.code; entry.retryable = failure.retryable;
-            entry.phase = failure.retryable && entry.attempts < MAX_ATTEMPTS ? 'retry-wait' : 'failed';
+            entry.phase = failure.retryable && entry.attempts < MAX_DELIVERY_ATTEMPTS ? 'retry-wait' : 'failed';
+            if (failure.retryable && stopExhaustedDelivery(entry)) entry.error = `${failure.message} ${entry.error}`;
             if (entry.phase === 'retry-wait') entry.nextRetryAt = Date.now() + 1000 * entry.attempts;
           }
         });

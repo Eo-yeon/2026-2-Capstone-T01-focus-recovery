@@ -1,3 +1,4 @@
+import { MAX_DELIVERY_ATTEMPTS, stopExhaustedDelivery } from './delivery-retry';
 import { API_BASE_URL } from '../api/client';
 import { behaviorSnapshot, coversBehavior, sameBehavior, updateVisitBehavior, validBehavior } from '../api/behavior';
 import { VisitApiError } from '../api/visit';
@@ -88,6 +89,7 @@ export class BehaviorDelivery {
       while (true) {
         const entry = await this.mutate(() => {
           if (this.blocked) return;
+          for (const entry of this.checkpoint.entries) if (this.eligible(entry)) stopExhaustedDelivery(entry);
           const pending = this.checkpoint.entries.filter(e => this.eligible(e));
           const next = pending.find(e => e.phase === 'queued' || e.nextRetryAt! <= Date.now());
           if (!next) {
@@ -112,7 +114,8 @@ export class BehaviorDelivery {
           if (!this.checkpoint.entries.includes(entry)) return;
           if (failure) {
             entry.error = failure.message; entry.code = failure.code; entry.retryable = failure.retryable;
-            entry.phase = failure.retryable && entry.attempts < 3 ? 'retry-wait' : 'failed';
+            entry.phase = failure.retryable && entry.attempts < MAX_DELIVERY_ATTEMPTS ? 'retry-wait' : 'failed';
+            if (failure.retryable && stopExhaustedDelivery(entry)) entry.error = `${failure.message} ${entry.error}`;
             if (entry.phase === 'retry-wait') entry.nextRetryAt = Date.now() + 1000 * entry.attempts;
           } else {
             if (!entry.ack || coversBehavior(ack!, entry.ack)) entry.ack = ack;

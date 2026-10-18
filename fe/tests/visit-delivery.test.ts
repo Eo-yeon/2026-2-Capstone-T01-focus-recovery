@@ -192,16 +192,22 @@ describe('checkpoint restoration boundaries', () => {
     expect(send.mock.calls[0][0]).toEqual(checkpoint.entries[0].visit);
     expect(delivery.status().visits.every(visit => visit.phase === 'acked')).toBe(true);
   });
-  it('replays an uncertain last sending attempt once, then preserves a failed state instead of looping', async () => {
+  it('holds an uncertain last sending attempt for explicit retry without exceeding the automatic budget', async () => {
     const checkpoint = saved('sending'); checkpoint.entries[0].attempts = 3;
     const send = vi.fn().mockRejectedValue(new VisitApiError('network', '응답 미확인', true));
     const delivery = new VisitDelivery(mutationExecutor(), () => true, send);
     delivery.restore(structuredClone(checkpoint)); delivery.kick(); await flush();
-    expect(send).toHaveBeenCalledExactlyOnceWith(checkpoint.entries[0].visit);
-    expect(delivery.status().visits[0]).toMatchObject({ phase: 'failed', attempts: 4, retryable: true });
+    expect(send).not.toHaveBeenCalled();
+    expect(delivery.status().visits[0]).toMatchObject({ phase: 'failed', attempts: 3, retryable: true });
+    expect(delivery.status().visits[0].error).toContain('서버에 반영되었을 수');
     const restored = new VisitDelivery(mutationExecutor(), () => true, send);
     restored.restore(structuredClone(delivery.checkpoint)); restored.kick(); await vi.advanceTimersByTimeAsync(60000); await flush();
-    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
+    expect(restored.checkpoint.entries[0].visit).toEqual(checkpoint.entries[0].visit);
+    send.mockImplementation(async (visit: PageVisit) => response(visit));
+    restored.retry(); restored.kick(); await flush();
+    expect(send.mock.calls[0][0]).toEqual(checkpoint.entries[0].visit);
+    expect(restored.status().visits.every(visit => visit.phase === 'acked')).toBe(true);
   });
   it.each(['visit-id', 'sequence', 'mixed-session', 'url', 'time', 'retry-time', 'ack-order'] as const)('blocks %s corruption without rewriting or sending the record', async corruption => {
     const checkpoint = saved('queued');
@@ -218,4 +224,32 @@ describe('checkpoint restoration boundaries', () => {
     expect(delivery.status().blocked).toBeTruthy(); expect(send).not.toHaveBeenCalled();
     expect(checkpoint).toEqual(raw);
   });
+  it('bounds POST sends across repeated sending interruptions and preserves sequential dependents', async () => {
+    let checkpoint = saved('queued');
+    const requests: PageVisit[] = [];
+    for (let restart = 0; restart < 6; restart++) {
+      const worker = new VisitDelivery(mutationExecutor(), () => true, async visit => { requests.push(visit); return new Promise(() => {}); });
+      worker.restore(checkpoint); worker.kick(); await flush();
+      checkpoint = structuredClone(worker.checkpoint);
+      expect(checkpoint.entries[0].attempts).toBe(Math.min(restart + 1, 3));
+      expect(checkpoint.entries[1]).toMatchObject({ phase: 'queued', attempts: 0 });
+      worker.clear();
+    }
+    expect(requests).toEqual(Array.from({ length: 3 }, () => checkpoint.entries[0].visit));
+    expect(checkpoint.entries[0]).toMatchObject({ phase: 'failed', retryable: true });
+  });
+
+  it('preserves the third POST after two failures and holds later visits on recovery', async () => {
+    const original = pageVisit(), send = vi.fn().mockRejectedValueOnce(new VisitApiError('network', '첫 실패', true))
+      .mockRejectedValueOnce(new VisitApiError('timeout', '둘째 실패', true)).mockImplementationOnce(() => new Promise(() => {}));
+    const delivery = new VisitDelivery(mutationExecutor(), () => true, send);
+    delivery.collect([original, pageVisit(2)]); delivery.kick(); await flush(); await vi.advanceTimersByTimeAsync(3000); await flush();
+    expect(send.mock.calls.map(c => c[0])).toEqual([original, original, original]);
+    const checkpoint = structuredClone(delivery.checkpoint); expect(checkpoint.entries[0]).toMatchObject({ phase: 'sending', attempts: 3 }); delivery.clear();
+    const replay = vi.fn(), restored = new VisitDelivery(mutationExecutor(), () => true, replay); restored.restore(checkpoint); restored.kick(); await flush();
+    expect(replay).not.toHaveBeenCalled(); expect(restored.hasUnconfirmed()).toBe(true);
+    expect(restored.status().visits.map(e => e.phase)).toEqual(['failed', 'queued']);
+    expect(restored.checkpoint.entries[0].visit).toEqual(original);
+  });
+
 });

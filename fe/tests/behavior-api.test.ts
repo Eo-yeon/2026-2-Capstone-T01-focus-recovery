@@ -20,6 +20,7 @@ describe('behavior PATCH contract', () => {
     { applied: true }, { applied: false }, { applied: false, updatedAt: null },
     { applied: false, behaviorVersion: 5, activeDurationMs: 12000, tabSwitchCount: 2 },
     { applied: false, behaviorVersion: 5 },
+    { applied: false, behaviorVersion: 5, updatedAt: null },
   ])('accepts exact or monotonically superseding server state: %j', async overrides => {
     vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify(response(overrides)), { status: 200 }));
     expect(await call()).toEqual(response(overrides));
@@ -32,6 +33,10 @@ describe('behavior PATCH contract', () => {
     });
   }
   it.each([
+    { applied: true, updatedAt: null },
+    { updatedAt: '2026-10-18T10:00:00Z' }, { updatedAt: '2026-10-18T10:00:00.1Z' },
+    { updatedAt: '2026-10-18T10:00:00.0000Z' }, { updatedAt: '2026-10-18T10:00:00.000+00:00' },
+    { updatedAt: '2026-13-18T10:00:00.000Z' },
     { visitId: 'foreign-id' }, { applied: 'true' }, { updatedAt: '2026-10-18T10:00:00+09:00' }, { updatedAt: '2026-02-30T10:00:00.000Z' },
     { activeDurationMs: '8000' }, { tabSwitchCount: -1 }, { tabSwitchCount: 2147483648 }, { behaviorVersion: 1.5 }, { behaviorVersion: Number.MAX_SAFE_INTEGER + 1 },
     { applied: true, behaviorVersion: 4 }, { applied: true, activeDurationMs: 9000 }, { applied: true, tabSwitchCount: 2 },
