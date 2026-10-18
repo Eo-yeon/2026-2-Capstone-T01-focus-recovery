@@ -41,7 +41,9 @@ beforeEach(async () => {
     scripting: { getRegisteredContentScripts: vi.fn(async () => []), unregisterContentScripts: vi.fn(async () => undefined), registerContentScripts: vi.fn(async () => undefined), executeScript: vi.fn(async () => undefined) },
     webNavigation: { getFrame: vi.fn(async () => frame), onCommitted: chromeEvent(), onHistoryStateUpdated: chromeEvent(), onErrorOccurred: chromeEvent() },
   };
-  vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify({ ...serverSession(JSON.parse(init.body as string).goalText), sessionId: SERVER_SESSION_ID }), { status: 201 })));
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => new Response(JSON.stringify(url.endsWith('/visits')
+    ? { ...JSON.parse(init.body as string), sessionId: SERVER_SESSION_ID, updatedAt: null }
+    : { ...serverSession(JSON.parse(init.body as string).goalText), sessionId: SERVER_SESSION_ID }), { status: 201 })));
   vi.stubGlobal('chrome', api);
   await import('../src/background/index');
 });
@@ -168,7 +170,12 @@ describe('background Chrome adapter', () => {
     clock.mockReturnValue(20000);
     await reloadWorker();
     api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
-    expect((await message({ type: 'status' })).status).toEqual(stopped);
+    const restored = (await message({ type: 'status' })).status!;
+    const { visitDelivery: stoppedDelivery, ...stoppedCollection } = stopped;
+    const { visitDelivery: restoredDelivery, ...restoredCollection } = restored;
+    expect(restoredCollection).toEqual(stoppedCollection);
+    expect(stoppedDelivery!.visits[0].visitId).toBe(restoredDelivery!.visits[0].visitId);
+    expect(restoredDelivery!.visits[0].phase).toBe('acked');
   });
   it('does not resume when a tab is selected inside a minimized window', async () => {
     const { clock } = await validVisit();
@@ -985,5 +992,61 @@ describe('activation receipts and failure boundaries', () => {
     expect((await message({ type: 'status' })).status?.sessionStartRecovery).toMatchObject({ kind: 'invalid', reason: kind === 'conflict' ? 'conflicting-records' : 'corrupted-record' });
     expect((await start()).ok).toBe(false);
     expect(local).toEqual(records); expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('visit HTTP integration in the real background adapter', () => {
+  async function prepare() {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(10000);
+    const started = await message({ type: 'start', goalText: '방문 저장 연동 검증하기' });
+    const sessionId = started.status!.session!.sessionId;
+    await message({ type: 'context' }, pageSender);
+    clock.mockReturnValue(11000);
+    await message({ type: 'snapshot', sessionId, snapshot: { ...await describeUrl(frame.url), title: '합성 문서', content: '공개 합성 본문입니다. '.repeat(10) } }, pageSender);
+    return { clock, sessionId };
+  }
+  it('keeps processing collection events and new visits while awaiting the preceding HTTP ACK', async () => {
+    const { clock, sessionId } = await prepare();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const requests: any[] = [];
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      const body = JSON.parse(init!.body as string); requests.push({ url, body });
+      if (requests.length === 1) await gate;
+      return new Response(JSON.stringify({ ...body, sessionId, updatedAt: null }), { status: 201 });
+    });
+    clock.mockReturnValue(12000);
+    frame = { documentId: 'document2', url: 'https://example.com/two' };
+    const second = { ...pageSender, documentId: frame.documentId, url: frame.url };
+    await message({ type: 'context' }, second);
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    const firstRequest = structuredClone(requests[0].body);
+    clock.mockReturnValue(13000);
+    await message({ type: 'snapshot', sessionId, snapshot: { ...await describeUrl(frame.url), title: '두 번째 문서', content: '새 공개 합성 본문입니다. '.repeat(10) } }, second);
+    api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
+    await message({ type: 'stop' });
+    const pending = (await message({ type: 'status' })).status!;
+    expect(pending.session).toBeNull();
+    expect(pending.readyVisits.map(v => v.sequence)).toEqual([1, 2]);
+    expect(requests).toHaveLength(1);
+    expect(memory.visitDelivery.entries[0].visit).toMatchObject(firstRequest);
+    expect(memory.collection.candidates[1].tabSwitchCount).toBe(1);
+    release();
+    await vi.waitFor(() => expect(requests).toHaveLength(2));
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.visitDelivery!.visits.map(v => v.phase)).toEqual(['acked', 'acked']));
+    expect(requests.map(request => request.body.sequence)).toEqual([1, 2]);
+    await message({ type: 'status' }); expect(requests).toHaveLength(2);
+  });
+  it('preserves a failed request and blocks a new session until explicit local deletion', async () => {
+    await prepare();
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ code: 'SESSION_ENDED' }), { status: 409 }));
+    await message({ type: 'stop' });
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.visitDelivery!.visits[0]).toMatchObject({ phase: 'failed', code: 'SESSION_ENDED', retryable: false }));
+    const count = vi.mocked(fetch).mock.calls.length;
+    const blocked = await message({ type: 'start', goalText: '새 작업을 시작해 보기' });
+    expect(blocked.ok).toBe(false); expect(fetch).toHaveBeenCalledTimes(count);
+    await message({ type: 'clear' });
+    expect(memory.visitDelivery.entries).toEqual([]);
+    expect(memory.collection.candidates).toEqual([]);
   });
 });
