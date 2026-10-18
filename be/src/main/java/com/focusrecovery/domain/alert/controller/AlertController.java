@@ -36,6 +36,11 @@ public class AlertController {
 
 	private static final String INVALID_SESSION_ID = "세션 ID가 올바른 UUID 형식이 아닙니다.";
 	private static final String INVALID_ALERT_ID = "알림 ID가 올바른 UUID 형식이 아닙니다.";
+	private static final String REPEAT_LIMIT_BASIS = """
+		- AI 반복 알림 제한 기준(의도된 정책): 연속 DRIFT는 표시된 AI 알림 중 최대 windowIndex, 최소 간격은 표시된 AI 알림 중 최대 shownAt을 기준으로 합니다.
+		  두 값은 서로 다른 알림에서 나올 수 있습니다. 확인 요청의 도착 순서·시각은 쓰지 않으므로, 작은 구간의 확인이 늦게 도착해도 연속 DRIFT 기준이 뒤로 돌아가지 않고,
+		  같은 shownAt 재전송이나 늦은 확인은 최소 간격의 시작 시각을 바꾸지 않습니다.
+		""";
 	private static final String TIME_RULES = """
 
 		**시각 입력 형식**
@@ -110,7 +115,8 @@ public class AlertController {
 			- 최초 표시 시각만 유지합니다. 같은 shownAt 재전송은 200으로 기존 결과를, 다른 시각은 409 ALERT_SHOWN_AT_CONFLICT입니다.
 			- 표시할 수 없었던 시각이면 409 ALERT_NOT_DISPLAYABLE입니다: 후보 생성 시각 − 허용치보다 이른 표시, 서버 현재 시각 + 허용치보다 미래, 세션 종료 시각 + 허용치보다 늦은 표시(종료 후 표시).
 			- 종료 전에 표시된 알림의 늦은 확인은 세션 종료 후에도 저장합니다. 요청 시점의 최신 구간·현재 후보 여부로 거절하지 않습니다.
-			- 기록된 shownAt은 AI 반복 알림 제한(연속 DRIFT·최소 간격)에 반영됩니다. 고정 주기 예정 시각(startedAt + 간격 × n)은 shownAt으로 바뀌지 않습니다.
+			- 기록된 shownAt은 AI 반복 알림 제한에 반영됩니다. 고정 주기 예정 시각(startedAt + 간격 × n)은 shownAt으로 바뀌지 않습니다.
+			""" + REPEAT_LIMIT_BASIS + """
 			""" + TIME_RULES)
 	@ApiResponse(responseCode = "200", description = "표시 시각 기록 또는 같은 값 재전송 (Alert 객체)")
 	@ApiResponse(responseCode = "400", description = "잘못된 UUID, shownAt 누락·형식 오류·밀리초 미만 정밀도",
@@ -153,7 +159,8 @@ public class AlertController {
 			- 이미 shownAt이 저장돼 있으면 생략할 수 있고, 다른 값을 보내면 409 ALERT_SHOWN_AT_CONFLICT입니다.
 			- selectedAt은 shownAt보다 앞설 수 없습니다(같은 클라이언트 시계라 허용치 없이 비교, 400). 서버 현재 시각 + 허용치보다 미래인 selectedAt도 400입니다.
 			- 종료 전에 표시된 알림의 선택은 세션 종료 후에도 저장할 수 있으며, 종료 시각 뒤에 선택했더라도 저장합니다.
-			""" + TIME_RULES)
+			- 이 요청으로 처음 기록된 shownAt도 표시 확인과 같은 기준으로 AI 반복 알림 제한에 반영됩니다.
+			""" + REPEAT_LIMIT_BASIS + TIME_RULES)
 	@ApiResponse(responseCode = "201", description = "최초 선택 저장")
 	@ApiResponse(responseCode = "200", description = "같은 선택 재전송: 기존 객체")
 	@ApiResponse(responseCode = "400", description = "잘못된 UUID, action·selectedAt 누락·형식 오류, 밀리초 미만 정밀도, selectedAt < shownAt, 미래 selectedAt",

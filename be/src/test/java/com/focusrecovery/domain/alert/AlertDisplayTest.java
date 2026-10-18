@@ -450,6 +450,92 @@ class AlertDisplayTest {
 		assertThat(kept.getShownAt()).isNull();
 	}
 
+	// 구간 1 DRIFT(A1) → 구간 2 NORMAL → 구간 3 DRIFT(A3). 모두 같은 시각 base에 후보가 만들어진다
+	private Notification[] driftNormalDrift() throws Exception {
+		completed(nextWindow(sessionId), "NORMAL");
+		Notification a3 = alertService.createAiCandidate(sessionId, completedDrift(nextWindow(sessionId))).orElseThrow();
+		return new Notification[] {alert, a3};
+	}
+
+	// 큰 구간(3)의 확인이 먼저 오고 작은 구간(1)의 확인이 늦게 와도 연속 DRIFT 기준은 최대 windowIndex(3)다.
+	// 기준이 늦게 온 구간 1로 돌아가면 구간 2 NORMAL을 복귀로 보고 후보를 만들었을 것이다
+	@Test
+	void 작은_구간의_확인이_늦게_도착해도_연속_DRIFT_기준은_최대_windowIndex다() throws Exception {
+		Instant base = alert.getCreatedAt();
+		Notification[] alerts = driftNormalDrift();
+		now.set(base.plus(Duration.ofHours(1)));
+		shown(sessionId, alerts[1].getAlertId(), base.plus(Duration.ofMinutes(2))).andExpect(status().isOk());
+		shown(sessionId, alerts[0].getAlertId(), base.plus(Duration.ofMinutes(1))).andExpect(status().isOk());
+
+		UUID next = completedDrift(nextWindow(sessionId));
+		registerTask(next);
+		alertTaskProcessor.process(next);
+
+		assertSkipped(next, "DRIFT_FLOW_CONTINUES");
+	}
+
+	// 최대 windowIndex 알림(A3, 10분 표시)과 최대 shownAt 알림(A1, 50분 표시)이 다르다.
+	// 연속 DRIFT는 A3의 구간 3, 최소 간격은 A1의 50분을 기준으로 해야 한다
+	@Test
+	void 연속_DRIFT와_최소_간격은_각각_최대_windowIndex와_최대_shownAt을_기준으로_한다() throws Exception {
+		Instant base = alert.getCreatedAt();
+		Notification[] alerts = driftNormalDrift();
+		now.set(base.plus(Duration.ofMinutes(54)));
+		shown(sessionId, alerts[1].getAlertId(), base.plus(Duration.ofMinutes(10))).andExpect(status().isOk());
+		shown(sessionId, alerts[0].getAlertId(), base.plus(Duration.ofMinutes(50))).andExpect(status().isOk());
+
+		// 구간 3 뒤에 복귀가 없으므로 연속 DRIFT(A1의 구간 1을 기준으로 했다면 구간 2 NORMAL 때문에 통과했을 것)
+		UUID w4 = completedDrift(nextWindow(sessionId));
+		registerTask(w4);
+		alertTaskProcessor.process(w4);
+		assertSkipped(w4, "DRIFT_FLOW_CONTINUES");
+
+		// 구간 5 TRANSITION으로 복귀한 뒤의 DRIFT: 최소 간격은 A1의 50분부터(A3의 10분이었다면 이미 지남)
+		completed(nextWindow(sessionId), "TRANSITION");
+		UUID w6 = completedDrift(nextWindow(sessionId));
+		registerTask(w6);
+		alertTaskProcessor.process(w6);
+		assertSkipped(w6, "MIN_INTERVAL_NOT_PASSED");
+
+		now.set(base.plus(Duration.ofMinutes(55)));
+		UUID w7 = completedDrift(nextWindow(sessionId));
+		registerTask(w7);
+		alertTaskProcessor.process(w7);
+		assertThat(taskRepository.findById(w7).orElseThrow().getStatus()).isEqualTo(AlertTaskStatus.CREATED);
+	}
+
+	// 최소 간격의 시작은 기록된 shownAt(최대값)이며, 같은 값 재전송이나 더 이른 shownAt의 늦은 확인이 도착한 시각으로 바뀌지 않는다
+	@Test
+	void 같은_shownAt_재전송과_늦은_확인은_최소_간격의_시작_시각을_바꾸지_않는다() throws Exception {
+		Instant base = alert.getCreatedAt();
+		Notification a2 = alertService.createAiCandidate(sessionId, completedDrift(nextWindow(sessionId))).orElseThrow();
+		now.set(base.plus(Duration.ofMinutes(10)));
+		shown(sessionId, a2.getAlertId(), base.plus(Duration.ofMinutes(10))).andExpect(status().isOk());
+
+		now.set(base.plus(Duration.ofMinutes(14)));
+		shown(sessionId, a2.getAlertId(), base.plus(Duration.ofMinutes(10))).andExpect(status().isOk());
+		shown(sessionId, alert.getAlertId(), base.plus(Duration.ofMinutes(8))).andExpect(status().isOk());
+		assertThat(notificationRepository.findById(a2.getAlertId()).orElseThrow().getShownAt())
+			.isEqualTo(base.plus(Duration.ofMinutes(10)));
+
+		// 시작 시각이 도착 시각(14분)으로 바뀌었다면 15분에는 아직 5분이 지나지 않는다
+		completed(nextWindow(sessionId), "NORMAL");
+		now.set(base.plus(Duration.ofMinutes(15)));
+		UUID next = completedDrift(nextWindow(sessionId));
+		registerTask(next);
+		alertTaskProcessor.process(next);
+
+		assertThat(taskRepository.findById(next).orElseThrow().getStatus()).isEqualTo(AlertTaskStatus.CREATED);
+	}
+
+	private void completed(AnalysisWindow window, String result) {
+		AnalysisResult analysis = AnalysisResult.request(UUID.randomUUID(), window.getWindowId(), "{}", now.get());
+		analysis.start(now.get());
+		analysis.finish(new AiAnalysisOutcome(null, result, 0.4, 0.4, 0.2, false, null, null, "{\"c\":\"rf\"}", now.get()),
+			now.get());
+		analysisResultRepository.save(analysis);
+	}
+
 	private record Pause(CountDownLatch pausedLatch, CountDownLatch resumeLatch) {
 
 		void awaitPaused() throws InterruptedException {

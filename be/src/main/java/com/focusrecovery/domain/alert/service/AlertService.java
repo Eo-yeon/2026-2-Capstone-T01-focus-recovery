@@ -122,6 +122,9 @@ public class AlertService {
 
 	// 실제 표시된 AI 알림이 없으면 허용(null). 있으면 그 구간 뒤에 정상 복귀(NORMAL·TRANSITION 완료)가 있어야 하고
 	// (실패·PENDING·RUNNING·분석 없음은 복귀로 보지 않음) 마지막 shownAt부터 최소 간격이 지나야 한다. 순서는 windowIndex 기준
+	// 두 기준은 의도적으로 따로 계산한다(같은 알림에서 나올 필요 없음). 확인 요청의 도착 시각은 어느 기준에도 쓰지 않는다:
+	// - 연속 DRIFT: 표시된 AI 알림 중 최대 windowIndex. 작은 구간의 확인이 늦게 도착해도 기준이 뒤로 돌아가지 않는다
+	// - 최소 간격: 표시된 AI 알림 중 최대 shownAt. 같은 shownAt 재전송·늦은 확인은 이 시작 시각을 바꾸지 않는다
 	private String driftFlowBlockReason(UUID sessionId, int windowIndex) {
 		Optional<Integer> lastShownWindow = notificationRepository.findLastShownAiWindowIndex(sessionId);
 		if (lastShownWindow.isEmpty()) {
