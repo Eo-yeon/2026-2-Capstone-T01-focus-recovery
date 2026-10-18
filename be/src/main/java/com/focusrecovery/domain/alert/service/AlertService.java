@@ -201,6 +201,15 @@ public class AlertService {
 			.orElse(null);
 	}
 
+	// 알림 응답(Alert). AI 알림은 연결된 분석의 구간 순서를 windowIndex로 채운다
+	public AlertResponse toResponse(Notification notification, String goalText) {
+		Integer windowIndex = notification.getAnalysisId() == null ? null
+			: analysisResultRepository.findById(notification.getAnalysisId())
+				.flatMap(analysis -> analysisWindowRepository.findById(analysis.getWindowId()))
+				.map(AnalysisWindow::getWindowIndex).orElse(null);
+		return AlertResponse.of(notification, windowIndex, goalText);
+	}
+
 	private int latestWindowIndex(UUID sessionId) {
 		return analysisWindowRepository.findFirstBySessionIdOrderByWindowIndexDesc(sessionId)
 			.map(AnalysisWindow::getWindowIndex).orElse(0);

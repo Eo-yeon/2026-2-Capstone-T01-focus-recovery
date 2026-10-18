@@ -9,7 +9,8 @@ import com.focusrecovery.domain.alert.entity.AlertType;
 // 서버 전체 설정을 쓰는 잠정 구현이다. 세션별 방식 선택은 아직 지원하지 않는다.
 // 실행 중에 바꾸지 않으며, 모드 전환은 진행 중인 세션을 모두 종료한 뒤 서버를 재시작하는 운영을 전제로 한다
 @ConfigurationProperties("focus-recovery.alert")
-public record AlertProperties(AlertType mode, Ai ai, FixedInterval fixedInterval, Task task) {
+// clockSkewTolerance: 클라이언트 시각(shownAt·selectedAt)과 서버 시각(후보 생성·세션 종료·현재 시각)을 비교할 때만 쓰는 허용 오차(잠정)
+public record AlertProperties(AlertType mode, Ai ai, FixedInterval fixedInterval, Task task, Duration clockSkewTolerance) {
 
 	// minInterval: 마지막으로 실제 표시된 AI 알림의 shownAt부터 새 AI 후보까지의 최소 간격(잠정)
 	public record Ai(Duration minInterval) {

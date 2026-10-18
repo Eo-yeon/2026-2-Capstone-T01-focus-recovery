@@ -4,6 +4,7 @@ import java.util.Map;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -11,6 +12,10 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.focusrecovery.domain.alert.dto.AlertResponse;
+import com.focusrecovery.domain.alert.dto.AlertResponseRequest;
+import com.focusrecovery.domain.alert.dto.NotificationResponseResponse;
+import com.focusrecovery.domain.alert.dto.ShownRequest;
+import com.focusrecovery.domain.alert.service.AlertDisplayService;
 import com.focusrecovery.domain.alert.service.AlertService;
 import com.focusrecovery.global.exception.ErrorResponse;
 import com.focusrecovery.global.util.Uuids;
@@ -22,16 +27,34 @@ import io.swagger.v3.oas.annotations.media.ExampleObject;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.validation.Valid;
 
-@Tag(name = "목표 복귀 알림", description = "알림 후보 생성 API")
+@Tag(name = "목표 복귀 알림", description = "알림 후보 생성·실제 표시 확인·사용자 선택 저장 API")
 @RestController
 @RequestMapping("/api/sessions/{sessionId}/alerts")
 public class AlertController {
 
-	private final AlertService alertService;
+	private static final String INVALID_SESSION_ID = "세션 ID가 올바른 UUID 형식이 아닙니다.";
+	private static final String INVALID_ALERT_ID = "알림 ID가 올바른 UUID 형식이 아닙니다.";
+	private static final String TIME_RULES = """
 
-	public AlertController(AlertService alertService) {
+		**시각 입력 형식**
+		- UTC ISO 8601이며 밀리초(소수점 3자리)까지만 허용합니다. 예) 2026-10-18T01:10:02.345Z. 밀리초보다 세밀한 값(예: .345678Z)은 400 INVALID_REQUEST입니다.
+		- 전달한 시각은 보정하거나 잘라내지 않고 그대로 저장합니다.
+
+		**시각 검증 (구현 정책)**
+		- 이번 작업에서 확정한 구현 정책: 후보 생성 시각보다 이른 표시·서버 현재 시각보다 미래인 표시는 409 ALERT_NOT_DISPLAYABLE,
+		  selectedAt이 shownAt보다 이르거나 서버 현재 시각보다 미래면 400 INVALID_REQUEST입니다. selectedAt과 shownAt 비교에는 허용치를 쓰지 않습니다(같은 클라이언트 시계).
+		- 시계 오차 허용치(focus-recovery.alert.clock-skew-tolerance)는 최종 합의 전 잠정 설정 5초입니다. 클라이언트 시각과 서버 시각(후보 생성·세션 종료·현재 시각)을 비교할 때만 적용합니다.
+		- 요청 도착 지연과는 무관하므로 종료 전에 표시된 알림의 확인은 언제 도착해도 저장합니다. 한계: 종료 후 최대 5초 안의 표시는 허용 범위에 들어올 수 있습니다.
+		""";
+
+	private final AlertService alertService;
+	private final AlertDisplayService alertDisplayService;
+
+	public AlertController(AlertService alertService, AlertDisplayService alertDisplayService) {
 		this.alertService = alertService;
+		this.alertDisplayService = alertDisplayService;
 	}
 
 	@Operation(
@@ -75,7 +98,91 @@ public class AlertController {
 		@RequestBody(required = false) Map<String, Object> ignored
 	) {
 		AlertService.FixedIntervalResult result = alertService.requestFixedInterval(
-			Uuids.parse(sessionId, "세션 ID가 올바른 UUID 형식이 아닙니다."));
+			Uuids.parse(sessionId, INVALID_SESSION_ID));
 		return ResponseEntity.status(result.created() ? HttpStatus.CREATED : HttpStatus.OK).body(result.alert());
+	}
+
+	@Operation(
+		summary = "실제 알림 표시 확인",
+		description = """
+			FE가 알림을 실제 화면에 표시한 시각(shownAt)을 기록합니다. 후보 생성·조회만으로는 기록되지 않으며 실제 알림 횟수는 shownAt이 있는 알림만 집계합니다.
+
+			- 최초 표시 시각만 유지합니다. 같은 shownAt 재전송은 200으로 기존 결과를, 다른 시각은 409 ALERT_SHOWN_AT_CONFLICT입니다.
+			- 표시할 수 없었던 시각이면 409 ALERT_NOT_DISPLAYABLE입니다: 후보 생성 시각 − 허용치보다 이른 표시, 서버 현재 시각 + 허용치보다 미래, 세션 종료 시각 + 허용치보다 늦은 표시(종료 후 표시).
+			- 종료 전에 표시된 알림의 늦은 확인은 세션 종료 후에도 저장합니다. 요청 시점의 최신 구간·현재 후보 여부로 거절하지 않습니다.
+			- 기록된 shownAt은 AI 반복 알림 제한(연속 DRIFT·최소 간격)에 반영됩니다. 고정 주기 예정 시각(startedAt + 간격 × n)은 shownAt으로 바뀌지 않습니다.
+			""" + TIME_RULES)
+	@ApiResponse(responseCode = "200", description = "표시 시각 기록 또는 같은 값 재전송 (Alert 객체)")
+	@ApiResponse(responseCode = "400", description = "잘못된 UUID, shownAt 누락·형식 오류·밀리초 미만 정밀도",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "INVALID_REQUEST", "message": "요청 값이 올바르지 않습니다.", "fieldErrors": [{"field": "shownAt", "message": "표시 시각을 입력해 주세요."}]}""")))
+	@ApiResponse(responseCode = "404", description = "SESSION_NOT_FOUND: 세션 없음 / ALERT_NOT_FOUND: 알림이 없거나 다른 세션 소속",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = {
+			@ExampleObject(name = "SESSION_NOT_FOUND", value = """
+				{"code": "SESSION_NOT_FOUND", "message": "작업 세션을 찾을 수 없습니다.", "fieldErrors": []}"""),
+			@ExampleObject(name = "ALERT_NOT_FOUND", value = """
+				{"code": "ALERT_NOT_FOUND", "message": "해당 세션에서 알림을 찾을 수 없습니다.", "fieldErrors": []}""")
+		}))
+	@ApiResponse(responseCode = "409", description = "ALERT_SHOWN_AT_CONFLICT: 기록된 표시 시각과 다름 / ALERT_NOT_DISPLAYABLE: 표시될 수 없는 시각",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = {
+			@ExampleObject(name = "ALERT_SHOWN_AT_CONFLICT", value = """
+				{"code": "ALERT_SHOWN_AT_CONFLICT", "message": "이미 기록된 표시 시각과 다릅니다.", "fieldErrors": []}"""),
+			@ExampleObject(name = "ALERT_NOT_DISPLAYABLE", value = """
+				{"code": "ALERT_NOT_DISPLAYABLE", "message": "해당 시각에 표시될 수 없는 알림입니다.", "fieldErrors": []}""")
+		}))
+	@PatchMapping("/{alertId}/shown")
+	public AlertResponse markShown(
+		@Parameter(description = "작업 세션 ID (UUID)", example = "1ba72f77-c166-4e06-88c7-1d6ed919cd9b")
+		@PathVariable String sessionId,
+		@Parameter(description = "알림 ID (UUID)", example = "9d2c4e71-3a8b-4f05-b6e2-1c7a9f3d5b80")
+		@PathVariable String alertId,
+		@Valid @RequestBody ShownRequest request
+	) {
+		return alertDisplayService.markShown(Uuids.parse(sessionId, INVALID_SESSION_ID),
+			Uuids.parse(alertId, INVALID_ALERT_ID), request.shownAt());
+	}
+
+	@Operation(
+		summary = "알림 사용자 선택 저장",
+		description = """
+			실제 표시된 알림에 대한 사용자 선택(RETURN_TO_GOAL 또는 CONTINUE_BROWSING)을 alertId에 연결해 저장합니다.
+
+			- 알림당 최초 선택 1개만 유지합니다(DB UNIQUE). 최초 저장 201, 같은 action·selectedAt 재전송 200(기존 객체), 다른 선택은 409 RESPONSE_ALREADY_RECORDED입니다.
+			- 표시 확인이 아직 저장되지 않았으면 요청의 shownAt이 필요하며 shownAt과 선택을 한 트랜잭션으로 저장합니다(선택 저장이 실패하면 shownAt도 남지 않음).
+			  shownAt도 없으면 409 ALERT_NOT_SHOWN, 표시될 수 없는 시각이면 409 ALERT_NOT_DISPLAYABLE입니다.
+			- 이미 shownAt이 저장돼 있으면 생략할 수 있고, 다른 값을 보내면 409 ALERT_SHOWN_AT_CONFLICT입니다.
+			- selectedAt은 shownAt보다 앞설 수 없습니다(같은 클라이언트 시계라 허용치 없이 비교, 400). 서버 현재 시각 + 허용치보다 미래인 selectedAt도 400입니다.
+			- 종료 전에 표시된 알림의 선택은 세션 종료 후에도 저장할 수 있으며, 종료 시각 뒤에 선택했더라도 저장합니다.
+			""" + TIME_RULES)
+	@ApiResponse(responseCode = "201", description = "최초 선택 저장")
+	@ApiResponse(responseCode = "200", description = "같은 선택 재전송: 기존 객체")
+	@ApiResponse(responseCode = "400", description = "잘못된 UUID, action·selectedAt 누락·형식 오류, 밀리초 미만 정밀도, selectedAt < shownAt, 미래 selectedAt",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "INVALID_REQUEST", "message": "selectedAt은 shownAt보다 앞설 수 없습니다.", "fieldErrors": []}""")))
+	@ApiResponse(responseCode = "404", description = "SESSION_NOT_FOUND: 세션 없음 / ALERT_NOT_FOUND: 알림이 없거나 다른 세션 소속",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
+			{"code": "ALERT_NOT_FOUND", "message": "해당 세션에서 알림을 찾을 수 없습니다.", "fieldErrors": []}""")))
+	@ApiResponse(responseCode = "409", description = "ALERT_NOT_SHOWN / RESPONSE_ALREADY_RECORDED / ALERT_SHOWN_AT_CONFLICT / ALERT_NOT_DISPLAYABLE",
+		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = {
+			@ExampleObject(name = "ALERT_NOT_SHOWN", value = """
+				{"code": "ALERT_NOT_SHOWN", "message": "표시 시각을 확인할 수 없는 알림입니다.", "fieldErrors": []}"""),
+			@ExampleObject(name = "RESPONSE_ALREADY_RECORDED", value = """
+				{"code": "RESPONSE_ALREADY_RECORDED", "message": "이 알림의 사용자 선택이 이미 저장되었습니다.", "fieldErrors": []}"""),
+			@ExampleObject(name = "ALERT_SHOWN_AT_CONFLICT", value = """
+				{"code": "ALERT_SHOWN_AT_CONFLICT", "message": "이미 기록된 표시 시각과 다릅니다.", "fieldErrors": []}"""),
+			@ExampleObject(name = "ALERT_NOT_DISPLAYABLE", value = """
+				{"code": "ALERT_NOT_DISPLAYABLE", "message": "해당 시각에 표시될 수 없는 알림입니다.", "fieldErrors": []}""")
+		}))
+	@PostMapping("/{alertId}/responses")
+	public ResponseEntity<NotificationResponseResponse> respond(
+		@Parameter(description = "작업 세션 ID (UUID)", example = "1ba72f77-c166-4e06-88c7-1d6ed919cd9b")
+		@PathVariable String sessionId,
+		@Parameter(description = "알림 ID (UUID)", example = "9d2c4e71-3a8b-4f05-b6e2-1c7a9f3d5b80")
+		@PathVariable String alertId,
+		@Valid @RequestBody AlertResponseRequest request
+	) {
+		AlertDisplayService.ResponseResult result = alertDisplayService.respond(Uuids.parse(sessionId, INVALID_SESSION_ID),
+			Uuids.parse(alertId, INVALID_ALERT_ID), request);
+		return ResponseEntity.status(result.created() ? HttpStatus.CREATED : HttpStatus.OK).body(result.response());
 	}
 }

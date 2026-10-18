@@ -81,6 +81,11 @@ public class Notification implements Persistable<UUID> {
 		return notification;
 	}
 
+	// 실제 화면 표시 시각을 최초 한 번 기록한다(후보 생성·조회 시각으로 대신하지 않음)
+	public void markShown(Instant shownAt) {
+		this.shownAt = shownAt;
+	}
+
 	@PostLoad
 	@PostPersist
 	void markNotNew() {
