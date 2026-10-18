@@ -1,5 +1,6 @@
 import { Collector, emptyState } from './collector';
 import { serialExecutor } from './serial';
+import { BehaviorDelivery } from './behavior-delivery';
 import { VisitDelivery } from './visit-delivery';
 import { describeUrl } from '../shared/url';
 import { isContentMessage, isPopupMessage } from '../shared/messages';
@@ -25,7 +26,14 @@ const delivery = new VisitDelivery(operation => enqueue(async () => {
   const result = operation();
   await persist();
   return result;
-}), () => !pendingStart && !invalidRecovery);
+}).then(result => { behaviors.kick(); return result; }), () => !pendingStart && !invalidRecovery);
+const behaviors = new BehaviorDelivery(operation => enqueue(async () => {
+  await ready;
+  const result = operation();
+  await persist();
+  return result;
+}), visitId => !pendingStart && !invalidRecovery && !delivery.blocked
+  && delivery.checkpoint.entries.some(entry => entry.visitId === visitId && entry.phase === 'acked'));
 function isStartRecord(value: unknown): value is PendingSessionStart {
   if (!value || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
@@ -49,7 +57,8 @@ function recovery(): SessionStartRecovery {
 function status(now: number) {
   const collected = collector.status(now);
   delivery.collect(collected.readyVisits);
-  return { ...collected, sessionStartRecovery: recovery(), visitDelivery: delivery.status() };
+  behaviors.collect(collected.readyVisits, delivery.checkpoint.entries);
+  return { ...collected, sessionStartRecovery: recovery(), visitDelivery: delivery.status(), behaviorDelivery: behaviors.status() };
 }
 const ready = (async () => {
   await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
@@ -94,6 +103,7 @@ const ready = (async () => {
     && collector.state.session?.sessionId === pendingStart.response.sessionId) activeStart = pendingStart;
   const expectedSessionId = activeStart?.response?.sessionId;
   delivery.restore(savedDelivery, expectedSessionId ?? collector.state.session?.sessionId ?? collector.state.candidates[0]?.sessionId);
+  behaviors.restore((await chrome.storage.session.get('behaviorDelivery')).behaviorDelivery, delivery.checkpoint.entries);
   if (activeStart && ((collector.state.session && collector.state.session.sessionId !== expectedSessionId)
     || collector.state.candidates.some(candidate => candidate.sessionId !== expectedSessionId))) invalidRecovery = 'conflicting-records';
   if (!collector.state.session && retainedSession && !pendingStart && !activeStart) invalidRecovery ??= 'missing-request';
@@ -110,7 +120,8 @@ const ready = (async () => {
 });
 async function persist() {
   if (invalidRecovery === 'initialization-failed') return;
-  await chrome.storage.session.set({ collection: collector.state, ...(!delivery.blocked ? { visitDelivery: delivery.checkpoint } : {}) });
+  behaviors.collect(collector.status(Date.now(), false).readyVisits, delivery.checkpoint.entries);
+  await chrome.storage.session.set({ collection: collector.state, ...(!delivery.blocked ? { visitDelivery: delivery.checkpoint } : {}), ...(!behaviors.blocked ? { behaviorDelivery: behaviors.checkpoint } : {}) });
   if (collector.state.session) {
     retainedSession = collector.state.session;
     await chrome.storage.local.set({ activeSession: { ...retainedSession, ...(activeStart ? { startRequest: activeStart } : {}) } });
@@ -150,7 +161,7 @@ function dispatch<T>(operation: (now: number) => Promise<T>, foregroundEvent = f
       catch { await chrome.storage.session.remove('collection').catch(() => undefined); }
       throw error;
     }
-  }).then(result => { delivery.kick(); return result; });
+  }).then(result => { delivery.kick(); behaviors.kick(); return result; });
 }
 function event(operation: (now: number) => Promise<unknown>, foregroundEvent = false) {
   // Never log raw URLs, payloads, goals or platform error messages.
@@ -232,7 +243,7 @@ async function syncScripts() {
 async function startSession(goal: string): Promise<string | undefined> {
   if (invalidRecovery) return '시작 요청 정보 확인이 필요합니다. 원본을 보존한 채 서버 상태를 확인해 주세요.';
   if (collector.state.session) return '이미 활성 세션이 있습니다.';
-  if (!pendingStart && delivery.hasUnconfirmed()) return '저장이 확인되지 않은 방문이 있습니다. 전송 상태를 확인하고 재시도하거나 로컬 기록을 명시적으로 삭제해 주세요.';
+  if (!pendingStart && (delivery.hasUnconfirmed() || behaviors.hasUnconfirmed())) return '저장 또는 행동 갱신이 확인되지 않은 방문이 있습니다. 전송 상태를 확인하고 재시도하거나 로컬 기록을 명시적으로 삭제해 주세요.';
   const goalText = normalizeGoal(goal);
   if (!validGoal(goalText)) return '목표는 앞뒤 공백을 제외하고 5~150자로 입력해 주세요.';
   if (pendingStart && (pendingStart.goalText !== goalText || pendingStart.apiBaseUrl !== API_BASE_URL)) {
@@ -249,7 +260,7 @@ async function startSession(goal: string): Promise<string | undefined> {
     if (response.status !== 'ACTIVE') return '기존 서버 세션이 이미 종료되었습니다. 서버 상태를 확인해 주세요.';
     activatedAt = Date.now();
     if (activeStart) collector.resume(response);
-    else { collector.start(response); delivery.clear(); }
+    else { collector.start(response); delivery.clear(); behaviors.clear(); }
     activeStart = pendingStart;
     await persist();
     await refreshForeground(Date.now());
@@ -301,10 +312,12 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
       } else if (message.type === 'clear') {
         if (collector.state.session) return { ok: false, error: '세션 종료 후 기록을 지워 주세요.' };
         collector.state = emptyState();
-        delivery.clear();
-        await chrome.storage.session.remove('visitDelivery');
+        delivery.clear(); behaviors.clear();
+        await chrome.storage.session.remove(['visitDelivery', 'behaviorDelivery']);
       } else if (message.type === 'retry-visits') {
         delivery.retry();
+      } else if (message.type === 'retry-behaviors') {
+        behaviors.retry();
       } else if (message.type === 'sync-permissions') {
         await syncScripts();
         await broadcast();
@@ -408,8 +421,8 @@ chrome.permissions.onRemoved.addListener(() => event(async now => {
   // Revocation is privacy-sensitive: stop and erase all in-memory samples.
   suspend(now);
   collector.state = emptyState();
-  delivery.clear();
-  await chrome.storage.session.remove('visitDelivery');
+  delivery.clear(); behaviors.clear();
+  await chrome.storage.session.remove(['visitDelivery', 'behaviorDelivery']);
   await syncScripts();
   await broadcast();
 }));

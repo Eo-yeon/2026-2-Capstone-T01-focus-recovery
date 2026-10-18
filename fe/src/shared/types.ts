@@ -76,15 +76,22 @@ export type ContentMessage =
   | { type: 'context' }
   | { type: 'snapshot'; sessionId: string; snapshot: PageSnapshot | null; reason?: ExclusionReason }
   | { type: 'leave'; sessionId: string };
-export type PopupMessage = { type: 'status' } | { type: 'start'; goalText: string } | { type: 'stop' } | { type: 'clear' } | { type: 'sync-permissions' } | { type: 'retry-visits' };
+export type PopupMessage = { type: 'status' } | { type: 'start'; goalText: string } | { type: 'stop' } | { type: 'clear' } | { type: 'sync-permissions' } | { type: 'retry-visits' } | { type: 'retry-behaviors' };
 export interface VisitDeliveryStatus {
   blocked?: string;
   visits: { visitId: string; sequence: number; phase: 'queued' | 'sending' | 'retry-wait' | 'failed' | 'acked'; attempts: number; error?: string; code?: string; retryable?: boolean; nextRetryAt?: number }[];
+}
+export interface BehaviorDeliveryStatus {
+  blocked?: string;
+  visits: { visitId: string; sequence: number; phase: 'waiting-post' | 'queued' | 'sending' | 'retry-wait' | 'failed' | 'acked';
+    latest: VisitBehavior; ack?: VisitBehavior; request?: VisitBehavior; attempts: number;
+    error?: string; code?: string; retryable?: boolean; nextRetryAt?: number }[];
 }
 export interface DevStatus {
   session: ServerSession | null;
   sessionStartRecovery?: SessionStartRecovery;
   visitDelivery?: VisitDeliveryStatus;
+  behaviorDelivery?: BehaviorDeliveryStatus;
   candidates: Omit<VisitCandidate, 'snapshot' | 'activeSince' | 'activeTimeCursor'>[];
   visits: (Omit<PageVisit, 'sequence'> & { sequence: number | null })[];
   readyVisits: PageVisit[]; // Only these have immutable, contiguous server sequences.

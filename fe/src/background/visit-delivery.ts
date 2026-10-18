@@ -1,11 +1,12 @@
+import { MAX_DELIVERY_ATTEMPTS, stopExhaustedDelivery } from './delivery-retry';
 import { API_BASE_URL } from '../api/client';
 import { savePageVisit, VisitApiError } from '../api/visit';
 import { UUID } from '../api/session';
-import type { PageVisit, VisitDeliveryStatus } from '../shared/types';
+import { behaviorSnapshot, coversBehavior, validBehavior } from '../api/behavior';
+import type { VisitBehavior, PageVisit, VisitDeliveryStatus } from '../shared/types';
 
-type Entry = { visit: PageVisit } & VisitDeliveryStatus['visits'][number];
+type Entry = { visit: PageVisit; serverBehavior?: VisitBehavior } & VisitDeliveryStatus['visits'][number];
 interface Checkpoint { apiBaseUrl: string; entries: Entry[] }
-const MAX_ATTEMPTS = 3;
 function isSnapshot(visit: PageVisit) {
   return visit && typeof visit.visitId === 'string' && UUID.test(visit.visitId)
     && typeof visit.sessionId === 'string' && UUID.test(visit.sessionId)
@@ -31,6 +32,7 @@ export class VisitDelivery {
       || saved.entries.some(entry => !isSnapshot(entry?.visit) || entry.visitId !== entry.visit.visitId || entry.sequence !== entry.visit.sequence
         || !Number.isSafeInteger(entry.sequence) || entry.sequence < 1 || (sessionId !== undefined && entry.visit.sessionId !== sessionId)
         || !['queued', 'sending', 'retry-wait', 'failed', 'acked'].includes(entry.phase)
+        || (entry.serverBehavior !== undefined && (!validBehavior(entry.serverBehavior) || !coversBehavior(entry.serverBehavior, entry.visit)))
         || !Number.isSafeInteger(entry.attempts) || entry.attempts < 0
         || (entry.phase === 'retry-wait' && !Number.isFinite(entry.nextRetryAt)))
       || new Set(saved.entries.map(entry => entry.visitId)).size !== saved.entries.length
@@ -52,7 +54,7 @@ export class VisitDelivery {
     this.checkpoint.entries.sort((a, b) => a.sequence - b.sequence);
   }
   status(): VisitDeliveryStatus {
-    return { blocked: this.blocked, visits: this.checkpoint.entries.map(({ visit: _, ...status }) => ({ ...status })) };
+    return { blocked: this.blocked, visits: this.checkpoint.entries.map(({ visit: _, serverBehavior: __, ...status }) => ({ ...status })) };
   }
   hasUnconfirmed() { return Boolean(this.blocked) || this.checkpoint.entries.some(entry => entry.phase !== 'acked'); }
   retry() {
@@ -80,6 +82,7 @@ export class VisitDelivery {
           if (this.blocked || !this.canSend()) return;
           const first = this.checkpoint.entries.find(entry => entry.phase !== 'acked');
           if (!first || first.phase === 'failed' || first.phase === 'sending') return;
+          if (stopExhaustedDelivery(first)) return;
           if (first.phase === 'retry-wait' && first.nextRetryAt! > Date.now()) {
             this.timer = setTimeout(() => this.kick(), first.nextRetryAt! - Date.now());
             return;
@@ -94,16 +97,19 @@ export class VisitDelivery {
           break;
         }
         let failure: VisitApiError | undefined;
-        try { await this.send({ ...entry.visit }); }
+        let serverBehavior: VisitBehavior | undefined;
+        try { serverBehavior = behaviorSnapshot(await this.send({ ...entry.visit })); }
         catch (error) { failure = error instanceof VisitApiError ? error : new VisitApiError('network', '방문 저장 중 오류가 발생했습니다.', true); }
         await this.mutate(() => {
           // Clear/permission revocation must not let a late ACK recreate deleted state.
           if (!this.checkpoint.entries.includes(entry)) return;
           if (!failure) {
+            entry.serverBehavior = serverBehavior;
             entry.phase = 'acked'; delete entry.error; delete entry.code; delete entry.nextRetryAt; delete entry.retryable;
           } else {
             entry.error = failure.message; entry.code = failure.code; entry.retryable = failure.retryable;
-            entry.phase = failure.retryable && entry.attempts < MAX_ATTEMPTS ? 'retry-wait' : 'failed';
+            entry.phase = failure.retryable && entry.attempts < MAX_DELIVERY_ATTEMPTS ? 'retry-wait' : 'failed';
+            if (failure.retryable && stopExhaustedDelivery(entry)) entry.error = `${failure.message} ${entry.error}`;
             if (entry.phase === 'retry-wait') entry.nextRetryAt = Date.now() + 1000 * entry.attempts;
           }
         });
