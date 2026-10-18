@@ -9,12 +9,8 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -45,6 +41,8 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import com.focusrecovery.domain.alert.repository.AlertCandidateTaskRepository;
+import com.focusrecovery.domain.alert.repository.NotificationRepository;
 import com.focusrecovery.domain.analysis.entity.AnalysisResult;
 import com.focusrecovery.domain.analysis.entity.AnalysisStatus;
 import com.focusrecovery.domain.analysis.repository.AnalysisResultRepository;
@@ -55,7 +53,7 @@ import com.focusrecovery.domain.session.repository.WorkSessionRepository;
 import com.focusrecovery.domain.visit.repository.PageVisitRepository;
 import com.focusrecovery.domain.window.entity.AnalysisWindow;
 import com.focusrecovery.domain.window.repository.AnalysisWindowRepository;
-import com.sun.net.httpserver.HttpExchange;
+import com.focusrecovery.support.MockAiServer;
 import com.sun.net.httpserver.HttpServer;
 
 import tools.jackson.databind.JsonNode;
@@ -98,6 +96,12 @@ class AnalysisIntegrationTest {
 
 	@Autowired
 	private AnalysisResultRepository analysisResultRepository;
+
+	@Autowired
+	private NotificationRepository notificationRepository;
+
+	@Autowired
+	private AlertCandidateTaskRepository alertCandidateTaskRepository;
 
 	@Autowired
 	private AnalysisExecutor analysisExecutor;
@@ -519,6 +523,8 @@ class AnalysisIntegrationTest {
 	}
 
 	private void cleanUp() {
+		alertCandidateTaskRepository.deleteAll();
+		notificationRepository.deleteAll();
 		analysisResultRepository.deleteAll();
 		analysisWindowRepository.deleteAll();
 		pageVisitRepository.deleteAll();
@@ -554,89 +560,4 @@ class AnalysisIntegrationTest {
 	}
 
 	// POST /api/ai/analyses만 받는 모의 AI 서버. 응답을 붙잡아 두거나(hold) 지연·연결 끊기를 흉내 낸다
-	static final class MockAiServer {
-
-		static final Response DISCONNECT = new Response(-1, "", 0);
-
-		record Response(int status, String body, long delayMs) {
-		}
-
-		static Response ok(String body) {
-			return new Response(200, body, 0);
-		}
-
-		private final HttpServer server;
-		private final List<String> requests = Collections.synchronizedList(new ArrayList<>());
-		private volatile Function<String, Response> responder;
-		private volatile CountDownLatch gate = new CountDownLatch(0);
-
-		MockAiServer() {
-			try {
-				server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-			} catch (IOException e) {
-				throw new IllegalStateException(e);
-			}
-			server.setExecutor(Executors.newCachedThreadPool());
-			server.createContext("/api/ai/analyses", this::handle);
-			server.start();
-		}
-
-		String baseUrl() {
-			return "http://127.0.0.1:" + server.getAddress().getPort();
-		}
-
-		void reset(Function<String, Response> responder) {
-			this.responder = responder;
-			requests.clear();
-		}
-
-		void hold() {
-			gate = new CountDownLatch(1);
-		}
-
-		void release() {
-			gate.countDown();
-		}
-
-		List<String> requests() {
-			return List.copyOf(requests);
-		}
-
-		void awaitRequests(int count) throws InterruptedException {
-			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-			while (requests.size() < count && System.nanoTime() < deadline) {
-				Thread.sleep(10);
-			}
-			assertThat(requests).hasSizeGreaterThanOrEqualTo(count);
-		}
-
-		private void handle(HttpExchange exchange) throws IOException {
-			String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-			if (!"POST".equals(exchange.getRequestMethod())) {
-				exchange.sendResponseHeaders(405, -1);
-				return;
-			}
-			requests.add(body);
-			Response response = responder.apply(body);
-			try {
-				gate.await(10, TimeUnit.SECONDS);
-				Thread.sleep(response.delayMs());
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-			}
-			if (response == DISCONNECT) {
-				exchange.close();
-				return;
-			}
-			byte[] bytes = response.body().getBytes(StandardCharsets.UTF_8);
-			exchange.getResponseHeaders().add("Content-Type", "application/json");
-			try {
-				exchange.sendResponseHeaders(response.status(), bytes.length);
-				exchange.getResponseBody().write(bytes);
-			} catch (IOException e) {
-				// 클라이언트가 타임아웃으로 먼저 끊은 경우
-			}
-			exchange.close();
-		}
-	}
 }

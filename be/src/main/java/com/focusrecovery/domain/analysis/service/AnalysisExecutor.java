@@ -15,6 +15,7 @@ import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import com.focusrecovery.domain.alert.service.AlertTaskProcessor;
 import com.focusrecovery.domain.analysis.client.AiAnalysisClient;
 import com.focusrecovery.domain.analysis.client.AiAnalysisOutcome;
 import com.focusrecovery.domain.analysis.entity.AnalysisStatus;
@@ -38,11 +39,12 @@ public class AnalysisExecutor {
 	private final TransactionTemplate transactionTemplate;
 	private final TransactionTemplate newTransactionTemplate;
 	private final TaskExecutor analysisTaskExecutor;
+	private final AlertTaskProcessor alertTaskProcessor;
 
 	public AnalysisExecutor(AnalysisResultRepository analysisResultRepository,
 		AnalysisWindowRepository analysisWindowRepository, AiAnalysisClient aiAnalysisClient,
 		TransactionTemplate transactionTemplate, PlatformTransactionManager transactionManager,
-		TaskExecutor analysisTaskExecutor) {
+		TaskExecutor analysisTaskExecutor, AlertTaskProcessor alertTaskProcessor) {
 		this.analysisResultRepository = analysisResultRepository;
 		this.analysisWindowRepository = analysisWindowRepository;
 		this.aiAnalysisClient = aiAnalysisClient;
@@ -50,6 +52,7 @@ public class AnalysisExecutor {
 		this.newTransactionTemplate = new TransactionTemplate(transactionManager);
 		this.newTransactionTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
 		this.analysisTaskExecutor = analysisTaskExecutor;
+		this.alertTaskProcessor = alertTaskProcessor;
 	}
 
 	// 커밋 직후 요청 스레드에서 실행된다. 분석마다 따로 실행기에 넣고, 어떤 예외도 이미 커밋된 요청의 응답으로 올리지 않는다
@@ -88,17 +91,42 @@ public class AnalysisExecutor {
 				log.error("AI 호출 중 예상하지 못한 예외 analysisId={}", analysisId, e);
 				outcome = AiAnalysisOutcome.failed(INTERNAL_ERROR);
 			}
-			finish(analysisId, outcome);
+			if (finish(analysisId, claim.sessionId(), outcome) && isDrift(outcome)) {
+				processAlertTask(analysisId);
+			}
 		} catch (RuntimeException e) {
 			// 상태 전이 DB 오류 등: 남은 PENDING·RUNNING은 AnalysisRecovery가 제한 시간 뒤 FAILED로 확정한다
 			log.error("분석 처리 실패 analysisId={}", analysisId, e);
 		}
 	}
 
-	private void finish(UUID analysisId, AiAnalysisOutcome outcome) {
-		transactionTemplate.executeWithoutResult(status -> analysisResultRepository.findForUpdateByAnalysisId(analysisId)
+	// RUNNING을 완료·실패로 바꿨으면 true. DRIFT로 완료하면 같은 트랜잭션에서 알림 후보 작업을 등록해,
+	// 결과 저장 직후 서버가 멈춰도 후보 처리가 누락되지 않게 한다(작업은 AlertTaskProcessor가 다시 찾는다)
+	private boolean finish(UUID analysisId, UUID sessionId, AiAnalysisOutcome outcome) {
+		return Boolean.TRUE.equals(transactionTemplate.execute(status -> analysisResultRepository
+			.findForUpdateByAnalysisId(analysisId)
 			.filter(analysis -> analysis.getProcessingStatus() == AnalysisStatus.RUNNING)
-			.ifPresent(analysis -> analysis.finish(outcome, now())));
+			.map(analysis -> {
+				analysis.finish(outcome, now());
+				if (isDrift(outcome)) {
+					alertTaskProcessor.register(analysisId, sessionId);
+				}
+				return true;
+			})
+			.orElse(false)));
+	}
+
+	private static boolean isDrift(AiAnalysisOutcome outcome) {
+		return outcome.errorCode() == null && "DRIFT".equals(outcome.result());
+	}
+
+	// 결과 저장이 커밋된 뒤 바로 처리한다. 실패해도 저장된 분석 결과는 그대로이며 작업은 재시도·복구 대상으로 남는다
+	private void processAlertTask(UUID analysisId) {
+		try {
+			alertTaskProcessor.process(analysisId);
+		} catch (RuntimeException e) {
+			log.error("AI 알림 후보 작업 처리 실패 analysisId={}", analysisId, e);
+		}
 	}
 
 	// 커밋 후 단계에서는 원래 트랜잭션 자원이 아직 묶여 있으므로 새 트랜잭션으로 기록한다

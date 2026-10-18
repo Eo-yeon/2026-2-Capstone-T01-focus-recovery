@@ -34,6 +34,8 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 
+import com.focusrecovery.domain.alert.repository.AlertCandidateTaskRepository;
+import com.focusrecovery.domain.alert.repository.NotificationRepository;
 import com.focusrecovery.domain.analysis.client.AiAnalysisClient;
 import com.focusrecovery.domain.analysis.client.AiProperties;
 import com.focusrecovery.domain.analysis.entity.AnalysisResult;
@@ -47,6 +49,7 @@ import com.focusrecovery.domain.session.repository.WorkSessionRepository;
 import com.focusrecovery.domain.visit.repository.PageVisitRepository;
 import com.focusrecovery.domain.window.entity.AnalysisWindow;
 import com.focusrecovery.domain.window.repository.AnalysisWindowRepository;
+import com.focusrecovery.support.MockAiServer;
 
 import tools.jackson.databind.json.JsonMapper;
 
@@ -57,7 +60,7 @@ import tools.jackson.databind.json.JsonMapper;
 @ActiveProfiles("test")
 class AnalysisRecoveryTest {
 
-	private static final AnalysisIntegrationTest.MockAiServer AI = new AnalysisIntegrationTest.MockAiServer();
+	private static final MockAiServer AI = new MockAiServer();
 
 	@DynamicPropertySource
 	static void properties(DynamicPropertyRegistry registry) {
@@ -89,6 +92,12 @@ class AnalysisRecoveryTest {
 	private AnalysisResultRepository analysisResultRepository;
 
 	@Autowired
+	private NotificationRepository notificationRepository;
+
+	@Autowired
+	private AlertCandidateTaskRepository alertCandidateTaskRepository;
+
+	@Autowired
 	private AnalysisExecutor analysisExecutor;
 
 	@Autowired
@@ -107,7 +116,7 @@ class AnalysisRecoveryTest {
 
 	@BeforeEach
 	void setUp() {
-		AI.reset(request -> AnalysisIntegrationTest.MockAiServer.ok(validBody(request)));
+		AI.reset(request -> MockAiServer.ok(validBody(request)));
 		cleanUp();
 		sessionId = workSessionRepository.save(WorkSession.start("복구 테스트 목표", null)).getSessionId();
 	}
@@ -132,7 +141,7 @@ class AnalysisRecoveryTest {
 		analysisExecutor.run(completed);
 		assertThat(analysisResultRepository.findById(completed).orElseThrow().getProcessingStatus())
 			.isEqualTo(AnalysisStatus.COMPLETED);
-		AI.reset(request -> AnalysisIntegrationTest.MockAiServer.ok(validBody(request)));
+		AI.reset(request -> MockAiServer.ok(validBody(request)));
 
 		analysisRecovery.recoverStale(now);
 
@@ -356,6 +365,8 @@ class AnalysisRecoveryTest {
 	}
 
 	private void cleanUp() {
+		alertCandidateTaskRepository.deleteAll();
+		notificationRepository.deleteAll();
 		analysisResultRepository.deleteAll();
 		analysisWindowRepository.deleteAll();
 		pageVisitRepository.deleteAll();

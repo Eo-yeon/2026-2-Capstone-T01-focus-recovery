@@ -26,6 +26,13 @@ public interface AnalysisResultRepository extends JpaRepository<AnalysisResult, 
 
 	Optional<AnalysisResult> findByWindowId(UUID windowId);
 
+	// from < windowIndex < to 구간 중 NORMAL·TRANSITION으로 완료된 분석이 있는지(정상 복귀 여부)
+	@Query("""
+		select count(r) > 0 from AnalysisResult r join AnalysisWindow w on w.windowId = r.windowId
+		where w.sessionId = :sessionId and w.windowIndex > :from and w.windowIndex < :to
+			and r.processingStatus = :status and r.result in ('NORMAL', 'TRANSITION')""")
+	boolean existsCompletedBetween(UUID sessionId, int from, int to, AnalysisStatus status);
+
 	// 목록·최신 상태는 큰 JSON 컬럼(input_snapshot 등)을 읽지 않도록 요약 필드만 조회한다. 최신 여부는 windowIndex로만 판단한다
 	@Query(value = """
 		select new com.focusrecovery.domain.analysis.dto.AnalysisSummaryResponse(
