@@ -1,6 +1,7 @@
 package com.focusrecovery.domain.alert.service;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Optional;
@@ -132,7 +133,10 @@ public class AlertService {
 		return now().isBefore(lastShownAt.plus(properties.ai().minInterval())) ? "MIN_INTERVAL_NOT_PASSED" : null;
 	}
 
-	// 신규 201 / 미표시 후보 재반환 200. 세션 쓰기 잠금으로 동시 요청을 직렬화해 후보를 하나만 만든다
+	// 고정 주기 회차(잠정 정책): 예정 시각은 startedAt + interval × n(n ≥ 1)으로 세션 시작 시각에 고정하며 shownAt으로 다시 계산하지 않는다.
+	// 현재 시각까지 도래한 가장 최근 회차만 대상이다(놓친 이전 회차는 소급 생성하지 않음). 회차는 예정 시각(scheduled_at)으로 식별하고
+	// 세션 쓰기 잠금 + UNIQUE(session_id, scheduled_at)로 같은 회차 후보를 하나만 만든다.
+	// 신규 201 / 현재 회차 미표시 후보 재반환 200 / 현재 회차가 이미 표시됐거나 첫 회차 전이면 409 ALERT_INTERVAL_NOT_REACHED
 	@Transactional
 	public FixedIntervalResult requestFixedInterval(UUID sessionId) {
 		WorkSession session = workSessionRepository.findForUpdateBySessionId(sessionId)
@@ -143,20 +147,33 @@ public class AlertService {
 		if (session.getStatus() == WorkSessionStatus.ENDED) {
 			throw new ConflictException("SESSION_ENDED", "종료된 작업 세션입니다.");
 		}
-		Optional<Notification> unshown = notificationRepository
-			.findFirstBySessionIdAndAlertTypeAndShownAtIsNullOrderByCreatedAtDesc(sessionId, AlertType.FIXED_INTERVAL);
-		if (unshown.isPresent()) {
-			return new FixedIntervalResult(AlertResponse.of(unshown.get(), null, session.getGoalText()), false);
-		}
-		Instant base = notificationRepository.findLastShownAt(sessionId, AlertType.FIXED_INTERVAL)
-			.orElse(session.getStartedAt());
 		Instant now = now();
-		if (now.isBefore(base.plus(properties.fixedInterval().interval()))) {
-			throw new ConflictException("ALERT_INTERVAL_NOT_REACHED", "고정 주기 알림 간격이 아직 지나지 않았습니다.");
+		Instant scheduledAt = currentFixedSlot(session, now)
+			.orElseThrow(FixedIntervalNotReached::new);
+		Optional<Notification> existing = notificationRepository.findBySessionIdAndScheduledAt(sessionId, scheduledAt);
+		if (existing.isPresent()) {
+			if (existing.get().getShownAt() != null) {
+				throw new FixedIntervalNotReached();
+			}
+			return new FixedIntervalResult(AlertResponse.of(existing.get(), null, session.getGoalText()), false);
 		}
 		Notification created = notificationRepository.save(
-			Notification.fixedInterval(sessionId, FIXED_INTERVAL_MESSAGE, now));
+			Notification.fixedInterval(sessionId, FIXED_INTERVAL_MESSAGE, scheduledAt, now));
 		return new FixedIntervalResult(AlertResponse.of(created, null, session.getGoalText()), true);
+	}
+
+	private static class FixedIntervalNotReached extends ConflictException {
+
+		FixedIntervalNotReached() {
+			super("ALERT_INTERVAL_NOT_REACHED", "다음 고정 주기 알림 예정 시각이 아직 되지 않았습니다.");
+		}
+	}
+
+	// 현재 시각까지 도래한 가장 최근 회차의 예정 시각. 첫 회차(startedAt + interval) 전이면 없음
+	private Optional<Instant> currentFixedSlot(WorkSession session, Instant now) {
+		long intervalMs = properties.fixedInterval().interval().toMillis();
+		long slot = Duration.between(session.getStartedAt(), now).toMillis() / intervalMs;
+		return slot < 1 ? Optional.empty() : Optional.of(session.getStartedAt().plusMillis(intervalMs * slot));
 	}
 
 	// 분석 상태 조회용(읽기 전용, 후보를 만들지 않음): ACTIVE 세션에서 현재 활성화된 방식의 미표시 후보만 반환한다.
@@ -166,8 +183,10 @@ public class AlertService {
 			return null;
 		}
 		if (properties.mode() == AlertType.FIXED_INTERVAL) {
-			return notificationRepository.findFirstBySessionIdAndAlertTypeAndShownAtIsNullOrderByCreatedAtDesc(
-					session.getSessionId(), AlertType.FIXED_INTERVAL)
+			// 현재 회차의 미표시 후보만 반환한다(이전 회차·V8 이전의 회차 없는 후보는 반환하지 않음)
+			return currentFixedSlot(session, now())
+				.flatMap(scheduledAt -> notificationRepository.findBySessionIdAndScheduledAt(session.getSessionId(), scheduledAt))
+				.filter(notification -> notification.getShownAt() == null)
 				.map(notification -> AlertResponse.of(notification, null, session.getGoalText()))
 				.orElse(null);
 		}

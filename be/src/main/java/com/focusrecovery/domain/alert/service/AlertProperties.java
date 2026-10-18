@@ -15,7 +15,7 @@ public record AlertProperties(AlertType mode, Ai ai, FixedInterval fixedInterval
 	public record Ai(Duration minInterval) {
 	}
 
-	// interval: 첫 후보는 세션 startedAt, 이후는 마지막 고정 주기 알림의 shownAt부터의 간격(잠정)
+	// interval: 고정 주기 예정 시각 startedAt + interval × n(n ≥ 1)의 간격(잠정). shownAt으로 다시 계산하지 않는다
 	public record FixedInterval(Duration interval) {
 	}
 

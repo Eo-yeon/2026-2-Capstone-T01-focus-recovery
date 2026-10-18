@@ -48,6 +48,10 @@ public class Notification implements Persistable<UUID> {
 	@Column(name = "shown_at", columnDefinition = "DATETIME(3)")
 	private Instant shownAt;
 
+	// 고정 주기 후보의 예정 회차 시각. AI 후보는 null
+	@Column(name = "scheduled_at", columnDefinition = "DATETIME(3)", updatable = false)
+	private Instant scheduledAt;
+
 	// 서버가 ID를 발급하므로 save()가 merge(조회 후 INSERT)하지 않도록 항상 INSERT 하게 한다
 	@Transient
 	private boolean isNew = true;
@@ -59,8 +63,10 @@ public class Notification implements Persistable<UUID> {
 		return create(sessionId, analysisId, AlertType.AI, message, createdAt);
 	}
 
-	public static Notification fixedInterval(UUID sessionId, String message, Instant createdAt) {
-		return create(sessionId, null, AlertType.FIXED_INTERVAL, message, createdAt);
+	public static Notification fixedInterval(UUID sessionId, String message, Instant scheduledAt, Instant createdAt) {
+		Notification notification = create(sessionId, null, AlertType.FIXED_INTERVAL, message, createdAt);
+		notification.scheduledAt = scheduledAt;
+		return notification;
 	}
 
 	private static Notification create(UUID sessionId, UUID analysisId, AlertType alertType, String message,
@@ -117,5 +123,9 @@ public class Notification implements Persistable<UUID> {
 
 	public Instant getShownAt() {
 		return shownAt;
+	}
+
+	public Instant getScheduledAt() {
+		return scheduledAt;
 	}
 }

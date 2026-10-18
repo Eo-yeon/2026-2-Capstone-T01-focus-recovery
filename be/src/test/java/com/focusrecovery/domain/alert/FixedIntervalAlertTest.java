@@ -57,7 +57,7 @@ import com.focusrecovery.domain.window.entity.AnalysisWindow;
 import com.focusrecovery.domain.window.repository.AnalysisWindowRepository;
 import com.jayway.jsonpath.JsonPath;
 
-// FIXED_INTERVAL 모드(서버 설정) 고정 주기 후보. 간격(잠정 10분) 경계는 Clock을 고정해 검증한다
+// FIXED_INTERVAL 모드(서버 설정) 고정 주기 후보. 예정 시각 startedAt + 10분(잠정) × n의 경계는 Clock을 고정해 검증한다
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
@@ -140,13 +140,15 @@ class FixedIntervalAlertTest {
 			.andExpect(jsonPath("$.shownAt").value(nullValue()))
 			.andExpect(jsonPath("$.createdAt").value(MILLIS_UTC.format(startedAt.plus(INTERVAL))));
 		assertThat(notificationRepository.findAll().getFirst().getShownAt()).isNull();
+		assertThat(notificationRepository.findAll().getFirst().getScheduledAt()).isEqualTo(startedAt.plus(INTERVAL));
 	}
 
 	@Test
 	void 미표시_후보가_있으면_같은_alertId를_200으로_반환하고_상태_조회의_alert로_제공한다() throws Exception {
 		now.set(startedAt.plus(INTERVAL));
 		String alertId = alertId(request(sessionId).andExpect(status().isCreated()));
-		now.set(now.get().plus(Duration.ofHours(1)));
+		// 같은 회차(10분 회차) 안의 재요청
+		now.set(startedAt.plus(Duration.ofMinutes(19)));
 
 		request(sessionId).andExpect(status().isOk()).andExpect(jsonPath("$.alertId").value(alertId));
 		mockMvc.perform(post("/api/sessions/{sessionId}/alerts/fixed-interval", sessionId)
@@ -159,22 +161,104 @@ class FixedIntervalAlertTest {
 		assertThat(notificationRepository.count()).isEqualTo(1);
 	}
 
+	// 예정 시각은 startedAt + 10분 × n으로 고정된다. 첫 알림이 12분에 표시돼도 다음 회차는 22분이 아니라 20분이다
 	@Test
-	void 표시된_뒤에는_마지막_고정_주기_알림의_shownAt부터_간격을_계산한다() throws Exception {
+	void 표시_시각과_무관하게_다음_회차는_시작_시각_기준으로_정해진다() throws Exception {
 		now.set(startedAt.plus(INTERVAL));
 		String first = alertId(request(sessionId).andExpect(status().isCreated()));
-		Instant shownAt = startedAt.plus(Duration.ofMinutes(13));
-		markShown(first, shownAt);
+		markShown(first, startedAt.plus(Duration.ofMinutes(12)));
 
-		now.set(shownAt.plus(INTERVAL).minusMillis(1));
+		// 현재 회차(10분)가 이미 표시됐으므로 다음 예정 시각 전까지 409
+		now.set(startedAt.plus(Duration.ofMinutes(13)));
+		request(sessionId).andExpect(status().isConflict())
+			.andExpect(jsonPath("$.code").value("ALERT_INTERVAL_NOT_REACHED"));
+		now.set(startedAt.plus(Duration.ofMinutes(20)).minusMillis(1));
 		request(sessionId).andExpect(status().isConflict())
 			.andExpect(jsonPath("$.code").value("ALERT_INTERVAL_NOT_REACHED"));
 		mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", sessionId))
 			.andExpect(jsonPath("$.alert").value(nullValue()));
 
-		now.set(shownAt.plus(INTERVAL));
+		now.set(startedAt.plus(Duration.ofMinutes(20)));
 		String second = alertId(request(sessionId).andExpect(status().isCreated()));
 		assertThat(second).isNotEqualTo(first);
+		assertThat(scheduledAt(second)).isEqualTo(startedAt.plus(Duration.ofMinutes(20)));
+		assertThat(shownAt(first)).isEqualTo(startedAt.plus(Duration.ofMinutes(12)));
+	}
+
+	@Test
+	void 중간_회차를_놓쳐도_현재까지_도래한_최신_회차_하나만_만든다() throws Exception {
+		now.set(startedAt.plus(Duration.ofMinutes(35)));
+
+		String alertId = alertId(request(sessionId).andExpect(status().isCreated())
+			.andExpect(jsonPath("$.createdAt").value(MILLIS_UTC.format(now.get()))));
+
+		assertThat(notificationRepository.count()).isEqualTo(1);
+		// 예정 시각(30분)·실제 생성 시각(35분)·표시 시각(없음)을 구분해 저장한다
+		assertThat(scheduledAt(alertId)).isEqualTo(startedAt.plus(Duration.ofMinutes(30)));
+		assertThat(notificationRepository.findById(UUID.fromString(alertId)).orElseThrow().getCreatedAt()).isEqualTo(now.get());
+		assertThat(shownAt(alertId)).isNull();
+		now.set(startedAt.plus(Duration.ofMinutes(39)));
+		request(sessionId).andExpect(status().isOk()).andExpect(jsonPath("$.alertId").value(alertId));
+		assertThat(notificationRepository.count()).isEqualTo(1);
+	}
+
+	@Test
+	void 이전_회차의_미표시_후보는_기록을_남기되_새_회차에서_반환하지_않는다() throws Exception {
+		now.set(startedAt.plus(INTERVAL));
+		String old = alertId(request(sessionId).andExpect(status().isCreated()));
+
+		now.set(startedAt.plus(Duration.ofMinutes(20)));
+		mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", sessionId))
+			.andExpect(jsonPath("$.alert").value(nullValue()));
+		String current = alertId(request(sessionId).andExpect(status().isCreated()));
+
+		assertThat(current).isNotEqualTo(old);
+		mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", sessionId))
+			.andExpect(jsonPath("$.alert.alertId").value(current));
+		assertThat(notificationRepository.findById(UUID.fromString(old))).isPresent();
+		assertThat(shownAt(old)).isNull();
+	}
+
+	// V8 이전에 만든 고정 주기 후보(scheduled_at 없음)는 어느 회차에도 속하지 않으므로 반환·재사용하지 않고 기록은 그대로 둔다
+	@Test
+	void 회차_정보가_없는_기존_고정_주기_후보는_반환하거나_재사용하지_않는다() throws Exception {
+		UUID legacy = UUID.randomUUID();
+		jdbcTemplate.update("insert into notification (alert_id, session_id, alert_type, message, created_at) "
+				+ "values (?, ?, 'FIXED_INTERVAL', '이전 후보', ?)", legacy.toString(), sessionId.toString(),
+			LocalDateTime.ofInstant(startedAt.plus(Duration.ofMinutes(11)), ZoneOffset.UTC));
+		now.set(startedAt.plus(Duration.ofMinutes(15)));
+
+		mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", sessionId))
+			.andExpect(jsonPath("$.alert").value(nullValue()));
+		String created = alertId(request(sessionId).andExpect(status().isCreated()));
+
+		assertThat(created).isNotEqualTo(legacy.toString());
+		assertThat(jdbcTemplate.queryForObject("select count(*) from notification where alert_id = ? and scheduled_at is null "
+			+ "and shown_at is null", Long.class, legacy.toString())).isEqualTo(1);
+	}
+
+	@Test
+	void 분석_상태_조회는_고정_주기_후보를_만들거나_바꾸지_않는다() throws Exception {
+		now.set(startedAt.plus(INTERVAL));
+		request(sessionId).andExpect(status().isCreated());
+		now.set(startedAt.plus(Duration.ofMinutes(25)));
+		List<java.util.Map<String, Object>> before = jdbcTemplate.queryForList("select * from notification order by alert_id");
+
+		for (int i = 0; i < 3; i++) {
+			mockMvc.perform(get("/api/sessions/{sessionId}/analysis-status", sessionId))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.alert").value(nullValue()));
+		}
+
+		assertThat(jdbcTemplate.queryForList("select * from notification order by alert_id")).isEqualTo(before);
+	}
+
+	private Instant scheduledAt(String alertId) {
+		return notificationRepository.findById(UUID.fromString(alertId)).orElseThrow().getScheduledAt();
+	}
+
+	private Instant shownAt(String alertId) {
+		return notificationRepository.findById(UUID.fromString(alertId)).orElseThrow().getShownAt();
 	}
 
 	@Test
@@ -201,6 +285,12 @@ class FixedIntervalAlertTest {
 
 		assertThat(statuses).containsOnlyOnce(201).filteredOn(code -> code != 201).containsOnly(200);
 		assertThat(alertIds).containsOnly(alertIds.getFirst());
+		assertThat(notificationRepository.count()).isEqualTo(1);
+
+		// 같은 회차가 표시된 뒤 재요청은 409
+		markShown(alertIds.getFirst(), now.get());
+		request(sessionId).andExpect(status().isConflict())
+			.andExpect(jsonPath("$.code").value("ALERT_INTERVAL_NOT_REACHED"));
 		assertThat(notificationRepository.count()).isEqualTo(1);
 	}
 

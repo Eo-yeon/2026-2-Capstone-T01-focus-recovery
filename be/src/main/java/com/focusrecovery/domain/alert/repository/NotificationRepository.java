@@ -16,8 +16,7 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
 
 	Optional<Notification> findByAnalysisIdAndShownAtIsNull(UUID analysisId);
 
-	Optional<Notification> findFirstBySessionIdAndAlertTypeAndShownAtIsNullOrderByCreatedAtDesc(UUID sessionId,
-		AlertType alertType);
+	Optional<Notification> findBySessionIdAndScheduledAt(UUID sessionId, Instant scheduledAt);
 
 	@Query("select max(n.shownAt) from Notification n where n.sessionId = :sessionId and n.alertType = :alertType")
 	Optional<Instant> findLastShownAt(UUID sessionId, AlertType alertType);

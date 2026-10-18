@@ -56,6 +56,7 @@ public class AnalysisController {
 			**alert (알림 표시 기준)**
 			- 실제 알림 표시는 BE가 반환한 alert 후보를 기준으로 합니다. FE는 표시 직전에 세션이 ACTIVE인지와 alertId 중복 여부를 확인합니다.
 			- 서버 설정(잠정)으로 활성화된 한 가지 방식(AI 또는 FIXED_INTERVAL)의 아직 표시되지 않은 후보만 반환합니다. 세션별 방식 선택은 아직 지원하지 않습니다.
+			- 고정 주기 후보는 현재 회차(startedAt + 간격 × n 중 지금까지 도래한 가장 최근 예정 시각)의 미표시 후보만 반환합니다. 이전 회차 후보는 반환하지 않습니다.
 			- AI 후보는 실제 최신 구간(analysis_window의 최대 windowIndex)의 COMPLETED·DRIFT 분석에 연결된 것만 반환합니다. 더 최신 구간이 생겼으면 이전 구간의 후보는 반환하지 않습니다.
 			- 반환할 후보가 없거나 세션이 종료됐으면 null입니다. latestCompletedAnalysis가 DRIFT여도 alert가 null이면 알림을 표시하지 않습니다.
 			- 같은 후보는 표시 전까지 같은 alertId로 반환됩니다. 실제 표시 확인 API는 후속 작업이라 현재 shownAt은 항상 null입니다.

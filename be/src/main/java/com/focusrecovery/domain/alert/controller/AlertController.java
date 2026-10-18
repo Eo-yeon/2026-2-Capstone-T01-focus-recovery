@@ -41,13 +41,16 @@ public class AlertController {
 
 			- 방식은 서버 전체 설정(focus-recovery.alert.mode, 기본 AI)으로 하나만 활성화하는 잠정 구현이며 세션별 방식 선택은 아직 지원하지 않습니다.
 			  AI 모드에서는 409 FIXED_INTERVAL_DISABLED입니다. 모드 전환은 진행 중인 세션을 모두 종료한 뒤 서버를 재시작하는 운영을 전제로 합니다.
-			- 간격(focus-recovery.alert.fixed-interval.interval, 잠정 10분): 첫 후보는 세션 startedAt, 이후는 마지막 고정 주기 알림의 shownAt부터 계산합니다.
-			  간격이 지나지 않았으면 409 ALERT_INTERVAL_NOT_REACHED입니다(경과 시간이 간격과 같으면 생성).
-			- 아직 표시되지 않은 고정 주기 후보가 있으면 새로 만들지 않고 같은 alertId를 200으로 반환합니다. 동시 요청에도 후보는 하나입니다.
+			- 예정 시각(잠정 정책): 세션 startedAt + 간격 × n(n = 1, 2, 3…)으로 세션 시작 시각에 고정합니다. 간격(focus-recovery.alert.fixed-interval.interval)은 잠정값 10분입니다.
+			  예) 10분·20분·30분. 실제 표시 시각(shownAt)으로 다음 예정 시각을 다시 계산하지 않으므로, 첫 알림이 12분에 표시돼도 다음 예정 시각은 20분입니다.
+			- 현재 시각까지 도래한 가장 최근 회차만 생성 대상입니다. 놓친 이전 회차는 소급 생성하지 않습니다(예: 35분 첫 요청 → 30분 회차 후보 하나).
+			- 현재 회차의 미표시 후보가 있으면 같은 alertId를 200으로 반환합니다. 같은 회차 후보는 동시 요청에도 하나입니다.
+			- 첫 회차 전이거나 현재 회차가 이미 표시됐으면 다음 예정 시각까지 409 ALERT_INTERVAL_NOT_REACHED입니다(경계 시각 정각이면 해당 회차).
+			- 이전 회차의 미표시 후보는 기록으로 남지만 이후 회차에서는 반환하지 않습니다. createdAt은 실제 후보 생성 시각이며 예정 시각과 다를 수 있습니다.
 			- analysisId·windowIndex는 null이며 실제 표시 확인 전에는 shownAt이 null입니다. 후보 생성은 실제 표시가 아닙니다.
 			""")
-	@ApiResponse(responseCode = "201", description = "새 후보 생성")
-	@ApiResponse(responseCode = "200", description = "기존 미표시 후보 반환 (같은 alertId)")
+	@ApiResponse(responseCode = "201", description = "현재 회차의 새 후보 생성")
+	@ApiResponse(responseCode = "200", description = "현재 회차의 기존 미표시 후보 반환 (같은 alertId)")
 	@ApiResponse(responseCode = "400", description = "세션 ID가 UUID 형식이 아니거나 요청 본문이 JSON 객체가 아님",
 		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
 			{"code": "INVALID_REQUEST", "message": "세션 ID가 올바른 UUID 형식이 아닙니다.", "fieldErrors": []}""")))
@@ -55,14 +58,14 @@ public class AlertController {
 		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
 			{"code": "SESSION_NOT_FOUND", "message": "작업 세션을 찾을 수 없습니다.", "fieldErrors": []}""")))
 	@ApiResponse(responseCode = "409", description = "FIXED_INTERVAL_DISABLED: 고정 주기 방식 비활성 / SESSION_ENDED: 종료된 세션 / "
-		+ "ALERT_INTERVAL_NOT_REACHED: 간격 미도달",
+		+ "ALERT_INTERVAL_NOT_REACHED: 첫 예정 시각 전이거나 현재 회차가 이미 표시됨",
 		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = {
 			@ExampleObject(name = "FIXED_INTERVAL_DISABLED", value = """
 				{"code": "FIXED_INTERVAL_DISABLED", "message": "고정 주기 알림이 활성화되어 있지 않습니다.", "fieldErrors": []}"""),
 			@ExampleObject(name = "SESSION_ENDED", value = """
 				{"code": "SESSION_ENDED", "message": "종료된 작업 세션입니다.", "fieldErrors": []}"""),
 			@ExampleObject(name = "ALERT_INTERVAL_NOT_REACHED", value = """
-				{"code": "ALERT_INTERVAL_NOT_REACHED", "message": "고정 주기 알림 간격이 아직 지나지 않았습니다.", "fieldErrors": []}""")
+				{"code": "ALERT_INTERVAL_NOT_REACHED", "message": "다음 고정 주기 알림 예정 시각이 아직 되지 않았습니다.", "fieldErrors": []}""")
 		}))
 	@PostMapping("/fixed-interval")
 	public ResponseEntity<AlertResponse> createFixedInterval(
