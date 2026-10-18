@@ -80,3 +80,20 @@ describe('visit API contract', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 });
+
+describe('Unicode payload preservation at the visit API boundary', () => {
+  it.each([
+    ['Korean', '가'.repeat(5000), 5000, 5000, 201],
+    ['English', 'a'.repeat(5000), 5000, 5000, 201],
+    ['non-BMP within UTF-16 limit', '😀'.repeat(2500), 2500, 5000, 201],
+    ['non-BMP above UTF-16 limit', '😀'.repeat(2501), 2501, 5002, 400],
+  ] as const)('preserves %s without truncating for server validation', async (_label, content, points, units, status) => {
+    visit.content = content;
+    expect([...visit.content]).toHaveLength(points); expect(visit.content).toHaveLength(units);
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify(status === 400 ? { code: 'INVALID_REQUEST' } : { ...visit, updatedAt: null }), { status }));
+    if (status === 400) await expect(savePageVisit(visit)).rejects.toMatchObject({ status: 400, retryable: false });
+    else await expect(savePageVisit(visit)).resolves.toMatchObject({ content });
+    expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as string).content).toBe(content);
+    expect(visit.content).toBe(content);
+  });
+});

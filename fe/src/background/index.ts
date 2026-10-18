@@ -79,7 +79,7 @@ const ready = (async () => {
     || pendingStart.goalText !== activeStart.goalText || pendingStart.apiBaseUrl !== activeStart.apiBaseUrl
     || (pendingStart.response && pendingStart.response.sessionId !== activeStart.response?.sessionId))) invalidRecovery = 'conflicting-records';
   const saved = await chrome.storage.session.get('collection');
-  delivery.restore((await chrome.storage.session.get('visitDelivery')).visitDelivery);
+  const savedDelivery = (await chrome.storage.session.get('visitDelivery')).visitDelivery;
   if (saved.collection) {
     const state = saved.collection as CollectionState;
     if (state.session && (state.session.source !== 'server' || !isWorkSession(state.session) || state.session.status !== 'ACTIVE')) {
@@ -93,6 +93,7 @@ const ready = (async () => {
   if (!activeStart && pendingStart?.response?.status === 'ACTIVE'
     && collector.state.session?.sessionId === pendingStart.response.sessionId) activeStart = pendingStart;
   const expectedSessionId = activeStart?.response?.sessionId;
+  delivery.restore(savedDelivery, expectedSessionId ?? collector.state.session?.sessionId ?? collector.state.candidates[0]?.sessionId);
   if (activeStart && ((collector.state.session && collector.state.session.sessionId !== expectedSessionId)
     || collector.state.candidates.some(candidate => candidate.sessionId !== expectedSessionId))) invalidRecovery = 'conflicting-records';
   if (!collector.state.session && retainedSession && !pendingStart && !activeStart) invalidRecovery ??= 'missing-request';

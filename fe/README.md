@@ -10,7 +10,7 @@ Manifest V3 기반 개발용 페이지 수집기입니다. React popup의 목표
 
 `src/background/visit-delivery.ts`는 큐에 처음 추가할 때 평탄한 `PageVisit` 복사본을 고정합니다. 이후 Collector의 체류시간·전환 횟수·버전 변화는 이 요청에 반영하지 않습니다. 큐 상태와 최초 요청은 HTTP 전에 trusted `storage.session`에 저장합니다. 기존 직렬 실행기는 Collector 처리·스냅샷·저장·전송 상태 반영만 수행하며, **fetch와 응답 대기는 직렬 실행기 밖**에서 수행합니다. 이벤트 도착 순서를 유지하고 HTTP 중에도 수집과 로컬 종료를 처리합니다.
 
-한 번에 한 요청만 실행하고 sequence 오름차순으로 보냅니다. 성공 응답의 검증이 끝나 `acked`가 된 뒤에만 다음 방문을 보냅니다. 새 이벤트는 동일 ID를 다시 큐에 넣지 않습니다. Worker 재기동 뒤 첫 확장 이벤트에서 checkpoint를 읽고 `sending`을 동일 스냅샷의 재시도로 복구합니다. ACK가 있으면 재전송하지 않습니다. 서버 저장 후 응답만 유실되면 같은 ID·원본으로 POST하여 BE의 200 재전송 응답을 받습니다. 중복 행·Window 방지는 BE의 기존 원본 비교·유일성 제약과 이 순차 ACK 정책을 함께 사용합니다.
+한 번에 한 요청만 실행하고 sequence 오름차순으로 보냅니다. 복원 시 Collector/저장된 세션 생성 응답의 세션 ID와 큐 세션을 비교하고, ACK가 앞에서부터 연속된 상태인지 확인합니다. 세션 불일치나 앞 미확인·뒤 ACK 상태는 원본을 수정하지 않고 보류합니다. 성공 응답의 검증이 끝나 `acked`가 된 뒤에만 다음 방문을 보냅니다. 새 이벤트는 동일 ID를 다시 큐에 넣지 않습니다. Worker 재기동 뒤 첫 확장 이벤트에서 checkpoint를 읽고 `sending`을 동일 스냅샷의 재시도로 복구합니다. ACK가 있으면 재전송하지 않습니다. 서버 저장 후 응답만 유실되면 같은 ID·원본으로 POST하여 BE의 200 재전송 응답을 받습니다. 중복 행·Window 방지는 BE의 기존 원본 비교·유일성 제약과 이 순차 ACK 정책을 함께 사용합니다.
 
 | 응답/실패 | 처리 |
 | --- | --- |
@@ -19,7 +19,7 @@ Manifest V3 기반 개발용 페이지 수집기입니다. React popup의 목표
 | 400 | 요청 확인 필요 상태로 유지, 자동·버튼 재시도 없음 |
 | 404 | 세션/리소스 확인 필요 상태, 자동 새 세션 생성 없음 |
 | 409 | `SESSION_ENDED`, `VISIT_ID_CONFLICT`, `VISIT_SEQUENCE_CONFLICT`, `VISIT_SEQUENCE_OUT_OF_ORDER` 코드 보존, 재시도/ID·순서 교체 없이 보류 |
-| network·10초 timeout·5xx·408·429·읽을 수 없는 성공 JSON | 최초 포함 최대 3회, 첫/둘째 실패 후 1초/2초 대기. 소진 후 명시적 **같은 방문 재시도**로 같은 스냅샷을 최대 3회 다시 시도 |
+| network·10초 timeout·5xx·408·429·읽을 수 없는 성공 JSON | 정상 연속 실행에서 최초 포함 최대 3회, 첫/둘째 실패 후 1초/2초 대기. 소진 후 명시적 **같은 방문 재시도**로 같은 스냅샷을 최대 3회 다시 시도 |
 | 원본과 다른 성공 응답·알 수 없는 거절 | ACK하지 않고 확인 필요 상태로 유지 |
 | 전송 checkpoint 손상·API 주소 변경·저장 실패 | 원본 checkpoint를 자동 덮어쓰지 않고 전송 보류. Worker/저장소 및 기존 서버 확인 필요 |
 
@@ -34,7 +34,7 @@ Manifest V3 기반 개발용 페이지 수집기입니다. React popup의 목표
 ### 실제 FE–BE–MySQL 검증 절차
 
 1. 개인정보가 없는 **전용 테스트 DB**에 기존 BE를 연결하고 실행합니다. 예: 별도 MySQL 8.4의 `focus_recovery`, Java 21, `DB_URL`과 BE 포트 지정. 기존 데이터베이스에 테스트를 실행하지 마세요.
-2. `fe`에서 아래 명령을 실행합니다. 스크립트는 임시 확장/프로필에 합성 문서 호스트 권한을 부여하고, 실제 Popup → 세션 API → Collector → 방문 API를 사용합니다. API를 mock하거나 요청을 가로채지 않습니다. `CHROMIUM_PATH`는 설치한 Chrome for Testing 실행 파일입니다.
+2. `fe`에서 아래 명령을 실행합니다. 스크립트는 임시 확장/프로필에 합성 문서 호스트 권한을 부여하고, 실제 Popup → 세션 API → Collector → 방문 API를 사용합니다. 성공 요청은 테스트 전용 HTTP 프록시(`scripts/visit-test-proxy.mjs`)를 거쳐 실제 BE에 전달합니다. BE가 실제 저장을 마친 뒤 응답만 보류할 수 있습니다. A-2/A-3의 실패 구간만 프록시가 503을 주입하며, 이를 실제 BE 오류 검증으로 간주하지 않습니다. `CHROMIUM_PATH`는 설치한 Chrome for Testing 실행 파일입니다.
 
 ```sh
 INTEGRATION_API_BASE_URL=http://localhost:18043 \
@@ -42,7 +42,7 @@ CHROMIUM_PATH="/absolute/path/to/Chrome for Testing" \
 node scripts/visit-integration-test.mjs
 ```
 
-3. 비밀번호 없는 root를 쓰는 **전용 임시** MySQL 컨테이너라면 `INTEGRATION_MYSQL_CONTAINER=컨테이너명`을 함께 지정하면 실제 SQL로 방문·Window 수와 구성도 검사합니다. 이 옵션이 없으면 DB 검사는 명시적으로 SKIP합니다. 비밀정보를 인자·문서에 넣지 마세요. 스크립트는 방문 6개/sequence 1~6, ACK, 실제 서버 GET 결과, 각 방문의 동일 POST 200 재전송, 재전송 전후 실제 SQL의 방문 6개·Window 2개와 `[1,2,3,4,5]`, `[2,3,4,5,6]` 구성, Worker 재기동의 ACK 복구를 확인합니다. 임시 브라우저 파일은 자동 삭제합니다. 생성된 서버 세션은 ACTIVE로 남으므로 검증 후 전용 BE/DB 컨테이너를 정리하세요.
+3. 비밀번호 없는 root를 쓰는 **전용 임시** MySQL 컨테이너라면 `INTEGRATION_MYSQL_CONTAINER=컨테이너명`을 함께 지정하면 실제 SQL로 방문·Window 수와 구성도 검사합니다. 이 옵션이 없으면 DB 검사는 명시적으로 SKIP합니다. 비밀정보를 인자·문서에 넣지 마세요. 스크립트는 방문 6개/sequence 1~6, ACK, 실제 서버 GET 결과, 각 방문의 동일 POST 200 재전송, 재전송 전후 실제 SQL의 방문 6개·Window 2개와 `[1,2,3,4,5]`, `[2,3,4,5,6]` 구성, Worker 재기동의 ACK 복구를 확인합니다. 추가로 A/B 연속 세션, 미확인 방문의 신규 시작 차단과 명시적 재시도, BE 저장 직후 ACK 유실+실제 Worker target 종료, 전송 중 로컬 종료/삭제, Unicode 경계를 검사합니다. 임시 브라우저 파일은 자동 삭제합니다. 생성된 서버 세션은 ACTIVE로 남으므로 검증 후 전용 BE/DB 컨테이너를 정리하세요.
 4. `CHROMIUM_PATH="…" npm run test:browser`는 별도 합성 API 회귀 테스트입니다. 세션 응답 유실/동일 키 복구, 방문 응답 유실/동일 ID 재전송 200, 검색·SPA·탭·Worker·제외 정책을 검사합니다. 실제 BE 검증과 구분합니다.
 
 ### Issue #43 실행 결과 (2026-10-18)
@@ -51,6 +51,41 @@ node scripts/visit-integration-test.mjs
 - macOS Chrome for Testing **151.0.7922.34**, 합성 API MV3 테스트: 성공. 방문 응답 유실 후 동일 ID 재시도, 200 ACK, 순서 및 Worker 복구를 포함합니다. 기본 Playwright 바이너리는 설치되어 있지 않아 첫 실행은 실패했고, 기존 설치 바이너리를 명시해 통과했습니다. native 다중 창 포커스/최소화는 `HEADED=1` 미실행으로 SKIP했습니다.
 - 실제 Java **21.0.10**, Spring Boot **4.1.1**, 전용 MySQL **8.4.9**, 위 Chrome의 실제 6개 수집 방문 저장·ACK·6개 중복 POST 200·목록 불변·Worker ACK 복구를 검증했습니다. 실제 SQL에서 재전송 전후 모두 중복 없는 방문 6개·Window 2개, Window 1=[1,2,3,4,5], Window 2=[2,3,4,5,6]를 확인했습니다. 임시 BE와 테스트 컨테이너는 검증 후 정리했습니다.
 - Windows 11 Chrome Stable, 실제 사이트의 새 Google/Naver DOM, 화면 기반 권한 dialog는 이번 작업에서 검증하지 않았습니다. 행동 PATCH·브라우저 재시작의 방문 복원은 구현하지 않았습니다.
+
+### Issue #43 리뷰 후 보완 검증 (2026-10-18)
+
+작업 기준은 `feat/43/page-visit-api-integration`의 `d9e0e72`, 미커밋 변경 없음입니다. 최신 `upstream/main`은 `b9f6de5`이며 별도 알림 기능의 6개 커밋은 병합하지 않았습니다. 이 검증은 현재 작업 브랜치의 BE/Flyway V1~V8로 수행했습니다.
+
+정상 세션 혼합은 재현되지 않았습니다. 기능 수정은 두 재현 테스트로 확인한 복원 검증 누락에 한정합니다. 기존 큐의 내부 세션 ID가 일치해도 Collector와 다른 세션이면 차단하며, 앞 방문이 미확인인데 뒤 방문이 ACK인 불가능한 순서도 차단합니다. 두 경우 모두 원본 checkpoint를 자동 덮어쓰거나 ID/sequence를 고치지 않습니다. 정상 세션 전환, Collector·Popup·API 클라이언트 정책은 변경하지 않았습니다.
+
+| 항목 | 실제 검증 및 결과 |
+| --- | --- |
+| A-1 연속 세션 | A의 방문 6개를 모두 ACK한 뒤 로컬 종료하고 명시적 기록 삭제 없이 B 생성. B의 2개 방문은 새 세션과 sequence 1·2로 저장. Worker 재기동 후 A 재전송·중복·복원 충돌 없음. 실제 세션별 SQL/GET 확인 |
+| A-2 미확인 방문 | 프록시 503을 3회 주입. 새 세션 API 호출 차단, 오류 표시, 원본 스냅샷·ID·sequence 보존. 이 실패 자체는 주입된 전송 오류이며 실제 BE 장애가 아님 |
+| A-3 명시적 재시도 | 503 주입 해제 후 같은 요청이 실제 BE에 저장·ACK됨. 이후 새 세션에서 2개 방문 정상 저장 |
+| B 저장 직후 Worker 중단 | 실제 BE의 5번째 방문 201과 첫 Window SQL 저장 확인 후 응답 보류. FE checkpoint는 `sending`, 6번째 방문은 `queued`. CDP `Target.closeTarget`과 기존 target 소멸 확인 뒤 재기동. 같은 5번 원본 POST가 실제 BE의 200으로 ACK되고, 저장된 ACK를 확인한 뒤에만 6번 요청 도착 |
+| Window 일관성 | 중단 전 실제 SQL에 방문 5개·Window 1개, 복구 후 방문 6개·Window 2개. 각 방문 ID·sequence와 Window index·끝 방문 중복 없음. 구성 [1,2,3,4,5], [2,3,4,5,6] 유지 |
+| C-1 전송 중 로컬 종료 | 5번 응답 보류 중 로컬 종료가 즉시 처리되고 6번 후보 확정. 복구 후 두 요청이 순차 저장되며 로컬 종료 상태 유지. Worker 중단 없는 종료 흐름도 Background 회귀 테스트로 확인 |
+| C-2 전송 중 로컬 삭제 | 실제 BE가 1번을 저장하고 응답을 보류한 동안 로컬 종료·명시적 삭제. 늦은 실제 201 수신 후에도 checkpoint·후보는 비어 있고 2번 미전송. 서버의 1번 기록은 유지. Popup의 서버 저장 가능성·서버 삭제 아님 안내 확인 |
+| C-3 실패 후 삭제 | 실제 Unicode 400 원본이 Worker 재기동·허용되지 않는 재시도 뒤에도 보존됨. 명시적 기록 삭제 후에만 로컬 제거. 삭제 전 경고 표시 확인 |
+| Unicode | 실제 Collector 추출→BE 전송. 한글 5,000자·영문 5,000자·이모지 2,500개(UTF-16 5,000)는 201. 이모지 2,501개(code point 2,501 / UTF-16 5,002)는 실제 400, DB 0건. 요청 원본을 절단·보정하거나 새 ID로 보내지 않음 |
+
+`queued`·`sending`·`retry-wait`·`failed`·`acked`의 각 복원은 단위 테스트와 실제 Background 모듈을 재로드하는 모의 Chrome/HTTP adapter 테스트에서 모두 확인했습니다. `sending`은 같은 원본으로 재시도, `acked`는 중복 전송 없음, `retry-wait`는 대기 시각 유지, `failed`는 자동 재시도 없이 유지합니다. 실제 Chrome·BE 테스트에서는 `sending`+`queued`, `failed`, `acked` 복구를 확인했으며 `retry-wait` 상태 자체에서의 실제 Chrome 강제 종료는 별도로 실행하지 않았습니다. 손상·세션 불일치·ACK 역전·API Base URL 변경의 차단과 원본 보존은 모의 adapter/단위 테스트 범위입니다.
+
+재시도 보장 범위는 정상 연속 실행에서 최초 포함 최대 3회(1초/2초 대기), 이후 명시적 재시도입니다. `sending`으로 중단된 요청은 결과를 모르므로 재기동 시 같은 스냅샷으로 추가 전송할 수 있습니다. 마지막 시도 도중 중단됐다면 복구 전송으로 시도 횟수가 4가 될 수 있고, 이 요청이 실패하면 `failed`로 멈추는 것을 테스트했습니다. **Worker 중단이 반복되는 전체 수명에 걸친 최대 3회 보장은 아닙니다.** 별도 장기 재시도 스케줄러나 전역 예산은 구현하지 않았습니다.
+
+로컬 종료는 수집만 끝내고 확정 방문 전송을 계속합니다. 미확인 방문이 있으면 새 세션을 차단하며, 사용자의 명시적 로컬 삭제는 복구용 스냅샷까지 제거합니다. 이미 전송 중이거나 저장된 서버 데이터는 삭제되지 않습니다. 늦은 ACK는 삭제된 로컬 큐를 재생성하지 않습니다. 기존 Popup 안내를 유지했고 자동 초기화는 추가하지 않았습니다.
+
+검증 환경은 macOS Chrome for Testing 151.0.7922.34, Java 21.0.10, Spring Boot 4.1.1, 전용 임시 MySQL 8.4.9입니다. 초기 Playwright Worker `close` 이벤트 대기는 timeout이 발생해, 확장 Worker의 CDP target 종료 및 소멸을 직접 확인하는 방식으로 변경했습니다. 성공 응답과 SQL은 실제 BE/DB 결과이며 본문·개인정보·비밀정보는 출력하지 않습니다.
+
+- 자동 테스트: 기존 **405개 유지 + 신규 27개 = 432개**. 전송기 복원 14개, Background 세션/복원/삭제 9개, API Unicode 4개. 기존 검증 삭제·완화 없음.
+- `npm run typecheck`, `npm test`(16개 파일 / 432개), `npm run build`, `git diff --check`: 최종 실행 성공. 기존 합성 API MV3 브라우저 테스트도 성공했으며 native 다중 창 검사는 SKIP했습니다.
+- 새 실제 통합 시나리오 A-1/A-2/A-3/B/C-1/C-2/C-3/E와 SQL 검사: 최종 재실행 성공. 테스트 서버와 전용 MySQL 컨테이너/데이터는 검증 후 정리했습니다. A-2/A-3의 503 구간은 명시적으로 프록시 주입 오류로 구분합니다.
+- Windows 11 Chrome Stable, native 다중 창 포커스/최소화(`HEADED=1`), 화면 기반 권한 dialog, 실제 Google/Naver DOM 재검증은 미실행입니다. BE 단위 테스트 전체는 이번 FE 보완 작업에서 실행하지 않았습니다.
+
+현재 구현은 통제된 파일럿 수집에 사용할 수 있습니다. `storage.session`은 같은 브라우저 세션의 Worker 재기동 복구를 지원하지만 브라우저 재시작·확장 reload/업데이트·저장 전 종료·저장소 장애·명시적 삭제에서 미전송 데이터가 유실될 수 있습니다. 타이머는 Worker를 자동으로 깨우거나 장기간 유지하지 않으며 다음 확장 이벤트가 필요할 수 있습니다. 장기 무손실 수집에는 IndexedDB 영속 큐와 복구 정책이 필요합니다. 이는 이번 보완에서 구현하지 않았습니다.
+
+BE의 UTF-16 제한과 FE의 code point 제한을 통일할지 팀 협의가 필요합니다. 현재는 원본을 유지하고 400으로 멈추므로 후속 방문 전송도 보류됩니다. 열린 탭에 의한 전송 지연과 활성 10초 분석 시점, 영구 실패 시 운영 복구 방식도 후속 협의 대상입니다. 행동 PATCH·서버 종료·END_PENDING·AI·장기 alarms 스케줄러·DB 스키마 변경은 포함하지 않았습니다.
 
 ## 개발 환경 및 명령
 

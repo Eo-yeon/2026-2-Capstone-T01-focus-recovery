@@ -24,18 +24,19 @@ export class VisitDelivery {
   private running = false;
   private timer: ReturnType<typeof setTimeout> | undefined;
   constructor(private mutate: <T>(operation: () => T) => Promise<T>, private canSend: () => boolean, private send = savePageVisit) {}
-  restore(value: unknown) {
+  restore(value: unknown, sessionId?: string) {
     if (value === undefined) return;
     const saved = value as Checkpoint;
     if (!saved || saved.apiBaseUrl !== API_BASE_URL || !Array.isArray(saved.entries)
       || saved.entries.some(entry => !isSnapshot(entry?.visit) || entry.visitId !== entry.visit.visitId || entry.sequence !== entry.visit.sequence
-        || !Number.isSafeInteger(entry.sequence) || entry.sequence < 1 || typeof entry.visit.sessionId !== 'string'
+        || !Number.isSafeInteger(entry.sequence) || entry.sequence < 1 || (sessionId !== undefined && entry.visit.sessionId !== sessionId)
         || !['queued', 'sending', 'retry-wait', 'failed', 'acked'].includes(entry.phase)
         || !Number.isSafeInteger(entry.attempts) || entry.attempts < 0
         || (entry.phase === 'retry-wait' && !Number.isFinite(entry.nextRetryAt)))
       || new Set(saved.entries.map(entry => entry.visitId)).size !== saved.entries.length
       || saved.entries.some((entry, index) => index > 0 && (entry.sequence <= saved.entries[index - 1].sequence
-        || entry.visit.sessionId !== saved.entries[0].visit.sessionId))) {
+        || entry.visit.sessionId !== saved.entries[0].visit.sessionId
+        || (entry.phase === 'acked' && saved.entries[index - 1].phase !== 'acked')))) {
       this.blocked = '방문 전송 checkpoint 또는 API 서버 설정을 확인해 주세요. 원본을 보존하고 전송을 보류합니다.';
       return;
     }

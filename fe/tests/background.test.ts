@@ -1050,3 +1050,119 @@ describe('visit HTTP integration in the real background adapter', () => {
     expect(memory.collection.candidates).toEqual([]);
   });
 });
+
+describe('session separation and local delivery lifecycle', () => {
+  async function scenario() {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(20000);
+    const sessions: string[] = [], visits: { sessionId: string; body: any }[] = [];
+    let fail = false;
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      const body = JSON.parse(init!.body as string), path = String(url);
+      if (!path.endsWith('/visits')) {
+        const session = serverSession(body.goalText, Date.now()); sessions.push(session.sessionId);
+        return new Response(JSON.stringify(session), { status: 201 });
+      }
+      const sessionId = path.split('/').at(-2)!; visits.push({ sessionId, body: structuredClone(body) });
+      return new Response(JSON.stringify(fail ? { code: 'SERVER_ERROR' } : { ...body, sessionId, updatedAt: null }), { status: fail ? 503 : 201 });
+    });
+    const begin = async () => {
+      const result = await message({ type: 'start', goalText: '연속 세션 방문 보존 검증하기' });
+      expect(result.ok).toBe(true); return result.status!.session!.sessionId;
+    };
+    const collect = async (sessionId: string, count: number) => {
+      for (let i = 0; i < count; i++) {
+        clock.mockReturnValue(Date.now() + 1500);
+        frame = { documentId: crypto.randomUUID(), url: `https://example.com/${sessionId}/${i}` };
+        const sender = { ...pageSender, documentId: frame.documentId, url: frame.url };
+        await message({ type: 'context' }, sender);
+        clock.mockReturnValue(Date.now() + 1100);
+        await message({ type: 'snapshot', sessionId, snapshot: { ...await describeUrl(frame.url), title: '공개 합성 문서', content: '공개 본문 '.repeat(20) } }, sender);
+      }
+      api.tabs.onRemoved.listeners[0](1); await message({ type: 'status' });
+    };
+    const ack = async (count: number) => vi.waitFor(async () => {
+      const state = (await message({ type: 'status' })).status!;
+      expect(state.visitDelivery!.visits).toHaveLength(count);
+      expect(state.visitDelivery!.visits.every(visit => visit.phase === 'acked')).toBe(true);
+    });
+    return { clock, sessions, visits, begin, collect, ack, setFail: (value: boolean) => { fail = value; } };
+  }
+  it('separates six ACKed visits in A from two visits in B without explicit clear and survives restart', async () => {
+    const run = await scenario(), a = await run.begin(); await run.collect(a, 6); await run.ack(6);
+    const originals = structuredClone(run.visits); await message({ type: 'stop' });
+    const b = await run.begin(); expect(b).not.toBe(a);
+    await run.collect(b, 2); await run.ack(2); await reloadWorker(); await message({ type: 'status' });
+    expect(memory.visitDelivery.entries.map((entry: any) => [entry.visit.sessionId, entry.sequence, entry.phase])).toEqual([[b, 1, 'acked'], [b, 2, 'acked']]);
+    expect(run.visits.slice(0, 6)).toEqual(originals);
+    expect(run.visits.slice(6).map(visit => [visit.sessionId, visit.body.sequence])).toEqual([[b, 1], [b, 2]]);
+    expect((await message({ type: 'status' })).status!.visitDelivery!.blocked).toBeUndefined();
+    expect(run.sessions).toEqual([a, b]);
+  });
+  it('preserves an unresolved snapshot, then allows B after explicit retry and ACK', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const run = await scenario(), a = await run.begin(); run.setFail(true); await run.collect(a, 1); await message({ type: 'stop' });
+      await vi.waitFor(() => expect(memory.visitDelivery.entries[0].phase).toBe('retry-wait'));
+      for (const delay of [1000, 2000]) {
+        run.clock.mockReturnValue(Date.now() + delay); await vi.advanceTimersByTimeAsync(delay);
+      }
+      expect(memory.visitDelivery.entries[0]).toMatchObject({ phase: 'failed', attempts: 3 });
+      await reloadWorker(); const before = structuredClone(memory.visitDelivery);
+      const denied = await message({ type: 'start', goalText: '두 번째 작업을 시작하기' });
+      expect(denied.ok).toBe(false); expect(denied.error).toContain('확인되지 않은 방문');
+      expect(run.sessions).toEqual([a]); expect(memory.visitDelivery).toEqual(before);
+      expect(denied.status!.visitDelivery!.visits[0].error).toBeTruthy();
+      run.setFail(false); await message({ type: 'retry-visits' }); await run.ack(1);
+      expect(run.visits.at(-1)!.body).toEqual(run.visits[0].body);
+      const b = await run.begin(); await run.collect(b, 2); await run.ack(2);
+      expect(run.sessions).toEqual([a, b]); expect(b).not.toBe(a);
+      expect(run.visits.slice(-2).map(visit => [visit.sessionId, visit.body.sequence])).toEqual([[b, 1], [b, 2]]);
+    } finally { vi.useRealTimers(); }
+  });
+  it.each(['queued', 'sending', 'retry-wait', 'failed', 'acked'] as const)('rehydrates %s through the Background adapter without losing the snapshot', async phase => {
+    const run = await scenario(), sessionId = await run.begin(); await run.collect(sessionId, 1); await run.ack(1);
+    const entry = memory.visitDelivery.entries[0], original = structuredClone(entry.visit), calls = run.visits.length;
+    Object.assign(entry, { phase, attempts: phase === 'queued' ? 0 : 1 });
+    if (phase === 'retry-wait') entry.nextRetryAt = Date.now() + 60000;
+    if (phase === 'failed') Object.assign(entry, { error: '확인 필요', retryable: false, code: 'VISIT_ID_CONFLICT' });
+    const raw = structuredClone(memory.visitDelivery);
+    await reloadWorker(); await message({ type: 'status' });
+    if (phase === 'queued' || phase === 'sending') {
+      await run.ack(1); expect(run.visits).toHaveLength(calls + 1);
+      expect(run.visits.at(-1)!.body).toEqual(run.visits[0].body);
+    } else {
+      await message({ type: 'status' }); expect(run.visits).toHaveLength(calls);
+      expect(memory.visitDelivery).toEqual(raw);
+    }
+    expect(memory.visitDelivery.entries[0].visit).toEqual(original);
+    await message({ type: 'stop' }); await message({ type: 'clear' });
+  });
+  it('does not resurrect a deleted adapter checkpoint after a delayed successful HTTP response', async () => {
+    const run = await scenario(), sessionId = await run.begin();
+    let release!: () => void, received = false;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const send = vi.mocked(fetch).mockImplementation(async (_url, init) => {
+      const body = JSON.parse(init!.body as string); await gate; received = true;
+      return new Response(JSON.stringify({ ...body, sessionId, updatedAt: null }), { status: 201 });
+    });
+    await run.collect(sessionId, 2); await message({ type: 'stop' });
+    expect(memory.visitDelivery.entries.map((entry: any) => entry.phase)).toEqual(['sending', 'queued']);
+    const requests = send.mock.calls.length;
+    expect((await message({ type: 'clear' })).ok).toBe(true);
+    release(); await vi.waitFor(() => expect(received).toBe(true));
+    await message({ type: 'status' }); await reloadWorker(); await message({ type: 'status' });
+    expect(memory.collection.candidates).toEqual([]); expect(memory.visitDelivery.entries).toEqual([]);
+    expect(send).toHaveBeenCalledTimes(requests);
+  });
+  it('blocks a restored queue belonging to a different Collector session and preserves the raw checkpoint', async () => {
+    const run = await scenario(), a = await run.begin(); await run.collect(a, 1); await run.ack(1);
+    memory.visitDelivery.entries[0].visit.sessionId = crypto.randomUUID();
+    memory.visitDelivery.entries[0].phase = 'queued';
+    const raw = structuredClone(memory.visitDelivery), calls = run.visits.length;
+    await reloadWorker(); const restored = (await message({ type: 'status' })).status!;
+    expect(restored.visitDelivery!.blocked).toBeTruthy();
+    expect(memory.visitDelivery).toEqual(raw); expect(run.visits).toHaveLength(calls);
+    expect((await message({ type: 'stop' })).ok).toBe(true);
+    expect((await message({ type: 'start', goalText: '다음 세션을 시작하기' })).ok).toBe(false);
+  });
+});
