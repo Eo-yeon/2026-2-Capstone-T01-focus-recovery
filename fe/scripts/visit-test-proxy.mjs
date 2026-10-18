@@ -2,9 +2,9 @@ import { createServer } from 'node:http';
 
 // Test transport only: successful requests always reach the actual BE and its DB.
 export async function visitTestProxy(apiOrigin) {
-  let arm;
+  let arm, behaviorArm;
   const held = new Set();
-  const proxy = { requests: [], sessionRequests: 0, failVisits: false, onVisit: async () => undefined };
+  const proxy = { requests: [], behaviorRequests: [], sessionRequests: 0, failVisits: false, onVisit: async () => undefined };
   const server = createServer(async (req, res) => {
     try {
       const chunks = []; for await (const chunk of req) chunks.push(chunk);
@@ -13,6 +13,9 @@ export async function visitTestProxy(apiOrigin) {
       if (path === '/api/sessions' && req.method === 'POST') proxy.sessionRequests++;
       const visitPath = path.match(/^\/api\/sessions\/([a-f0-9-]{36})\/visits$/i);
       const isVisit = visitPath && req.method === 'POST';
+      const behaviorPath = path.match(/^\/api\/sessions\/([a-f0-9-]{36})\/visits\/([a-f0-9-]{36})\/behavior$/i);
+      const behavior = behaviorPath && req.method === 'PATCH' ? { sessionId: behaviorPath[1], visitId: behaviorPath[2], body: JSON.parse(body.toString()), delivered: false } : undefined;
+      if (behavior) proxy.behaviorRequests.push(behavior);
       const record = isVisit ? { sessionId: visitPath[1], body: JSON.parse(body.toString()), status: undefined, delivered: false } : undefined;
       if (record) { proxy.requests.push(record); await proxy.onVisit(record); }
       if (record && proxy.failVisits) {
@@ -27,17 +30,22 @@ export async function visitTestProxy(apiOrigin) {
       });
       const payload = Buffer.from(await upstream.arrayBuffer());
       if (record) record.status = upstream.status;
+      if (behavior) { behavior.status = upstream.status; behavior.response = JSON.parse(payload.toString()); }
       const deliver = () => {
         if (!res.destroyed) {
           res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') || 'application/json' });
           res.end(payload);
         }
         if (record) record.delivered = true;
+        if (behavior) behavior.delivered = true;
         held.delete(deliver);
       };
       if (record && arm?.sequence === record.body.sequence) {
         const ready = arm.resolve; arm = undefined;
         held.add(deliver); ready({ record, release: deliver });
+      } else if (behavior && behaviorArm && (!behaviorArm.visitId || behaviorArm.visitId === behavior.visitId)) {
+        const ready = behaviorArm.resolve; behaviorArm = undefined;
+        held.add(deliver); ready({ record: behavior, release: deliver });
       } else deliver();
     } catch {
       // Never print request bodies, upstream error text or collected data.
@@ -50,6 +58,10 @@ export async function visitTestProxy(apiOrigin) {
     holdNext(sequence) {
       if (arm) throw new Error('A response hold is already armed');
       return new Promise(resolve => { arm = { sequence, resolve }; });
+    },
+    holdNextBehavior(visitId) {
+      if (behaviorArm) throw new Error('A behavior response hold is already armed');
+      return new Promise(resolve => { behaviorArm = { visitId, resolve }; });
     },
     async close() {
       for (const deliver of held) deliver();

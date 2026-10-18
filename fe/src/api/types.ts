@@ -9,3 +9,10 @@ export interface WorkSessionResponse {
 
 export type CreatePageVisitRequest = Omit<import('../shared/types').PageVisit, 'sessionId'>;
 export type PageVisitResponse = import('../shared/types').PageVisit & { updatedAt: string | null };
+
+export type UpdateVisitBehaviorRequest = import('../shared/types').VisitBehavior;
+export interface VisitBehaviorResponse extends UpdateVisitBehaviorRequest {
+  visitId: string;
+  updatedAt: string | null;
+  applied: boolean;
+}

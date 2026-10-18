@@ -14,7 +14,7 @@ export function visitRequest(visit: PageVisit): CreatePageVisitRequest {
   // Whitelist DTO fields; do not normalize or truncate the collector's original data.
   return Object.fromEntries([...originals, ...counters].map(key => [key, visit[key]])) as unknown as CreatePageVisitRequest;
 }
-function validTime(value: unknown): value is string {
+export function validTime(value: unknown): value is string {
   return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
     && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
 }

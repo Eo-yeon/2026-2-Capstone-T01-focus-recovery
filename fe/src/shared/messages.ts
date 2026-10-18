@@ -22,5 +22,5 @@ export function isContentMessage(value: unknown): value is ContentMessage {
 export function isPopupMessage(value: unknown): value is PopupMessage {
   if (!value || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
-  return ['status', 'stop', 'clear', 'sync-permissions', 'retry-visits'].includes(v.type as string) || (v.type === 'start' && typeof v.goalText === 'string' && normalizeGoal(v.goalText).length <= 150);
+  return ['status', 'stop', 'clear', 'sync-permissions', 'retry-visits', 'retry-behaviors'].includes(v.type as string) || (v.type === 'start' && typeof v.goalText === 'string' && normalizeGoal(v.goalText).length <= 150);
 }

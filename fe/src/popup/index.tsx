@@ -14,6 +14,8 @@ function App() {
   const pending = recovery?.kind === 'pending' ? recovery : undefined;
   const invalid = recovery?.kind === 'invalid' ? recovery : undefined;
   const delivery = status?.visitDelivery;
+  const behavior = status?.behaviorDelivery;
+  const pendingBehavior = behavior?.visits.filter(visit => visit.phase !== 'acked') ?? [];
   const unconfirmed = delivery?.visits.filter(visit => visit.phase !== 'acked') ?? [];
   async function request(message: PopupMessage) {
     if (requestInFlight.current) return;
@@ -42,7 +44,7 @@ function App() {
   }
   return <main>
     <h1>Focus Recovery 개발용 수집기</h1>
-    <p>작업 목표와 허용한 사이트의 확정된 방문·본문·초기 행동 정보를 설정된 API 서버에 전송합니다.</p>
+    <p>작업 목표와 허용한 사이트의 확정된 방문·본문·누적 행동 정보를 설정된 API 서버에 전송합니다.</p>
     <p>종료는 로컬 수집만 중단합니다. 서버 종료 API는 미연동이므로 서버 세션은 ACTIVE로 남을 수 있습니다.</p>
     <button disabled={busy} onClick={() => void allowSite()}>현재 사이트 수집 허용</button>
     <p>상태: {status?.session ? '서버 세션으로 수집 중' : invalid ? '시작 요청 복구 필요' : pending ? '이전 시작 요청 확인 필요' : '수집 중지'}</p>
@@ -64,13 +66,18 @@ function App() {
     {error && <p role="alert">{error}</p>}
     <p>후보 {status?.candidates.length ?? 0}건 / 유효 방문 {status?.visits.length ?? 0}건</p>
     <p>서버 저장 확인 {delivery?.visits.filter(visit => visit.phase === 'acked').length ?? 0}건 / 저장 미확인 {unconfirmed.length}건. 유효 방문 중 순서 미확정 방문은 아직 전송하지 않습니다.</p>
-    <p>전송 상태는 브라우저 재시작·확장 재로드 시 유실될 수 있습니다. 로컬 수집 종료 후에도 확정 방문 전송은 계속됩니다.</p>
+    <p>전송 상태는 브라우저 재시작·확장 재로드 시 유실될 수 있습니다. 로컬 수집 종료 후에도 확정 방문 저장과 최종 행동 갱신은 계속됩니다.</p>
     {delivery?.blocked && <p role="alert">{delivery.blocked}</p>}
     {unconfirmed.map(visit => <p key={visit.visitId} role={visit.error ? 'alert' : undefined}>방문 #{visit.sequence}: {visit.phase} (시도 {visit.attempts}회){visit.error && ` — ${visit.code ? `${visit.code}: ` : ''}${visit.error}`}</p>)}
     <button disabled={busy || !unconfirmed.some(visit => visit.phase === 'failed' && visit.retryable)} onClick={() => void request({ type: 'retry-visits' })}>같은 방문 재시도</button>
+    <p>행동 갱신 {behavior?.blocked ? '상태 확인 필요' : `확인 ${behavior?.visits.filter(visit => visit.phase === 'acked').length ?? 0}건 / 갱신 미확인 ${pendingBehavior.length}건`} (POST 저장 대기 포함).</p>
+    {behavior?.blocked && <p role="alert">{behavior.blocked}</p>}
+    {pendingBehavior.map(visit => <p key={visit.visitId} role={visit.error ? 'alert' : undefined}>행동 #{visit.sequence}: {visit.phase} (시도 {visit.attempts}회, 최신 v{visit.latest.behaviorVersion} / 서버 ACK {visit.ack ? `v${visit.ack.behaviorVersion}` : '미확인'}){visit.error && ` — ${visit.code ? `${visit.code}: ` : ''}${visit.error}`}{visit.phase === 'failed' && (visit.retryable ? ' / 재시도 가능' : ' / 서버 상태 확인 필요')}</p>)}
+    <button disabled={busy || !pendingBehavior.some(visit => visit.phase === 'failed' && visit.retryable)} onClick={() => void request({ type: 'retry-behaviors' })}>같은 행동 갱신 재시도</button>
+    {(pendingBehavior.length > 0 || behavior?.blocked) && <p>행동 갱신이 미확인인 동안 새 세션 시작을 보류합니다. 삭제하면 최종 행동값을 복구할 수 없습니다.</p>}
     <button disabled={busy} onClick={() => void request({ type: 'status' })}>상태 새로고침</button>
     <button disabled={busy || Boolean(status?.session)} onClick={() => { setInspect(false); void request({ type: 'clear' }); }}>로컬 기록 삭제</button>
-    {unconfirmed.length > 0 && <p>로컬 기록 삭제는 저장 미확인 요청도 버립니다. 진행 중 요청은 서버에 저장될 수 있으며 서버 기록은 삭제되지 않습니다.</p>}
+    {(unconfirmed.length > 0 || pendingBehavior.length > 0) && <p>로컬 기록 삭제는 저장·행동 갱신 미확인 요청도 버립니다. 진행 중 요청은 서버에 저장될 수 있으며 서버 기록은 삭제되지 않습니다.</p>}
     <label><input type="checkbox" checked={inspect} onChange={event => setInspect(event.target.checked)} /> 수집 데이터 표시 (본문이 화면에 나타납니다)</label>
     {inspect && <pre>{JSON.stringify({ candidates: status?.candidates, visits: status?.visits, readyVisits: status?.readyVisits }, null, 2)}</pre>}
   </main>;

@@ -237,7 +237,7 @@ try {
   const late = await deadline(latePromise); assert.equal(late.record.status, 201);
   await request({ type: 'stop' });
   await popup.reload();
-  await popup.getByText(/로컬 기록 삭제는 저장 미확인 요청도 버립니다/).waitFor();
+  await popup.getByText(/로컬 기록 삭제는 저장·행동 갱신 미확인 요청도 버립니다/).waitFor();
   assert.equal((await request({ type: 'clear' })).ok, true);
   const responseFinished = context.waitForEvent('requestfinished', { predicate: request => request.url().includes(`/sessions/${deletionSession}/visits`), timeout: 10000 });
   late.release(); await responseFinished; await status(); await status();
@@ -267,7 +267,7 @@ try {
       assert.equal(JSON.stringify(await readCheckpoint()) === JSON.stringify(unicodeCheckpoint), true, 'failed original must survive restart and disallowed retry');
       await checkDatabase(unicodeSession, 0);
       await popup.reload();
-      await popup.getByText(/로컬 기록 삭제는 저장 미확인 요청도 버립니다/).waitFor();
+      await popup.getByText(/로컬 기록 삭제는 저장·행동 갱신 미확인 요청도 버립니다/).waitFor();
       assert.equal((await request({ type: 'clear' })).ok, true);
       assert.equal((await readCheckpoint()).entries.length, 0);
     } else await checkDatabase(unicodeSession, 1);

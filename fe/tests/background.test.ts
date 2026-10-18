@@ -17,7 +17,7 @@ function area(data: Record<string, any>) {
   return {
     get: vi.fn(async (key: string) => ({ [key]: structuredClone(data[key]) })),
     set: vi.fn(async (value: any) => { Object.assign(data, structuredClone(value)); }),
-    remove: vi.fn(async (key: string) => { delete data[key]; }),
+    remove: vi.fn(async (key: string | string[]) => { for (const name of [key].flat()) delete data[name]; }),
     setAccessLevel: vi.fn(async () => undefined),
   };
 }
@@ -171,9 +171,10 @@ describe('background Chrome adapter', () => {
     await reloadWorker();
     api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 });
     const restored = (await message({ type: 'status' })).status!;
-    const { visitDelivery: stoppedDelivery, ...stoppedCollection } = stopped;
-    const { visitDelivery: restoredDelivery, ...restoredCollection } = restored;
+    const { visitDelivery: stoppedDelivery, behaviorDelivery: stoppedBehavior, ...stoppedCollection } = stopped;
+    const { visitDelivery: restoredDelivery, behaviorDelivery: restoredBehavior, ...restoredCollection } = restored;
     expect(restoredCollection).toEqual(stoppedCollection);
+    expect(restoredBehavior!.visits[0]).toMatchObject({ phase: 'acked', latest: stoppedBehavior!.visits[0].latest });
     expect(stoppedDelivery!.visits[0].visitId).toBe(restoredDelivery!.visits[0].visitId);
     expect(restoredDelivery!.visits[0].phase).toBe('acked');
   });
@@ -1164,5 +1165,81 @@ describe('session separation and local delivery lifecycle', () => {
     expect(memory.visitDelivery).toEqual(raw); expect(run.visits).toHaveLength(calls);
     expect((await message({ type: 'stop' })).ok).toBe(true);
     expect((await message({ type: 'start', goalText: '다음 세션을 시작하기' })).ok).toBe(false);
+  });
+});
+
+describe('behavior PATCH integration in Background', () => {
+  async function prepare(holdPost = false, holdPatch = false, rejectPatch = false) {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(10000);
+    const session = (await message({ type: 'start', goalText: '누적 행동 갱신 검증하기' })).status!.session!;
+    await message({ type: 'context' }, pageSender);
+    clock.mockReturnValue(11000);
+    await message({ type: 'snapshot', sessionId: session.sessionId, snapshot: { ...await describeUrl(frame.url), title: '공개 합성', content: '개인정보 없는 합성 본문입니다. '.repeat(10) } }, pageSender);
+    let releasePost!: () => void, releasePatch!: () => void;
+    const postGate = new Promise<void>(resolve => { releasePost = resolve; });
+    const patchGate = new Promise<void>(resolve => { releasePatch = resolve; });
+    const requests: { method?: string; body: any; url: string }[] = [];
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      const body = JSON.parse(init!.body as string); requests.push({ method: init?.method, body, url: String(url) });
+      if (init?.method === 'PATCH') {
+        if (holdPatch) await patchGate;
+        return new Response(JSON.stringify(rejectPatch ? { code: 'BEHAVIOR_VERSION_CONFLICT' } : { visitId: String(url).split('/').at(-2), ...body, applied: true, updatedAt: '2026-10-18T10:00:00.000Z' }), { status: rejectPatch ? 409 : 200 });
+      }
+      if (holdPost) await postGate;
+      return new Response(JSON.stringify({ ...body, sessionId: session.sessionId, updatedAt: null }), { status: 201 });
+    });
+    clock.mockReturnValue(12000);
+    api.tabs.onRemoved.listeners[0](1); await message({ type: 'status' });
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    const original = structuredClone(memory.visitDelivery.entries[0].visit);
+    const activate = async () => { api.tabs.onActivated.listeners[0]({ tabId: 2, windowId: 1 }); await message({ type: 'status' }); };
+    return { clock, requests, releasePost, releasePatch, activate, original };
+  }
+  it('waits for POST ACK, then sends the late Chrome activation count with the existing Collector version', async () => {
+    const run = await prepare(true); await run.activate();
+    expect(run.requests).toHaveLength(1);
+    expect(memory.behaviorDelivery.entries[0]).toMatchObject({ phase: 'waiting-post', latest: { tabSwitchCount: 1 } });
+    run.releasePost();
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.behaviorDelivery!.visits[0].phase).toBe('acked'));
+    expect(run.requests.map(r => r.method)).toEqual(['POST', 'PATCH']);
+    expect(run.requests[1].body).toEqual({ activeDurationMs: run.original.activeDurationMs, tabSwitchCount: 1, behaviorVersion: run.original.behaviorVersion + 1 });
+    expect(memory.visitDelivery.entries[0].visit).toEqual(run.original);
+  });
+  it('local stop remains responsive while PATCH is pending and blocks new session until ACK', async () => {
+    const run = await prepare(false, true); await run.activate();
+    await vi.waitFor(() => expect(run.requests).toHaveLength(2));
+    const stopped = await message({ type: 'stop' }); expect(stopped.ok).toBe(true); expect(stopped.status!.session).toBeNull();
+    expect((await message({ type: 'start', goalText: '갱신 미확인 중 새 세션' })).ok).toBe(false);
+    expect(memory.behaviorDelivery.entries[0].phase).toBe('sending');
+    run.releasePatch();
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.behaviorDelivery!.visits[0].phase).toBe('acked'));
+    expect(memory.behaviorDelivery.entries[0].ack).toEqual(memory.behaviorDelivery.entries[0].latest);
+  });
+  it('retains final failure across stop/restart and refuses conflict retry or new sessions', async () => {
+    const run = await prepare(false, false, true); await run.activate(); await message({ type: 'stop' });
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.behaviorDelivery!.visits[0]).toMatchObject({ phase: 'failed', code: 'BEHAVIOR_VERSION_CONFLICT' }));
+    const original = structuredClone(memory.behaviorDelivery); await reloadWorker(); await message({ type: 'status' });
+    await message({ type: 'retry-behaviors' });
+    expect(memory.behaviorDelivery).toEqual(original);
+    expect((await message({ type: 'start', goalText: '서버 미확인 신규 세션' })).ok).toBe(false);
+    expect(run.requests.map(r => r.method)).toEqual(['POST', 'PATCH']);
+  });
+  it.each(['clear', 'revoke'])('ignores late PATCH ACK after %s and preserves no behavior data', async action => {
+    const run = await prepare(false, true); await run.activate(); await vi.waitFor(() => expect(run.requests).toHaveLength(2));
+    if (action === 'clear') { await message({ type: 'stop' }); await message({ type: 'clear' }); }
+    else api.permissions.onRemoved.listeners[0]();
+    await message({ type: 'status' }); run.releasePatch();
+    await vi.waitFor(() => expect(memory.behaviorDelivery.entries).toEqual([]));
+    expect((await message({ type: 'status' })).status!.behaviorDelivery!.visits).toEqual([]);
+    expect(memory.collection.candidates).toEqual([]);
+  });
+  it('replays a PATCH after Worker interruption without rebuilding its snapshot', async () => {
+    const run = await prepare(false, true); await run.activate(); await vi.waitFor(() => expect(run.requests).toHaveLength(2));
+    const snapshot = structuredClone(memory.behaviorDelivery.entries[0].request); await message({ type: 'stop' });
+    await reloadWorker(); await message({ type: 'status' });
+    await vi.waitFor(() => expect(run.requests).toHaveLength(3));
+    expect(run.requests[2].body).toEqual(snapshot); run.releasePatch();
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.behaviorDelivery!.visits[0].phase).toBe('acked'));
+    expect(memory.behaviorDelivery.entries[0].ack).toEqual(snapshot);
   });
 });
