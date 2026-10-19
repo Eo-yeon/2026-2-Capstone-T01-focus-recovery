@@ -17,12 +17,17 @@ const apiUrl = new URL(api);
 assert.ok(['http:', 'https:'].includes(apiUrl.protocol));
 const proxy = await visitTestProxy(apiUrl.origin);
 const host = '127.0.0.1';
+const title = '공개 합성 방문 검증';
+const longContent = '개인정보 없는 긴 공개 문서의 본문 제한을 확인합니다. '.repeat(300);
 const fixture = createServer((req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  const path = new URL(req.url, 'http://localhost').pathname;
   const content = req.url === '/empty' ? '짧음' : req.url === '/unicode/korean' ? '가'.repeat(5000)
     : req.url === '/unicode/english' ? 'a'.repeat(5000) : req.url === '/unicode/emoji' ? '😀'.repeat(2500)
-    : req.url === '/unicode/overflow' ? '😀'.repeat(2501) : '서버 방문 저장을 확인하는 개인정보 없는 공개 합성 본문입니다. '.repeat(5);
-  res.end('<!doctype html><title>공개 합성 방문 검증</title><article><p>' + content + '</p></article>');
+    : req.url === '/unicode/overflow' ? '😀'.repeat(2501) : path === '/document/1' ? longContent
+    : '서버 방문 저장을 확인하는 개인정보 없는 공개 합성 본문입니다. '.repeat(5);
+  const sensitive = path === '/sensitive' ? '<form><input type="password" value="SYNTHETIC_SECRET"></form>' : '';
+  res.end('<!doctype html><title>' + title + '</title><article><p>' + content + '</p></article>' + sensitive);
 });
 await new Promise(resolve => fixture.listen(0, '127.0.0.1', resolve));
 const origin = `http://${host}:${fixture.address().port}`;
@@ -34,7 +39,7 @@ try {
   await build({ configFile: resolve('vite.config.ts'), build: { outDir: extension } });
   await build({ configFile: resolve('vite.content.config.ts'), build: { outDir: extension } });
   const manifest = JSON.parse(await readFile(join(extension, 'manifest.json'), 'utf8'));
-  manifest.host_permissions.push(`http://${host}/*`);
+  manifest.host_permissions.push(`http://${host}/*`, 'https://www.google.com/*');
   await writeFile(join(extension, 'manifest.json'), JSON.stringify(manifest));
   context = await chromium.launchPersistentContext(join(root, 'profile'), {
     channel: 'chromium', headless: !process.env.HEADED, executablePath: process.env.CHROMIUM_PATH || undefined,
@@ -57,11 +62,21 @@ try {
     assert.fail('Timed out waiting for visits/ACK');
   }
   const page = await context.newPage();
-  await page.goto(`${origin}/document/1`); await page.bringToFront();
-  assert.equal((await request({ type: 'start', goalText: '공개 합성 방문 여섯 개 저장 검증하기' })).ok, true);
-  const sessionId = (await status()).session.sessionId;
+  // Only the search document is synthetic; its extracted visit still goes to the real BE/DB.
+  const searchUrl = 'https://www.google.com/search?q=focus+recovery&source=fixture#results';
+  await page.route('https://www.google.com/**', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body:
+    '<!doctype html><title>공개 합성 검색 검증</title><div id="search"><div id="rso"><div class="MjjYud"><a href="https://example.com/docs"><h3>공개 문서</h3></a><div class="VwiC3b">수집 흐름을 확인하는 합성 검색 결과입니다.</div></div></div></div>',
+  }));
+  await page.goto(`${origin}/empty`); await page.bringToFront();
+  assert.equal((await request({ type: 'start', goalText: '공개 합성 방문 일곱 개 저장 검증하기' })).ok, true);
+  const active = (await status()).session;
+  const sessionId = active.sessionId;
   assert.match(sessionId, /^[a-f0-9-]{36}$/);
-  async function checkDatabase(id = sessionId, count = 6) {
+  const serverSession = await fetch(`${apiUrl.origin}/api/sessions/${sessionId}`).then(response => response.json());
+  assert.equal(serverSession.status, 'ACTIVE');
+  assert.equal(serverSession.startedAt, active.startedAt);
+  assert.equal(serverSession.goalText, active.goalText);
+  async function checkDatabase(id = sessionId, count = 7) {
     assert.match(id, /^[a-f0-9-]{36}$/);
     if (!process.env.INTEGRATION_MYSQL_CONTAINER) return;
     const sql = `SELECT COUNT(*), COUNT(DISTINCT visit_id), COUNT(DISTINCT sequence) FROM page_visit WHERE session_id='${id}';
@@ -74,25 +89,51 @@ try {
     assert.deepEqual(stdout.trim().split('\n'), [`${count}\t${count}\t${count}`, `${windows}\t${windows}\t${windows}`,
       ...Array.from({ length: windows }, (_, index) => `${index + 1}\t${Array.from({ length: 5 }, (_, offset) => index + offset + 1).join(',')}`)]);
   }
-  for (let count = 1; count <= 6; count++) {
-    if (count > 1) await page.goto(`${origin}/document/${count}`);
+  for (let count = 1; count <= 7; count++) {
+    // Visit 6 revisits document 2 after intervening documents, so it must get a new ID/sequence.
+    await page.goto(count === 7 ? searchUrl : `${origin}/document/${count === 6 ? 2 : count}?source=fixture#body`);
     await page.bringToFront();
     await until(state => state.visits.length === count);
+    await page.goto(`${origin}/empty`);
+    await until(state => state.visitDelivery.visits.length === count && state.visitDelivery.visits.every(visit => visit.phase === 'acked'));
+    await checkDatabase(sessionId, count);
   }
-  await page.goto(`${origin}/empty`);
-  await until(state => state.visitDelivery.visits.length === 6 && state.visitDelivery.visits.every(visit => visit.phase === 'acked'));
+  await page.goto(`${origin}/sensitive`);
+  await until(state => state.candidates.at(-1)?.reason === 'dom-policy');
+  await page.goto(`${origin}/login`);
+  await until(state => state.candidates.at(-1)?.reason === 'url-policy');
+  await checkDatabase();
   assert.equal((await request({ type: 'stop' })).ok, true);
-  const complete = await until(state => state.visitDelivery.visits.length === 6 && state.visitDelivery.visits.every(visit => visit.phase === 'acked'));
-  assert.deepEqual(complete.readyVisits.map(visit => visit.sequence), [1, 2, 3, 4, 5, 6]);
+  const complete = await until(state => state.visitDelivery.visits.length === 7 && state.visitDelivery.visits.every(visit => visit.phase === 'acked'));
+  assert.deepEqual(complete.readyVisits.map(visit => visit.sequence), [1, 2, 3, 4, 5, 6, 7]);
   const checkpoint = await readDurable(popup, 'visitDelivery');
   const list = async () => {
     const reply = await fetch(`${apiUrl.origin}/api/sessions/${sessionId}/visits?size=100`);
     assert.equal(reply.status, 200); return reply.json();
   };
   const beforeReplay = await list();
-  assert.equal(beforeReplay.totalElements, 6);
-  assert.equal(new Set(beforeReplay.items.map(visit => visit.visitId)).size, 6);
-  assert.deepEqual(beforeReplay.items.map(visit => visit.sequence), [1, 2, 3, 4, 5, 6]);
+  assert.equal(beforeReplay.totalElements, 7);
+  assert.equal(new Set(beforeReplay.items.map(visit => visit.visitId)).size, 7);
+  assert.deepEqual(beforeReplay.items.map(visit => visit.sequence), [1, 2, 3, 4, 5, 6, 7]);
+  assert.equal(beforeReplay.items[1].normalizedUrl, beforeReplay.items[5].normalizedUrl);
+  assert.notEqual(beforeReplay.items[1].visitId, beforeReplay.items[5].visitId);
+  const sensitiveCandidates = (await readDurable(popup, 'collection')).candidates.filter(candidate => candidate.reason === 'dom-policy');
+  assert.ok(sensitiveCandidates.length > 0);
+  assert.equal(sensitiveCandidates.every(candidate => !candidate.snapshot), true);
+  for (const [index, entry] of checkpoint.entries.entries()) {
+    const original = entry.visit;
+    assert.equal(original.normalizedUrl, index === 6 ? 'https://www.google.com/search' : `${origin}/document/${index === 5 ? 2 : index + 1}`);
+    assert.equal(original.domain, index === 6 ? 'www.google.com' : host);
+    assert.equal(original.title, index === 6 ? '공개 합성 검색 검증' : title);
+    assert.equal(original.isSearchResultPage, index === 6);
+    assert.equal(original.searchQuery, index === 6 ? 'focus recovery' : null);
+    assert.ok([...original.content].length <= 5000);
+    if (index === 0) assert.equal(original.content, [...longContent.trim()].slice(0, 5000).join(''));
+    if (index === 6) assert.ok(original.content.includes('검색어: focus recovery') && original.content.includes('공개 문서'));
+    const stored = beforeReplay.items[index];
+    // The list API omits content; replay responses below verify every original field including content.
+    for (const key of ['visitId', 'sequence', 'normalizedUrl', 'title', 'searchQuery', 'isSearchResultPage']) assert.equal(stored[key], original[key]);
+  }
   await checkDatabase();
   for (const entry of checkpoint.entries) {
     const { sessionId: _, ...body } = entry.visit;
@@ -109,10 +150,10 @@ try {
   assert.deepEqual(restored.visitDelivery.visits, complete.visitDelivery.visits);
   assert.deepEqual(await list(), beforeReplay);
   // A test-only file lets a separate DB check verify counts without logging payloads.
-  if (process.env.INTEGRATION_RESULT_PATH) await writeFile(process.env.INTEGRATION_RESULT_PATH, JSON.stringify({ sessionId, visits: 6, expectedWindows: 2 }));
-  console.log(`PASS: Chrome ${context.browser()?.version() ?? 'Chromium'} → real Spring Boot: session creation, six collector visits, ordered ACK, six duplicate 200 replays, unchanged server list, worker ACK recovery`);
+  if (process.env.INTEGRATION_RESULT_PATH) await writeFile(process.env.INTEGRATION_RESULT_PATH, JSON.stringify({ sessionId, visits: 7, expectedWindows: 3 }));
+  console.log(`PASS: Chrome ${context.browser()?.version() ?? 'Chromium'} → real Spring Boot: ACTIVE session, seven visits/sequence 1–7, normalized URLs/title/limited content, synthetic Google query stored, sensitive/login/short pages excluded, seven duplicate 200 replays, unchanged server list, worker ACK recovery`);
   console.log(process.env.INTEGRATION_MYSQL_CONTAINER
-    ? 'PASS: real MySQL before/after duplicate replays: six unique visits, two unique Windows, [1,2,3,4,5] and [2,3,4,5,6]'
+    ? 'PASS: real MySQL at each visit 1–7: Window counts 0,0,0,0,1,2,3; size 5/stride 1; members [1,2,3,4,5], [2,3,4,5,6], [3,4,5,6,7]; duplicate replay leaves rows unchanged'
     : 'SKIP: DB Window contents/counts require INTEGRATION_MYSQL_CONTAINER (disposable MySQL with passwordless test root).');
 
   const readCheckpoint = () => readDurable(popup, 'visitDelivery');
@@ -163,7 +204,7 @@ try {
     } finally { await connection.detach(); }
   }
 
-  // A-1: no explicit clear between six ACKed A visits and two B visits.
+  // A-1: no explicit clear between seven ACKed A visits and two B visits.
   const aRequests = proxy.requests.filter(record => record.sessionId === sessionId).length;
   const b = await begin('연속 세션 B'); assert.notEqual(b, sessionId);
   await collect(2, 'B'); await finish(2); await restart(); await allAck(2);
@@ -171,9 +212,9 @@ try {
   assert.equal(proxy.requests.filter(record => record.sessionId === sessionId).length, aRequests);
   assert.equal(proxy.requests.filter(record => record.sessionId === b).length, 2);
   assert.deepEqual((await visitList(b)).items.map(visit => visit.sequence), [1, 2]);
-  assert.equal((await visitList(sessionId)).totalElements, 6);
+  assert.equal((await visitList(sessionId)).totalElements, 7);
   await checkDatabase(b, 2);
-  console.log('PASS A-1: six ACKed A visits → local stop → B without clear, two B visits start at 1, Worker restart, no A resend or session mixing');
+  console.log('PASS A-1: seven ACKed A visits → local stop → B without clear, two B visits start at 1, Worker restart, no A resend or session mixing');
 
   // A-2/A-3: only transport 503 is injected; after retry the request reaches real BE.
   const failedSession = await begin('전송 실패 복구'); proxy.failVisits = true;
