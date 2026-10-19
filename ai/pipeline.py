@@ -20,6 +20,7 @@ class PipelineResult:
     context: Optional[ContextAnalysisResult]   # AI-002: Context 분석 결과 (Context 단계 제외 시 None)
     probabilities: dict                        # AI-003: P_NORMAL / P_TRANSITION / P_DRIFT
     result: str                                # AI-003: NORMAL / TRANSITION / DRIFT
+    features: List[float]                      # 분류기에 입력한 특징 벡터 (featureSnapshot 용)
 
     def to_dict(self) -> dict:
         return {
@@ -173,6 +174,7 @@ class FocusRecoveryPipeline:
             context=context_result,
             probabilities={"P_NORMAL": p_normal, "P_TRANSITION": p_transition, "P_DRIFT": p_drift},
             result=self.classifier.decide(p_normal, p_transition, p_drift),
+            features=[float(v) for v in features[0]],
         )
 
     def score_visits(self, goal: str, visits: Sequence[PageVisit]) -> List[PageVisit]:
@@ -180,6 +182,19 @@ class FocusRecoveryPipeline:
         if not goal or not goal.strip():
             raise ValueError("[Pipeline] 유효한 최초 작업 목표가 필요합니다.")
         return self._compute_semantic_relevances(goal, visits)
+
+
+def aggregate_behavior(
+    active_duration_ms: Sequence[Optional[float]], tab_switch_counts: Sequence[Optional[float]]
+) -> Optional[List[float]]:
+    """
+    방문별 행동 정보를 구간 행동 특징으로 집계한다: [평균 활성 체류시간(초), 탭 전환 횟수 합].
+    학습(training/dataset.py)과 API(main.py)가 같은 집계를 사용한다.
+    측정값이 하나라도 없으면 None을 반환하며 임의 값으로 채우지 않는다.
+    """
+    if any(v is None for v in active_duration_ms) or any(v is None for v in tab_switch_counts):
+        return None
+    return [sum(active_duration_ms) / len(active_duration_ms) / 1000.0, float(sum(tab_switch_counts))]
 
 
 def iter_windows(visits: Sequence[PageVisit], window_size: int = WINDOW_SIZE, stride: int = STRIDE) -> Iterator[List[PageVisit]]:

@@ -128,6 +128,26 @@ python -m training.train --zip <데이터.zip> --sha256 <체크섬>   # 체크�
 
 합성 데이터의 후보 라벨로 학습한 결과는 학습 코드의 작동 확인용이며 실제 모델 성능이 아닙니다.
 
+## 분석 API (AI-API-01)
+
+BE(`AiAnalysisClient`)가 호출하는 API입니다. 실행: `cd ai && uvicorn main:app --port 8000`
+
+- `POST /api/ai/analyses`
+  - 요청: `analysisId`, `sessionId`, `windowId`, `windowIndex`, `goalText`, `visits[5]` (position 1~5)
+  - 성공(200): 요청 식별자 3개, `result`, `pNormal`/`pTransition`/`pDrift`(합 1), `contextUsed`, `contextResult`, `featureSnapshot`, `modelVersions`, `analyzedAt`(UTC 밀리초)
+  - 실패: `{"code", "message", "fieldErrors"}`
+
+| code | HTTP | 상황 |
+| --- | --- | --- |
+| `INVALID_REQUEST` | 422 | 요청 형식·값 오류 (방문 수, position, 빈 목표 등) |
+| `ANALYSIS_ID_CONFLICT` | 409 | 같은 `analysisId`로 다른 내용의 요청 |
+| `ANALYSIS_IN_PROGRESS` | 409 | 같은 `analysisId`의 분석이 처리 중 |
+| `AI_ANALYSIS_FAILED` | 500 | 분석 실패 (Context 출력 재검증 실패 등) |
+| `AI_NOT_READY` | 503 | 모델 로드 중 또는 로드 실패 |
+
+- 같은 `analysisId`와 같은 내용으로 다시 요청하면 저장된 응답을 그대로 반환합니다. (메모리 보관, 재시작 시 초기화)
+- `GET /health`: 모델 로드가 끝나면 200 `{"status": "READY"}`, 그 전에는 503 `AI_NOT_READY`
+
 ## 개발 상태
 
 현재 AI 영역은 기능 설계가 완료된 초기 개발 환경 구성 단계입니다.

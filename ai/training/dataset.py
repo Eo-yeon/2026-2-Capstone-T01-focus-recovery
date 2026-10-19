@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Union
 
 from models.classifier import LABELS
 from models.context import WINDOW_SIZE, PageVisit
+from pipeline import aggregate_behavior
 
 
 @dataclass
@@ -44,15 +45,11 @@ def _read_jsonl(path: Path) -> List[dict]:
 
 
 def _window_behavior(raw_visits: List[dict]) -> Optional[List[float]]:
-    """
-    구간의 행동 특징: [평균 활성 체류시간(초), 탭 전환 횟수 합].
-    측정값이 하나라도 없으면 None을 반환한다.
-    """
-    durations = [v.get("activeDurationMs") for v in raw_visits]
-    switches = [v.get("tabSwitchCount") for v in raw_visits]
-    if any(d is None for d in durations) or any(s is None for s in switches):
-        return None
-    return [sum(durations) / len(durations) / 1000.0, float(sum(switches))]
+    """구간의 행동 특징. 집계 방식은 pipeline.aggregate_behavior를 따른다."""
+    return aggregate_behavior(
+        [v.get("activeDurationMs") for v in raw_visits],
+        [v.get("tabSwitchCount") for v in raw_visits],
+    )
 
 
 def load_dataset(data_dir: Union[str, Path]) -> List[WindowSample]:
