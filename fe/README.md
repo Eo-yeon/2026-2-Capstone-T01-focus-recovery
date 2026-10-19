@@ -2,6 +2,8 @@
 
 Manifest V3 개발용 수집기입니다. 서버 작업 세션 → 확정 방문 POST → POST ACK 이후 누적 행동 PATCH → 최종 ACK 이후 서버 종료와 END_PENDING 영속 복구를 연동합니다. 이번 변경은 BE 코드·DB 스키마를 변경하지 않습니다.
 
+Issue #55의 최신 main 기반 실행 결과와 체크리스트는 [FE 데이터 수집 E2E 검증](../docs/fe-collection-e2e-validation.md)을 참고하세요. 기존 테스트를 재사용해 7개 방문과 단계별 MySQL Window 검사를 보강했습니다. 실제 검색 서비스 검증의 미완료 범위와 본문 문자 단위 계약 결함(#56)은 자동 검사 통과와 구분합니다.
+
 ## Issue #51 코드 리뷰 경계 검증·보완 (2026-10-19)
 
 이번 리뷰 작업은 미커밋 변경 없는 `feat/51/session-end-pending-recovery`, HEAD `777355971e02f01611526cbc771ebc5d05d8207d`에서 시작했습니다. origin은 개인 fork, upstream은 공식 저장소이며 실제 fetch 후 upstream/main은 `05b8d46a40546fbe693d34f12acc96ef768b29d7`으로 동일했습니다. 차이는 upstream 쪽 0개/작업 브랜치 쪽 1개 커밋입니다. 브랜치 전환·병합·기존 변경 폐기는 하지 않았습니다. 아래 #51 최초 구현 절은 당시 기록이며 이번 리뷰 결과는 이 절을 따릅니다.
