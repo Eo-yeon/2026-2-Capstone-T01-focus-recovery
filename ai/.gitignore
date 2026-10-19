@@ -4,3 +4,6 @@ __pycache__/
 **saved_models/
 *.bin
 *.safetensors
+# 학습 데이터 및 학습 산출물 (Git에 올리지 않음)
+data/
+artifacts/

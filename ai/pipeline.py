@@ -1,12 +1,17 @@
 import math
+import os
 from dataclasses import dataclass, replace
-from typing import Iterator, List, Optional, Sequence
+from pathlib import Path
+from typing import Iterator, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 from models.classifier import DriftClassifier
 from models.context import WINDOW_SIZE, ContextAnalysisResult, LocalContextModel, PageVisit
 from models.embedding import LocalSemanticEmbeddingModel
 
 STRIDE = 1
+DEFAULT_CLASSIFIER_PATH = Path(__file__).resolve().parent / "artifacts" / "drift_classifier.joblib"
 
 
 @dataclass
@@ -45,33 +50,46 @@ class FocusRecoveryPipeline:
         classifier: DriftClassifier,
         context_model: Optional[LocalContextModel] = None,
     ):
-        # context_model이 None이면 Context 분석 단계를 제외한다.
-        # (Validation 결과 Context Model이 최종 분류 성능 향상에 기여하지 않는 경우)
+        # Context 분석 단계 사용 여부는 학습된 분류기의 특징 구성(use_context)을 따른다.
+        # (Validation 결과 Context Model이 최종 분류 성능 향상에 기여하지 않으면 제외한 구성으로 학습)
+        if classifier.use_context and context_model is None:
+            raise ValueError("[Pipeline] Context 특징으로 학습된 분류기에는 context_model이 필요합니다.")
         self.embedding_model = embedding_model
-        self.context_model = context_model
+        self.context_model = context_model if classifier.use_context else None
         self.classifier = classifier
 
     @classmethod
-    def from_default(cls, use_context: bool = True, classifier_type: str = "xgboost") -> "FocusRecoveryPipeline":
+    def from_default(cls, classifier_path=None) -> "FocusRecoveryPipeline":
+        """
+        학습된 분류기를 로드하고, 분류기의 특징 구성에 맞춰 필요한 모델만 로드한다.
+        경로 우선순위: 인자 > DRIFT_CLASSIFIER_PATH 환경 변수 > ai/artifacts/drift_classifier.joblib
+        """
+        classifier_path = classifier_path or os.getenv("DRIFT_CLASSIFIER_PATH") or DEFAULT_CLASSIFIER_PATH
         print("[Pipeline] AI 모델을 로드합니다...")
+        classifier = DriftClassifier.load(classifier_path)
         embedding_model = LocalSemanticEmbeddingModel()
-        context_model = LocalContextModel() if use_context else None
-        classifier = DriftClassifier(model_type=classifier_type)
-        print("[Pipeline] 모든 모델 로드가 완료되었습니다.")
+        context_model = LocalContextModel() if classifier.use_context else None
+        print(
+            f"[Pipeline] 모든 모델 로드가 완료되었습니다. "
+            f"(classifier={classifier.model_type}, use_context={classifier.use_context}, "
+            f"use_behavior={classifier.use_behavior}, γ={classifier.threshold_gamma})"
+        )
         return cls(embedding_model, classifier, context_model)
 
     # ------------------------------------------------------------------ 입력 검증
     @staticmethod
-    def _validate_input(goal: str, visits: Sequence[PageVisit], behavior_features: Sequence[float]) -> None:
+    def _validate_input(goal: str, visits: Sequence[PageVisit], behavior_features: Optional[Sequence[float]]) -> None:
         if not goal or not goal.strip():
             raise ValueError("[Pipeline] 유효한 최초 작업 목표가 필요합니다.")
         if len(visits) != WINDOW_SIZE:
             raise ValueError(
                 f"[Pipeline] 최근 {WINDOW_SIZE}개의 유효 Page Visit이 필요합니다. (입력: {len(visits)}개)"
             )
-        # 행동 특징을 확보할 수 없는 경우 임의의 값을 생성하지 않는다.
-        if not behavior_features:
-            raise ValueError("[Pipeline] 행동 특징(behavior_features)이 필요합니다.")
+        # 행동 특징은 선택 입력이다. 주어진 경우에만 검증하며, 없는 값을 임의로 생성하지 않는다.
+        if behavior_features is None:
+            return
+        if len(behavior_features) == 0:
+            raise ValueError("[Pipeline] behavior_features가 비어 있습니다. 행동 특징이 없으면 None으로 전달하세요.")
         for i, value in enumerate(behavior_features):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError(f"[Pipeline] behavior_features[{i}]가 유효한 숫자가 아닙니다: {value}")
@@ -108,9 +126,16 @@ class FocusRecoveryPipeline:
             relevances[-1] - relevances[0],   # 구간 내 변화량 (P5 - P1)
         ]
 
-    # ------------------------------------------------------------------ 공개 API
-    def analyze(self, goal: str, visits: Sequence[PageVisit], behavior_features: Sequence[float]) -> PipelineResult:
-        """최초 목표와 최근 5개 Page Visit, 행동 특징으로 탐색 구간의 최종 상태를 분류한다."""
+    def extract_window_features(
+        self,
+        goal: str,
+        visits: Sequence[PageVisit],
+        behavior_features: Optional[Sequence[float]] = None,
+    ) -> Tuple[np.ndarray, List[float], Optional[ContextAnalysisResult]]:
+        """
+        한 탐색 구간의 분류 특징 벡터를 만든다. 학습(training)과 추론(analyze)이 같은 경로를 사용한다.
+        반환: (특징 벡터 (1, n), 페이지별 의미적 관련성, Context 분석 결과 또는 None)
+        """
         self._validate_input(goal, visits, behavior_features)
 
         # 1. AI-001: Semantic Relevance
@@ -122,18 +147,32 @@ class FocusRecoveryPipeline:
         if self.context_model is not None:
             context_result = self.context_model.analyze(goal, scored_visits)
 
-        # 3. Feature 구성 + AI-003: Drift Classification
-        prediction = self.classifier.predict_state(
+        # 3. Feature 구성
+        features = self.classifier.extract_features(
             semantic_relevance=self._build_semantic_features(relevances),
             context_result_dict=context_result.to_dict() if context_result is not None else None,
-            behavior_features=list(behavior_features),
+            behavior_features=list(behavior_features) if behavior_features is not None else None,
         )
+        return features, relevances, context_result
+
+    # ------------------------------------------------------------------ 공개 API
+    def analyze(
+        self,
+        goal: str,
+        visits: Sequence[PageVisit],
+        behavior_features: Optional[Sequence[float]] = None,
+    ) -> PipelineResult:
+        """최초 목표와 최근 5개 Page Visit, (선택) 행동 특징으로 탐색 구간의 최종 상태를 분류한다."""
+        features, relevances, context_result = self.extract_window_features(goal, visits, behavior_features)
+
+        # 4. AI-003: Drift Classification
+        p_normal, p_transition, p_drift = (float(p) for p in self.classifier.predict_proba(features)[0])
 
         return PipelineResult(
             semantic_relevances=relevances,
             context=context_result,
-            probabilities=prediction["probabilities"],
-            result=prediction["final_state"],
+            probabilities={"P_NORMAL": p_normal, "P_TRANSITION": p_transition, "P_DRIFT": p_drift},
+            result=self.classifier.decide(p_normal, p_transition, p_drift),
         )
 
     def score_visits(self, goal: str, visits: Sequence[PageVisit]) -> List[PageVisit]:
@@ -167,8 +206,9 @@ if __name__ == "__main__":
         PageVisit("인기 유튜브 개발 채널 추천", "구독자 많은 개발 유튜버 모음..."),
         PageVisit("유튜브 쇼츠 인기 영상", "오늘의 인기 쇼츠 모음..."),
     ]
-    # Extension에서 수집한 구간별 행동 특징 예시: [활성 체류시간(초), 탭 전환 횟수]
-    behavior_per_window = [[180.0, 3.0], [95.0, 7.0]]
+    # Extension에서 수집한 구간별 행동 특징 예시: [평균 활성 체류시간(초), 탭 전환 횟수]
+    # 행동 특징 없이 학습된 분류기라면 None을 전달한다.
+    behavior_per_window = [[180.0, 3.0], [95.0, 7.0]] if pipeline.classifier.use_behavior else [None, None]
 
     # 관련성을 한 번만 계산해 두고 겹치는 구간에서 재사용한다.
     scored_history = pipeline.score_visits(goal, history)

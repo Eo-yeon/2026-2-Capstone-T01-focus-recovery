@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import uvicorn
 
 from models.context import PageVisit
@@ -9,7 +9,8 @@ from pipeline import FocusRecoveryPipeline
 app = FastAPI(title="AI Capstone Design - Drift Analysis API")
 
 # AI 파이프라인 전역 인스턴스 초기화 (AI-001 -> AI-002 -> AI-003)
-pipeline = FocusRecoveryPipeline.from_default(use_context=True, classifier_type="xgboost")
+# 학습된 분류기(ai/artifacts/drift_classifier.joblib 또는 DRIFT_CLASSIFIER_PATH)가 필요하다.
+pipeline = FocusRecoveryPipeline.from_default()
 
 # Request 데이터 스키마 정의 (Spring Boot에서 전달받을 데이터 구조)
 class PageVisitRequest(BaseModel):
@@ -19,7 +20,7 @@ class PageVisitRequest(BaseModel):
 class AnalysisRequest(BaseModel):
     task_goal: str
     recent_pages: List[PageVisitRequest]
-    behavior_features: List[float] # 예: [활성 체류시간, 탭 전환 횟수 등]
+    behavior_features: Optional[List[float]] = None # 예: [활성 체류시간, 탭 전환 횟수 등], 행동 특징 없이 학습된 분류기면 생략
 
 @app.post("/api/v1/analyze")
 def analyze_drift(request: AnalysisRequest):
