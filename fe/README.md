@@ -1,5 +1,7 @@
 # Focus Recovery Chrome Extension (Issue #51 포함)
 
+Issue #60에서 Naver 일반 웹 카드의 새 DOM 경계를 지원합니다. [수정·검증 보고서](../docs/naver-search-dom-fix-validation.md)에 실제 Chrome → 전용 BE/MySQL의 영어·한국어 저장 결과와 남은 검증 범위를 기록합니다. 사이트 권한은 테스트 manifest에 사전 부여했으므로 사용자 승인 dialog 검증과 구분합니다.
+
 Manifest V3 개발용 수집기입니다. 서버 작업 세션 → 확정 방문 POST → POST ACK 이후 누적 행동 PATCH → 최종 ACK 이후 서버 종료와 END_PENDING 영속 복구를 연동합니다.
 
 본문은 최대 **5,000 Unicode code points**까지 추출하고, IndexedDB 큐·전송·저장에서는 추출 원본을 유지합니다. Issue #56에서 BE 검증도 동일 기준으로 통일했습니다. [Unicode 계약 수정·회귀 검증](../docs/unicode-content-length-validation.md)에 원인·경계값·실제 Chrome → BE → MySQL 결과를 기록합니다. DB 스키마 변경은 없습니다.
@@ -789,9 +791,11 @@ Issue #34 보완 브라우저 시나리오는 실제 Worker에 checkpoint 저장
 | 서비스 | 현재 판별 근거 | 설명 추출 | 검증 상태 |
 | --- | --- | --- | --- |
 | Google | `#search #rso` 안의 `.MjjYud`/`.g`, `a[href] h3` | `[data-sncf]`, `.VwiC3b`, `.IsZvec` | 합성 HTML/MV3 검증만 완료. 실제 서비스는 차단되어 **실제 DOM 미확인** |
-| Naver | `#main_pack` 안의 `[data-block-id^="web/"]` 또는 `[data-template-id="ugcItem"][data-template-type="searchBasic"]`, 제목 링크의 `sds-comps-text-type-headline` | 제목과 분리된 설명 링크의 `sds-comps-text-type-body1` | 2026-10-14 실제 데스크톱 DOM과 확장 실행 확인 |
+| Naver | `#main_pack .fds-web-root .fds-web-list-root > .fds-web-doc-root.fds-web-normal-doc-root`와 제목 링크의 `headline1`; 기존 `web/…`·`ugcItem/searchBasic`도 유지 | 새 카드는 같은 목적지 링크의 `body1`만 연결하며 모호한 다중 제목/설명은 제외 | 2026-10-19 실제 데스크톱 영어/한국어 수집·전용 DB 저장 확인. [#60 보고서](../docs/naver-search-dom-fix-validation.md) |
 
 Naver의 해시형 클래스는 사용하지 않습니다. Google의 클래스 변경, Naver의 다른 섹션/모바일/실험 레이아웃은 추출 실패할 수 있습니다. 근거가 부족하면 전체 body 텍스트로 대체하지 않습니다. 같은 제목 DOM의 중첩 wrapper와 같은 제목·설명은 중복 계산하지 않습니다.
+
+#60 재현 테스트는 `npm test -- tests/search-live-dom.test.ts`로 기본 실행됩니다. `RUN_KNOWN_SEARCH_BUG` 조건과 SKIP은 제거했습니다. 실제 서비스 재검증은 새 전용 DB(label `focus-recovery.issue=60`)와 본인이 시작한 로컬 BE를 확인한 뒤 `INTEGRATION_API_BASE_URL`, `INTEGRATION_MYSQL_CONTAINER`, `CHROMIUM_PATH`를 지정해 `HEADED=1 node scripts/naver-search-integration-test.mjs`로 실행합니다. 실제 공개 검색 3회(영어·한국어·결과 없는 검증어)만 요청하고 원문은 출력하지 않습니다.
 
 `content`는 `검색어: …`, `검색 결과 N`, `제목: …`, 선택적 `설명: …` 구조이며 총 **5,000 Unicode code point** 제한을 적용합니다. 제한 내에 온전한 제목을 보관할 수 없는 결과는 세지 않습니다. 별도 서버 검색 결과 배열/DTO/`searchedAt`은 추가하지 않았습니다. `PageSnapshot.organicResultCount`는 내부 판정 근거이며 `PageVisit`에서 제거합니다.
 
