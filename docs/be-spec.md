@@ -186,7 +186,7 @@ Chrome Extension이 수집한 분석 대상 페이지 방문을 Page Visit 단�
 | normalizedUrl | 정규화 URL |
 | domain | 도메인 |
 | title | 페이지 제목 |
-| content | 제한된 페이지 본문 |
+| content | 최대 5,000 Unicode code points인 페이지 본문 (생략·null·빈 문자열 허용) |
 | searchQuery | 검색어 |
 | visitedAt | 방문 시각 |
 | duration | 활성 체류시간 |
@@ -199,6 +199,7 @@ Chrome Extension이 수집한 분석 대상 페이지 방문을 Page Visit 단�
 
 - 존재하지 않거나 종료된 세션의 방문은 저장하지 않는다.
 - 분석 제외 페이지는 분석용 방문 데이터로 저장하지 않는다.
+- 본문은 FE와 동일하게 Unicode code point 수로 검증한다. 5,000개 초과 시 HTTP 400 `INVALID_REQUEST`와 `content` 필드 오류를 반환하며 원본을 자동 절단하지 않는다. 저장 컬럼은 기존 `MEDIUMTEXT`를 유지한다.
 - 같은 URL의 실제 재방문은 독립 방문으로 저장할 수 있다. 요청 재전송과 실제 재방문의 식별 방식은 별도로 확정할 사항이다.
 
 #### 연관 기능

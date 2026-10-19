@@ -33,11 +33,12 @@ export async function visitTestProxy(apiOrigin) {
       const headers = { 'Content-Type': 'application/json' };
       if (req.headers['idempotency-key']) headers['Idempotency-Key'] = req.headers['idempotency-key'];
       const upstream = await fetch(new URL(req.url, apiOrigin), {
-        method: req.method, headers, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body, redirect: 'error',
+        // onVisit can explicitly inject invalid test input for real BE validation.
+        method: req.method, headers, body: ['GET', 'HEAD'].includes(req.method) ? undefined : record ? JSON.stringify(record.body) : body, redirect: 'error',
       });
       const payload = Buffer.from(await upstream.arrayBuffer());
       if (end) { end.status = upstream.status; end.response = JSON.parse(payload.toString()); }
-      if (record) record.status = upstream.status;
+      if (record) { record.status = upstream.status; record.response = JSON.parse(payload.toString()); }
       if (behavior) { behavior.status = upstream.status; behavior.response = JSON.parse(payload.toString()); }
       const deliver = () => {
         if (!res.destroyed) {

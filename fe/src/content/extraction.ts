@@ -52,5 +52,6 @@ export function extractMainContent(doc: Document): string | null {
   const roots = explicit.length ? explicit : [...doc.querySelectorAll('section')].filter(el => el.querySelectorAll('p,pre').length >= 2);
   const texts = roots.map(textFrom).map(cleanText).filter(Boolean);
   if (!texts.length) return null;
+  // FE/BE contract: at most 5,000 Unicode code points, preserving surrogate pairs.
   return [...texts.sort((a, b) => b.length - a.length)[0]].slice(0, 5000).join('');
 }

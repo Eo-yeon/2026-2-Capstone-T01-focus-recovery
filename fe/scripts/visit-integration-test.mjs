@@ -9,6 +9,7 @@ import { join, resolve } from 'node:path';
 import { build } from 'vite';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createHash } from 'node:crypto';
 import { visitTestProxy } from './visit-test-proxy.mjs';
 
 const api = process.env.INTEGRATION_API_BASE_URL;
@@ -19,13 +20,18 @@ const proxy = await visitTestProxy(apiUrl.origin);
 const host = '127.0.0.1';
 const title = '공개 합성 방문 검증';
 const longContent = '개인정보 없는 긴 공개 문서의 본문 제한을 확인합니다. '.repeat(300);
+const unicodeCases = [
+  ['korean', '가'.repeat(5000)], ['english', 'a'.repeat(5000)],
+  ['emoji', '😀'.repeat(2500)], ['emoji2501', '😀'.repeat(2501)],
+  ['emoji5000', '😀'.repeat(5000)], ['overflow', '😀'.repeat(5001)],
+  ['mixed', '한a😀𐐀'.repeat(1250)],
+];
 const fixture = createServer((req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   const path = new URL(req.url, 'http://localhost').pathname;
-  const content = req.url === '/empty' ? '짧음' : req.url === '/unicode/korean' ? '가'.repeat(5000)
-    : req.url === '/unicode/english' ? 'a'.repeat(5000) : req.url === '/unicode/emoji' ? '😀'.repeat(2500)
-    : req.url === '/unicode/overflow' ? '😀'.repeat(2501) : path === '/document/1' ? longContent
-    : '서버 방문 저장을 확인하는 개인정보 없는 공개 합성 본문입니다. '.repeat(5);
+  const content = req.url === '/empty' ? '짧음' : unicodeCases.find(([label]) => path === `/unicode/${label}`)?.[1]
+    ?? (path === '/document/1' ? longContent
+    : '서버 방문 저장을 확인하는 개인정보 없는 공개 합성 본문입니다. '.repeat(5));
   const sensitive = path === '/sensitive' ? '<form><input type="password" value="SYNTHETIC_SECRET"></form>' : '';
   res.end('<!doctype html><title>' + title + '</title><article><p>' + content + '</p></article>' + sensitive);
 });
@@ -290,31 +296,69 @@ try {
   await checkDatabase(deletionSession, 1);
   console.log('PASS C-2: explicit local clear, late real 201 received, checkpoint stays empty, queued visit 2 never sent, already committed server visit remains');
 
-  // E + C-3: real extraction/API validation; no original is cut to fit Java @Size.
-  for (const [label, codePoints, units, expected] of [['korean', 5000, 5000, 201], ['english', 5000, 5000, 201], ['emoji', 2500, 5000, 201], ['overflow', 2501, 5002, 400]]) {
+  // E: collect the exact code point prefix, then store/replay without any further truncation.
+  for (const [label, source] of unicodeCases) {
+    const expectedContent = [...source].slice(0, 5000).join('');
     const unicodeSession = await begin(`Unicode ${label}`);
     await page.goto(`${origin}/unicode/${label}`); await page.bringToFront();
     await until(state => state.visits.length === 1);
     await request({ type: 'stop' });
-    await until(state => state.visitDelivery.visits[0]?.phase === (expected === 400 ? 'failed' : 'acked'), true);
+    await allAck(1);
     const unicodeCheckpoint = await readCheckpoint(), original = unicodeCheckpoint.entries[0].visit;
-    assert.equal([...original.content].length, codePoints); assert.equal(original.content.length, units);
+    assert.equal(original.content, expectedContent, 'IDB preserves the extracted Unicode prefix');
+    assert.equal([...original.content].length, Math.min([...source].length, 5000));
     const requests = proxy.requests.filter(record => record.sessionId === unicodeSession);
-    assert.equal(requests.length, 1); assert.equal(requests[0].status, expected);
-    assert.equal((await visitList(unicodeSession)).totalElements, expected === 400 ? 0 : 1);
+    assert.equal(requests.length, 1); assert.equal(requests[0].status, 201);
+    assert.equal(requests[0].response.visitId, original.visitId);
+    assert.equal(requests[0].response.content, expectedContent);
+    const storedList = await visitList(unicodeSession);
+    assert.equal(storedList.totalElements, 1);
     assert.equal(sameRequest(requests[0], original), true);
-    if (expected === 400) {
-      assert.equal(unicodeCheckpoint.entries[0].retryable, false);
-      await restart(); await request({ type: 'retry-visits' });
-      assert.equal(JSON.stringify(await readCheckpoint()) === JSON.stringify(unicodeCheckpoint), true, 'failed original must survive restart and disallowed retry');
-      await checkDatabase(unicodeSession, 0);
-      await popup.reload();
-      await popup.getByText(/로컬 기록 삭제는 저장·행동 갱신 미확인 요청도 버립니다/).waitFor();
-      assert.equal((await request({ type: 'clear' })).ok, true);
-      assert.equal((await readCheckpoint()).entries.length, 0);
-    } else await checkDatabase(unicodeSession, 1);
+    async function checkUnicodeRow() {
+      await checkDatabase(unicodeSession, 1);
+      if (!process.env.INTEGRATION_MYSQL_CONTAINER) return;
+      assert.match(original.visitId, /^[a-f0-9-]{36}$/);
+      const sql = `SELECT visit_id, CHAR_LENGTH(content), OCTET_LENGTH(content), SHA2(content,256) FROM page_visit WHERE session_id='${unicodeSession}' AND visit_id='${original.visitId}';`;
+      const { stdout } = await promisify(execFile)('docker', ['exec', process.env.INTEGRATION_MYSQL_CONTAINER, 'mysql', '-uroot', '--batch', '--skip-column-names', 'focus_recovery', '-e', sql]);
+      assert.equal(stdout.trim(), [original.visitId, [...expectedContent].length, Buffer.byteLength(expectedContent), createHash('sha256').update(expectedContent).digest('hex')].join('\t'));
+    }
+    await checkUnicodeRow();
+    const { sessionId: _, ...body } = original;
+    const replay = await fetch(`${apiUrl.origin}/api/sessions/${unicodeSession}/visits`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    assert.equal(replay.status, 200);
+    const replayed = await replay.json();
+    assert.equal(replayed.visitId, original.visitId); assert.equal(replayed.content, expectedContent);
+    await restart(); await allAck(1);
+    assert.deepEqual(await readCheckpoint(), unicodeCheckpoint);
+    assert.deepEqual(await visitList(unicodeSession), storedList);
+    await checkUnicodeRow();
+    console.log(`PASS E ${label}: visitId=${original.visitId}, POST 201, ${[...expectedContent].length} code points/${expectedContent.length} UTF-16 units/${Buffer.byteLength(expectedContent)} bytes, exact response/IDB content, replay 200, Worker ACK preserved${process.env.INTEGRATION_MYSQL_CONTAINER ? ', SQL length/SHA-256/unique row verified' : ''}`);
   }
-  console.log('PASS E/C-3: real BE accepts Korean/English 5000 units and emoji 2500 code points/5000 units; rejects emoji 2501 code points/5002 units with 400, keeps original through restart, deletes only on explicit clear');
+
+  // C-3: deliberately corrupt only the outbound test request; BE must reject 5,001 code points.
+  const invalidSession = await begin('명시적 유효성 실패 입력');
+  proxy.onVisit = async record => { if (record.sessionId === invalidSession) record.body.content = '😀'.repeat(5001); };
+  await collect(1, 'invalid-content'); await request({ type: 'stop' });
+  await until(state => state.visitDelivery.visits[0]?.phase === 'failed', true);
+  const invalidCheckpoint = await readCheckpoint();
+  assert.equal(invalidCheckpoint.entries[0].retryable, false);
+  assert.equal(invalidCheckpoint.entries[0].code, 'INVALID_REQUEST');
+  assert.notEqual(invalidCheckpoint.entries[0].visit.content, '😀'.repeat(5001));
+  const invalidRequests = proxy.requests.filter(record => record.sessionId === invalidSession);
+  assert.equal(invalidRequests.length, 1); assert.equal(invalidRequests[0].status, 400);
+  assert.equal(invalidRequests[0].response.code, 'INVALID_REQUEST');
+  assert.equal(invalidRequests[0].response.fieldErrors[0].field, 'content');
+  assert.equal((await visitList(invalidSession)).totalElements, 0);
+  await restart(); await request({ type: 'retry-visits' });
+  assert.deepEqual(await readCheckpoint(), invalidCheckpoint, 'failed original survives restart and disallowed retry');
+  assert.equal(proxy.requests.filter(record => record.sessionId === invalidSession).length, 1);
+  await checkDatabase(invalidSession, 0);
+  proxy.onVisit = async () => undefined;
+  await popup.reload();
+  await popup.getByText(/로컬 기록 삭제는 저장·행동 갱신 미확인 요청도 버립니다/).waitFor();
+  assert.equal((await request({ type: 'clear' })).ok, true);
+  assert.equal((await readCheckpoint()).entries.length, 0);
+  console.log('PASS C-3: explicitly injected outbound 5001-code-point content gets real BE 400 INVALID_REQUEST, no DB row, intact IDB original/non-retryable state through Worker restart/disallowed retry, explicit clear only');
 } finally {
   await context?.close();
   await proxy.close();

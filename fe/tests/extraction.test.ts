@@ -23,6 +23,21 @@ describe('main content extraction', () => {
     expect([...result]).toHaveLength(5000);
     expect(result.endsWith('🙂')).toBe(true);
   });
+  it.each([
+    ['가'.repeat(5000), '가'.repeat(5000)],
+    ['a'.repeat(5000), 'a'.repeat(5000)],
+    ['😀'.repeat(2500), '😀'.repeat(2500)],
+    ['😀'.repeat(2501), '😀'.repeat(2501)],
+    ['😀'.repeat(5000), '😀'.repeat(5000)],
+    ['😀'.repeat(5001), '😀'.repeat(5000)],
+    ['한a😀𐐀'.repeat(1250), '한a😀𐐀'.repeat(1250)],
+    ['a'.repeat(4999) + '😀𐐀', 'a'.repeat(4999) + '😀'],
+  ])('preserves the exact Unicode prefix at boundary case %#', (content, expected) => {
+    document.body.innerHTML = `<article>${content}</article>`;
+    const result = extractMainContent(document)!;
+    expect(result).toBe(expected);
+    expect([...result].length).toBeLessThanOrEqual(5000);
+  });
   it.each(['<form><input value="secret"></form>', '<input type="password" value="secret" hidden>', '<input type="email" value="secret">', '<input autocomplete="cc-number" value="secret">', '<input name="token" value="secret">', '<div contenteditable="true">private</div>'])('fails closed on sensitive or form-centered documents: %s', element => {
     document.body.innerHTML = `<article>${'public '.repeat(30)}</article>${element}`;
     expect(isExcludedDocument(document)).toBe(true);

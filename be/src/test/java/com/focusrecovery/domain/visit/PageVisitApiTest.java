@@ -20,12 +20,14 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -153,10 +155,15 @@ class PageVisitApiTest {
 		assertThat(response).contains("\"title\":null", "\"content\":null", "\"searchQuery\":null", "\"updatedAt\":null");
 	}
 
-	@Test
-	void 본문은_5000자까지_저장된다() throws Exception {
+	static Stream<String> allowedContents() {
+		return Stream.of("", " ", "가".repeat(5000), "a".repeat(5000), "😀".repeat(2500),
+			"😀".repeat(2501), "😀".repeat(5000), "한a😀𐐀".repeat(1250));
+	}
+
+	@ParameterizedTest(name = "허용 본문 [{index}]")
+	@MethodSource("allowedContents")
+	void 본문은_5000_code_points까지_원본대로_저장된다(String content) throws Exception {
 		String visitId = UUID.randomUUID().toString();
-		String content = "가".repeat(5000);
 		String body = withField(visitJson(visitId, 1, "제목"), "content", "\"" + content + "\"");
 
 		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
@@ -164,20 +171,28 @@ class PageVisitApiTest {
 			.andExpect(jsonPath("$.content").value(content));
 		// 같은 본문으로 재전송하면 기존 방문을 반환한다
 		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
-			.andExpect(status().isOk());
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.visitId").value(visitId))
+			.andExpect(jsonPath("$.content").value(content));
 
+		assertThat(pageVisitRepository.count()).isEqualTo(1);
 		assertThat(pageVisitRepository.findById(UUID.fromString(visitId)).orElseThrow().getContent()).isEqualTo(content);
 	}
 
-	@Test
-	void 본문이_5000자를_넘으면_400이고_저장하지_않는다() throws Exception {
-		String body = withField(visitJson(UUID.randomUUID().toString(), 1, "제목"), "content", "\"" + "a".repeat(5001) + "\"");
+	static Stream<String> oversizedContents() {
+		return Stream.of("가".repeat(5001), "a".repeat(5001), "😀".repeat(5001), "한a😀𐐀".repeat(1250) + "😀");
+	}
+
+	@ParameterizedTest(name = "초과 본문 [{index}]")
+	@MethodSource("oversizedContents")
+	void 본문이_5000_code_points를_넘으면_400이고_저장하지_않는다(String content) throws Exception {
+		String body = withField(visitJson(UUID.randomUUID().toString(), 1, "제목"), "content", "\"" + content + "\"");
 
 		mockMvc.perform(post(visitsUrl(sessionId)).contentType(MediaType.APPLICATION_JSON).content(body))
 			.andExpect(status().isBadRequest())
 			.andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
 			.andExpect(jsonPath("$.fieldErrors[0].field").value("content"))
-			.andExpect(jsonPath("$.fieldErrors[0].message").value("본문은 5,000자 이하여야 합니다."));
+			.andExpect(jsonPath("$.fieldErrors[0].message").value("본문은 5,000 Unicode code points 이하여야 합니다."));
 
 		assertThat(pageVisitRepository.count()).isZero();
 	}

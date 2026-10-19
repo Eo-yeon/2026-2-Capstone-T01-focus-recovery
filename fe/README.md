@@ -1,8 +1,10 @@
 # Focus Recovery Chrome Extension (Issue #51 포함)
 
-Manifest V3 개발용 수집기입니다. 서버 작업 세션 → 확정 방문 POST → POST ACK 이후 누적 행동 PATCH → 최종 ACK 이후 서버 종료와 END_PENDING 영속 복구를 연동합니다. 이번 변경은 BE 코드·DB 스키마를 변경하지 않습니다.
+Manifest V3 개발용 수집기입니다. 서버 작업 세션 → 확정 방문 POST → POST ACK 이후 누적 행동 PATCH → 최종 ACK 이후 서버 종료와 END_PENDING 영속 복구를 연동합니다.
 
-Issue #55의 최신 main 기반 실행 결과와 체크리스트는 [FE 데이터 수집 E2E 검증](../docs/fe-collection-e2e-validation.md)을 참고하세요. 기존 테스트를 재사용해 7개 방문과 단계별 MySQL Window 검사를 보강했습니다. 실제 검색 서비스 검증의 미완료 범위와 본문 문자 단위 계약 결함(#56)은 자동 검사 통과와 구분합니다.
+본문은 최대 **5,000 Unicode code points**까지 추출하고, IndexedDB 큐·전송·저장에서는 추출 원본을 유지합니다. Issue #56에서 BE 검증도 동일 기준으로 통일했습니다. [Unicode 계약 수정·회귀 검증](../docs/unicode-content-length-validation.md)에 원인·경계값·실제 Chrome → BE → MySQL 결과를 기록합니다. DB 스키마 변경은 없습니다.
+
+Issue #55 당시 실행 결과와 체크리스트는 [FE 데이터 수집 E2E 검증](../docs/fe-collection-e2e-validation.md)을 참고하세요. 기존 테스트를 재사용해 7개 방문과 단계별 MySQL Window 검사를 보강했습니다. 당시 발견한 문자 단위 결함은 위 #56 보고서로 후속 검증하며, 실제 검색 서비스 검증의 미완료 범위는 그대로 남습니다.
 
 ## Issue #51 코드 리뷰 경계 검증·보완 (2026-10-19)
 
