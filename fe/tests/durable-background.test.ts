@@ -30,6 +30,25 @@ async function visit(duration = 1500) {
   await message({ type: 'snapshot', sessionId: SERVER_SESSION_ID, snapshot: { ...(await describeUrl(frame.url))!, title: '공개 문서', content: '공개 합성 본문 '.repeat(20) } }, true);
   return clock;
 }
+async function deniedNavigation() {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(10000);
+  chromeApi.permissions.contains.mockResolvedValue(false);
+  chromeApi.permissions.getAll.mockResolvedValue({ origins: [] });
+  expect((await message({ type: 'start', goalText: '공개 문서의 신규 사이트 권한 검증하기' })).ok).toBe(true);
+  chromeApi.webNavigation.onCommitted.listeners[0]({ tabId: 1, frameId: 0, documentId: frame.documentId, url: frame.url, transitionType: 'link' });
+  await message({ type: 'status' });
+  return clock;
+}
+async function grantSite() {
+  chromeApi.permissions.contains.mockResolvedValue(true);
+  chromeApi.permissions.getAll.mockResolvedValue({ origins: [`${new URL(frame.url).origin}/*`] });
+  chromeApi.permissions.onAdded.listeners[0]();
+  await message({ type: 'status' });
+}
+async function publicSnapshot() {
+  const url = (await describeUrl(frame.url))!;
+  return message({ type: 'snapshot', sessionId: SERVER_SESSION_ID, snapshot: { ...url, title: '공개 문서', content: '개인정보 없는 공개 합성 본문 '.repeat(20), ...(url.isSearchResultPage ? { organicResultCount: 1 } : {}) } }, true);
+}
 beforeEach(async () => {
   vi.restoreAllMocks(); vi.resetModules(); vi.stubGlobal('indexedDB', new IDBFactory()); local = {}; legacy = {};
   frame = { documentId: 'original-document', url: 'https://example.com/docs' };
@@ -50,6 +69,99 @@ beforeEach(async () => {
 });
 
 describe('real Background with IndexedDB', () => {
+  it.each(['ordinary', 'naver'] as const)('starts one %s candidate at grant time without pre-permission data or duplicate sequences', async kind => {
+    if (kind === 'naver') frame.url = 'https://search.naver.com/search.naver?query=Spring%20Boot%20JWT#public';
+    const clock = await deniedNavigation(), before = (await raw()).value.collection;
+    expect(before.tabs[1].awaitingPermission).toBe(true);
+    await publicSnapshot(); expect((await raw()).value.collection.candidates[0].snapshot).toBeUndefined();
+    clock.mockReturnValue(90000); await grantSite(); await message({ type: 'context' }, true);
+    const fresh = (await raw()).value.collection.candidates.at(-1);
+    expect(fresh).toMatchObject({ visitedAt: new Date(90000).toISOString(), activeDurationMs: 0, browserTabKey: before.tabs[1].browserTabKey });
+    expect(fresh.visitId).not.toBe(before.candidates[0].visitId);
+    clock.mockReturnValue(90500); await publicSnapshot();
+    expect((await message({ type: 'status' })).status!.visits).toEqual([]);
+    clock.mockReturnValue(91500); await publicSnapshot();
+    for (let i = 0; i < 2; i++) { await grantSite(); await message({ type: 'context' }, true); await publicSnapshot(); }
+    const state = (await raw()).value.collection;
+    expect(state.candidates).toHaveLength(2);
+    expect(state.candidates[0]).toMatchObject({ state: 'excluded', activeDurationMs: 0, sequence: null });
+    expect(state.candidates[0].snapshot).toBeUndefined();
+    expect(state.candidates[1]).toMatchObject({ visitId: fresh.visitId, state: 'valid', activeDurationMs: 1500 });
+    expect(state.candidates[1].snapshot.searchQuery).toBe(kind === 'naver' ? 'Spring Boot JWT' : null);
+    chromeApi.tabs.onRemoved.listeners[0](1);
+    await vi.waitFor(async () => expect((await raw()).value.visitDelivery.entries[0]).toMatchObject({ phase: 'acked', sequence: 1 }));
+    await vi.waitFor(async () => expect((await raw()).value.behaviorDelivery.entries[0].phase).toBe('acked'));
+    expect((await raw()).value.visitDelivery.entries).toHaveLength(1);
+    await message({ type: 'stop' }); await message({ type: 'clear' });
+  });
+  it('does not revive a truly sensitive URL even after the same document changes to a safe path', async () => {
+    frame.url = 'https://example.com/login'; const clock = await deniedNavigation();
+    expect((await raw()).value.collection.tabs[1].awaitingPermission).toBeUndefined();
+    await grantSite(); await message({ type: 'context' }, true);
+    frame.url = 'https://example.com/docs'; clock.mockReturnValue(90000);
+    await message({ type: 'context' }, true); await publicSnapshot();
+    expect((await message({ type: 'status' })).status!.visits).toEqual([]);
+    expect((await raw()).value.collection.candidates).toHaveLength(1);
+  });
+  it('consumes the permission marker when the current URL fails policy validation', async () => {
+    const clock = await deniedNavigation();
+    frame.url = 'https://example.com/account'; await grantSite(); await message({ type: 'context' }, true);
+    expect((await raw()).value.collection.tabs[1].awaitingPermission).toBeUndefined();
+    frame.url = 'https://example.com/docs'; clock.mockReturnValue(90000);
+    await message({ type: 'context' }, true); await publicSnapshot();
+    expect((await raw()).value.collection.candidates).toHaveLength(1);
+    expect((await message({ type: 'status' })).status!.visits).toEqual([]);
+  });
+  it('retains DOM exclusion after grant and never revives it through repeated context', async () => {
+    const clock = await deniedNavigation(); await grantSite(); await message({ type: 'context' }, true);
+    await message({ type: 'snapshot', sessionId: SERVER_SESSION_ID, snapshot: null, reason: 'dom-policy' }, true);
+    clock.mockReturnValue(90000); await message({ type: 'context' }, true); await publicSnapshot();
+    const state = (await raw()).value.collection;
+    expect(state.candidates).toHaveLength(2);
+    expect(state.candidates[1]).toMatchObject({ state: 'excluded', reason: 'dom-policy' });
+    expect(state.candidates[1].snapshot).toBeUndefined();
+    expect((await message({ type: 'status' })).status!.visits).toEqual([]);
+  });
+  it('does not create a permission recovery marker for the mandatory API host', async () => {
+    frame.url = (await import('../src/api/client')).API_BASE_URL + '/docs';
+    await deniedNavigation(); await grantSite();
+    expect((await raw()).value.collection.tabs[1].awaitingPermission).toBeUndefined();
+    expect(await message({ type: 'context' }, true)).toMatchObject({ sessionId: null });
+    expect((await message({ type: 'status' })).status!.visits).toEqual([]);
+  });
+  it('rechecks document and permission before consuming the recovery marker', async () => {
+    await deniedNavigation(); await grantSite();
+    chromeApi.webNavigation.getFrame.mockResolvedValue({ ...frame, documentId: 'replacement' });
+    expect(await message({ type: 'context' }, true)).toMatchObject({ sessionId: null });
+    expect((await raw()).value.collection.tabs[1].awaitingPermission).toBe(true);
+    chromeApi.webNavigation.getFrame.mockResolvedValue(frame); chromeApi.permissions.contains.mockResolvedValue(false);
+    expect(await message({ type: 'context' }, true)).toMatchObject({ sessionId: null });
+    expect((await raw()).value.collection.candidates).toHaveLength(1);
+  });
+  it('starts only a fresh post-grant candidate after Worker restart', async () => {
+    const clock = await deniedNavigation(); await restart(); await message({ type: 'status' });
+    clock.mockReturnValue(90000); await grantSite(); await message({ type: 'context' }, true);
+    clock.mockReturnValue(91500); await publicSnapshot();
+    expect((await message({ type: 'status' })).status!.visits[0]).toMatchObject({ activeDurationMs: 1500, visitedAt: new Date(90000).toISOString() });
+    expect((await raw()).value.collection.candidates).toHaveLength(2);
+  });
+  it('collects the same active document after granting permission to a page opened during the session', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(10000);
+    chromeApi.permissions.contains.mockResolvedValue(false);
+    chromeApi.permissions.getAll.mockResolvedValue({ origins: [] });
+    expect((await message({ type: 'start', goalText: '공개 문서의 신규 사이트 권한 검증하기' })).ok).toBe(true);
+    chromeApi.webNavigation.onCommitted.listeners[0]({ tabId: 1, frameId: 0, documentId: frame.documentId, url: frame.url, transitionType: 'link' });
+    await message({ type: 'status' });
+    expect((await raw()).value.collection.candidates[0]).toMatchObject({ state: 'excluded', reason: 'url-policy' });
+    chromeApi.permissions.contains.mockResolvedValue(true);
+    chromeApi.permissions.getAll.mockResolvedValue({ origins: ['https://example.com/*'] });
+    chromeApi.permissions.onAdded.listeners[0]({ origins: ['https://example.com/*'] });
+    await message({ type: 'status' });
+    await message({ type: 'context' }, true);
+    clock.mockReturnValue(11500);
+    await message({ type: 'snapshot', sessionId: SERVER_SESSION_ID, snapshot: { ...(await describeUrl(frame.url))!, title: '권한 허용된 공개 문서', content: '개인정보 없는 공개 합성 본문 '.repeat(20) } }, true);
+    expect((await message({ type: 'status' })).status!.candidates.at(-1)?.state).toBe('valid');
+  });
   it.each(['acked', 'unconfirmed', 'in-flight'] as const)('never reuses a %s sequence after repeated revocation, clear and Worker restart', async phase => {
     const clock = await visit(), normalFetch = vi.mocked(fetch).getMockImplementation()!;
     let release: (() => void) | undefined;
