@@ -84,6 +84,28 @@ describe('IndexedDB aggregate transactions', () => {
 });
 
 describe('migration and corruption', () => {
+  it('persists an erased prefix without weakening candidate or POST sequence validation', async () => {
+    const state = await fixture();
+    state.collection.sequenceStart = 7; state.collection.nextSequence = 8;
+    state.collection.candidates[0].sequence = 7;
+    state.visitDelivery!.entries[0].sequence = 7; state.visitDelivery!.entries[0].visit.sequence = 7;
+    state.behaviorDelivery!.entries[0].sequence = 7;
+    await repository.initialize(state);
+    expect((await repo().initialize({})).value).toEqual(state);
+    for (const change of [
+      (s: DurableState) => { delete s.collection.sequenceStart; },
+      (s: DurableState) => { s.collection.nextSequence++; },
+      (s: DurableState) => { s.collection.candidates[0].sequence = 8; },
+      (s: DurableState) => { s.visitDelivery!.entries[0].sequence = 8; s.visitDelivery!.entries[0].visit.sequence = 8; },
+    ]) {
+      const corrupt = structuredClone(state); change(corrupt);
+      expect(() => validateState(corrupt)).toThrow();
+    }
+  });
+  it.each([0, -1, 1.5, null, '2', Number.MAX_SAFE_INTEGER + 1])('rejects invalid erased-prefix sequence %s', async base => {
+    const state = await fixture(); Object.assign(state.collection, { sequenceStart: base });
+    expect(() => validateState(state)).toThrow();
+  });
   it('shares duplicate initialization calls within one Worker', async () => {
     const state = await fixture(); const first = repository.initialize(state), second = repository.initialize(state);
     expect(first).toBe(second); await first; expect((await read()).revision).toBe(1);

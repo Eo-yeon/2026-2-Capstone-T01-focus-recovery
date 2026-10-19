@@ -460,7 +460,7 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
         await broadcast();
       } else if (message.type === 'clear') {
         if (collector.state.session) return { ok: false, error: '세션 종료 후 기록을 지워 주세요.' };
-        collector.state = emptyState();
+        collector.state = emptyState(activeStart && !ending.checkpoint ? collector.state.nextSequence : 1);
         if (ending.checkpoint) { ending.clear(); activeStart = undefined; retainedSession = undefined; }
         delivery.clear(); behaviors.clear();
         durablePostAcks.clear();
@@ -579,7 +579,8 @@ chrome.permissions.onRemoved.addListener(() => event(async now => {
   if (ending.checkpoint) { await syncScripts(); await broadcast(); return; }
   // Revocation is privacy-sensitive: stop and erase all in-memory samples.
   suspend(now);
-  collector.state = emptyState();
+  // Issued numbers may already be committed on the server, even without an ACK.
+  collector.state = emptyState(collector.state.nextSequence);
   delivery.clear(); behaviors.clear();
   durablePostAcks.clear();
   await persist(true);
