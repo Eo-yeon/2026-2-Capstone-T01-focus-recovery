@@ -84,4 +84,13 @@ class OpenApiDocsTest {
 				allOf(containsString("offset 페이지네이션의 한계"), containsString("스냅샷 일관성은 보장하지 않습니다"),
 					containsString("alertId로 중복을 걸러도"), containsString("커서 방식은 후속 개선"))));
 	}
+
+	@Test
+	void OpenAPI_문서에_상태_확인_API와_확인_범위가_포함된다() throws Exception {
+		mockMvc.perform(get("/v3/api-docs"))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.paths['/api/health'].get.description",
+				allOf(containsString("HTTP 서버의 응답 가능 여부뿐"), containsString("DB나 AI가 정상이라는 뜻은 아닙니다"))))
+			.andExpect(jsonPath("$.components.schemas.HealthResponse.properties.length()").value(1));
+	}
 }
