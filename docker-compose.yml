@@ -1,0 +1,57 @@
+# MySQL, Backend, AI Service를 함께 실행한다.
+# 사용법: cp .env.example .env 후 값을 채우고 `docker compose up -d --build`
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD를 .env에 설정하세요}
+      MYSQL_DATABASE: focus_recovery
+      TZ: UTC
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  ai:
+    build: ./ai
+    ports:
+      - "${AI_PORT:-8000}:8000"
+    volumes:
+      # 최초 실행 시 내려받은 모델을 보관해 재시작마다 다시 받지 않는다
+      - ai-models:/models
+    # GPU를 쓰려면 아래 주석을 해제한다 (NVIDIA Container Toolkit 필요)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  be:
+    build: ./be
+    depends_on:
+      mysql:
+        condition: service_healthy
+      ai:
+        condition: service_started
+    environment:
+      DB_URL: jdbc:mysql://mysql:3306/focus_recovery?serverTimezone=UTC
+      DB_USERNAME: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      AI_BASE_URL: http://ai:8000
+    ports:
+      - "${BE_PORT:-8080}:8080"
+
+volumes:
+  mysql-data:
+  ai-models:
