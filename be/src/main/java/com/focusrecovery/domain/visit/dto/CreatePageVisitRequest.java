@@ -7,6 +7,7 @@ import java.util.UUID;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.focusrecovery.domain.visit.entity.PageVisit;
 import com.focusrecovery.global.util.Uuids;
+import com.focusrecovery.global.validation.CodePointLength;
 import com.focusrecovery.global.validation.NormalizedUrl;
 
 import io.swagger.v3.oas.annotations.media.Schema;
@@ -54,9 +55,9 @@ public record CreatePageVisitRequest(
 	@Size(max = 16383, message = "제목이 너무 깁니다.")
 	String title,
 
-	@Schema(description = "FE가 추출한 페이지 본문 텍스트 (생략 또는 null 가능, 최대 5,000자)", maxLength = 5000,
+	@Schema(description = "FE가 추출한 페이지 본문 텍스트 (생략 또는 null 가능, 최대 5,000 Unicode code points)", maxLength = 5000,
 		example = "Spring Boot helps you to create stand-alone...")
-	@Size(max = 5000, message = "본문은 5,000자 이하여야 합니다.")
+	@CodePointLength(max = 5000, message = "본문은 5,000 Unicode code points 이하여야 합니다.")
 	String content,
 
 	@Schema(description = "검색어 (생략 가능)", example = "spring boot jpa")

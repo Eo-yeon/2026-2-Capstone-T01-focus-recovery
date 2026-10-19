@@ -85,8 +85,11 @@ describe('Unicode payload preservation at the visit API boundary', () => {
   it.each([
     ['Korean', '가'.repeat(5000), 5000, 5000, 201],
     ['English', 'a'.repeat(5000), 5000, 5000, 201],
-    ['non-BMP within UTF-16 limit', '😀'.repeat(2500), 2500, 5000, 201],
-    ['non-BMP above UTF-16 limit', '😀'.repeat(2501), 2501, 5002, 400],
+    ['non-BMP 2500 points', '😀'.repeat(2500), 2500, 5000, 201],
+    ['non-BMP 2501 points', '😀'.repeat(2501), 2501, 5002, 201],
+    ['non-BMP 5000 points', '😀'.repeat(5000), 5000, 10000, 201],
+    ['mixed 5000 points', '한a😀𐐀'.repeat(1250), 5000, 7500, 201],
+    ['invalid 5001 points', '😀'.repeat(5001), 5001, 10002, 400],
   ] as const)('preserves %s without truncating for server validation', async (_label, content, points, units, status) => {
     visit.content = content;
     expect([...visit.content]).toHaveLength(points); expect(visit.content).toHaveLength(units);

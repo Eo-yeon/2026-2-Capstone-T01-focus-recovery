@@ -1,5 +1,7 @@
 # FE 데이터 수집 E2E 검증 — Issue #55
 
+> 이 문서는 #55 실행 당시의 기록이다. 병합 이후 #56에서 문자 길이 계약을 5,000 Unicode code points로 통일하고 E/C-3을 갱신했다. 최신 경계값 및 400 오류 복구 검증은 [후속 보고서](unicode-content-length-validation.md)를 따른다.
+
 검증일: 2026-10-19 (Asia/Seoul). [Issue #55](https://github.com/SKHU-AI-Projects-Archive/2026-2-Capstone-T01-focus-recovery/issues/55)의 전체 본문과 댓글(0건), FE·BE 기능명세 및 데이터 수집 규격을 기준으로 검증했다. **실행한 자동 검사는 모두 통과했지만, 본문 문자 단위 불일치 요구사항은 FAIL이며 실제 검색 서비스 DOM·수동 권한 허용 검증은 BLOCKED(미실행)다.** AI 학습·최종 분류 성능은 범위 밖이다.
 
 ## Git 기준과 작업 범위

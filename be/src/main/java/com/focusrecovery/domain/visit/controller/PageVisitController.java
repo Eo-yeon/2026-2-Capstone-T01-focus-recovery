@@ -56,7 +56,7 @@ public class PageVisitController {
 			- domain은 normalizedUrl의 전체 호스트명(서브도메인 포함, 포트 제외)과 같아야 합니다. 예) `https://docs.spring.io:8443/a` → `docs.spring.io`. 다르면 400입니다.
 			- title, content, searchQuery는 생략하거나 null로 보낼 수 있습니다. isSearchResultPage 생략 시 false, tabSwitchCount·behaviorVersion 생략 시 0입니다.
 			- activeDurationMs는 필수이며 1000ms(1초) 이상이어야 합니다. 유효 방문 판정은 FE가 하고 서버는 최소 체류시간만 다시 검증합니다.
-			- content는 FE가 추출한 본문이며 최대 5,000자입니다. 초과하면 서버가 자르지 않고 400을 반환합니다.
+			- content는 FE가 추출한 본문이며 최대 5,000 Unicode code points입니다. 초과하면 서버가 자르지 않고 400을 반환합니다.
 			- visitedAt은 밀리초까지 저장되며, 응답은 UTC ISO 8601(밀리초) 형식입니다.
 
 			**탐색 구간 자동 생성 (응답 형식은 변경 없음)**
@@ -72,7 +72,7 @@ public class PageVisitController {
 			""")
 	@ApiResponse(responseCode = "201", description = "새 방문 저장 (필요한 탐색 구간도 함께 생성)")
 	@ApiResponse(responseCode = "200", description = "같은 방문 재전송: 저장된 방문 반환")
-	@ApiResponse(responseCode = "400", description = "잘못된 UUID, 필수값 누락, 음수, activeDurationMs 누락·1000ms 미만, 본문(content) 5,000자 초과, "
+	@ApiResponse(responseCode = "400", description = "잘못된 UUID, 필수값 누락, 음수, activeDurationMs 누락·1000ms 미만, 본문(content) 5,000 Unicode code points 초과, "
 		+ "정규화되지 않은 주소(http/https가 아닌 스킴, 호스트 없음·대문자, 기본 포트, 인증정보, Query·Fragment 포함, URL 문법 오류), "
 		+ "domain과 normalizedUrl 호스트명 불일치",
 		content = @Content(schema = @Schema(implementation = ErrorResponse.class), examples = @ExampleObject(value = """
