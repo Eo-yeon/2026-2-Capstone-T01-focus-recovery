@@ -66,6 +66,7 @@ export interface CollectionState {
   sequenceVersion: 1;
   session: ServerSession | null;
   nextSequence: number;
+  sequenceStart?: number; // First sequence after an erased prefix; absent on existing checkpoints.
   tabs: Record<number, TabState>;
   candidates: VisitCandidate[];
   foregroundTabId: number | null;

@@ -1,5 +1,7 @@
 # Focus Recovery Chrome Extension (Issue #51 포함)
 
+Issue #64에서 사이트 권한 철회 후 동일 세션을 재개할 때 이미 발급한 방문 순서를 재사용하지 않도록 수정했습니다. 본문·전송 큐는 삭제하고 순서 상한만 보존합니다. [수정·회귀 검증 보고서](../docs/permission-regrant-sequence-fix-validation.md)를 참고하세요.
+
 Issue #60에서 Naver 일반 웹 카드의 새 DOM 경계를 지원합니다. [수정·검증 보고서](../docs/naver-search-dom-fix-validation.md)에 실제 Chrome → 전용 BE/MySQL의 영어·한국어 저장 결과와 남은 검증 범위를 기록합니다. 사이트 권한은 테스트 manifest에 사전 부여했으므로 사용자 승인 dialog 검증과 구분합니다.
 
 Manifest V3 개발용 수집기입니다. 서버 작업 세션 → 확정 방문 POST → POST ACK 이후 누적 행동 PATCH → 최종 ACK 이후 서버 종료와 END_PENDING 영속 복구를 연동합니다.

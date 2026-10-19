@@ -71,7 +71,8 @@ function assertCollection(state: CollectionState) {
     || (state.session !== null && (!isWorkSession(state.session) || state.session.source !== 'server' || state.session.status !== 'ACTIVE'))
     || !Number.isSafeInteger(state.nextSequence) || state.nextSequence < 1 || typeof state.capacityReached !== 'boolean') throw new StorageFailure('corrupt');
   const ids = new Set<string>();
-  let sequence = 1, unresolved = false;
+  let sequence = state.sequenceStart === undefined ? 1 : state.sequenceStart, unresolved = false;
+  if (!Number.isSafeInteger(sequence) || sequence < 1) throw new StorageFailure('corrupt');
   const sessionId = state.session?.sessionId ?? state.candidates[0]?.sessionId;
   for (const c of state.candidates) {
     if (!c || !UUID.test(c.visitId) || ids.has(c.visitId) || !UUID.test(c.sessionId) || c.sessionId !== sessionId
@@ -150,7 +151,7 @@ export function validateState(value: DurableState) {
   if (posts.checkpoint.entries.length && (value.behaviorDelivery === undefined
     || value.behaviorDelivery.entries.length !== posts.checkpoint.entries.length)) throw new StorageFailure('corrupt');
   for (const [index, entry] of posts.checkpoint.entries.entries()) {
-    if (entry.sequence !== index + 1) throw new StorageFailure('conflict');
+    if (entry.sequence !== index + (value.collection.sequenceStart ?? 1)) throw new StorageFailure('conflict');
     const visit = ready.find(v => v.visitId === entry.visitId);
     if (!visit || Object.keys(entry.visit).some(key => !['activeDurationMs', 'tabSwitchCount', 'behaviorVersion'].includes(key)
       && entry.visit[key as keyof typeof visit] !== visit[key as keyof typeof visit])

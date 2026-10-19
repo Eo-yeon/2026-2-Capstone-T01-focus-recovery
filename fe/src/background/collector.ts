@@ -5,8 +5,8 @@ import { resumeActiveTime, settleActiveTime } from './active-time';
 import type { WorkSessionResponse } from '../api/types';
 import { isWorkSession } from '../api/session';
 export const MAX_CANDIDATES = 200;
-export function emptyState(): CollectionState {
-  return { sequenceVersion: 1, session: null, nextSequence: 1, tabs: {}, candidates: [], foregroundTabId: null, lastActiveTabId: null, lastActiveVisitId: null, capacityReached: false };
+export function emptyState(sequenceStart = 1): CollectionState {
+  return { sequenceVersion: 1, session: null, nextSequence: sequenceStart, ...(sequenceStart > 1 ? { sequenceStart } : {}), tabs: {}, candidates: [], foregroundTabId: null, lastActiveTabId: null, lastActiveVisitId: null, capacityReached: false };
 }
 export class Collector {
   constructor(public state = emptyState(), private uuid = () => crypto.randomUUID() as string) {
