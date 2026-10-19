@@ -1,9 +1,15 @@
+import hashlib
 import os
 import shutil
+import threading
+from collections import OrderedDict
 from pathlib import Path
 import torch
 from typing import Union
 from sentence_transformers import SentenceTransformer, util
+
+# 임베딩 캐시 크기 (임베딩 1개 약 4KB, 4096개 약 16MB)
+EMBEDDING_CACHE_SIZE = int(os.getenv("EMBEDDING_CACHE_SIZE", "4096"))
 
 class LocalSemanticEmbeddingModel:
     """
@@ -29,6 +35,12 @@ class LocalSemanticEmbeddingModel:
             
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = self._load_or_download_model()
+
+        # 텍스트별 임베딩 캐시.
+        # Window가 Stride 1로 이동하므로 목표와 이전 방문 4개는 직전 요청과 같은 텍스트이며,
+        # 새로 임베딩해야 하는 것은 새 방문 1개뿐이다.
+        self._cache: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+        self._cache_lock = threading.Lock()
 
     def _is_model_valid(self, path: Path) -> bool:
         """
@@ -79,6 +91,28 @@ class LocalSemanticEmbeddingModel:
 
         return SentenceTransformer(save_path_str, device=self.device)
 
+    def _embed(self, text: str) -> torch.Tensor:
+        """텍스트 임베딩을 반환한다. 같은 텍스트는 캐시된 임베딩을 재사용한다."""
+        key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        with self._cache_lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                self._cache.move_to_end(key)
+                return cached
+
+        embedding = self.model.encode([text], convert_to_tensor=True, device=self.device)[0]
+
+        with self._cache_lock:
+            self._cache[key] = embedding
+            self._cache.move_to_end(key)
+            while len(self._cache) > EMBEDDING_CACHE_SIZE:
+                self._cache.popitem(last=False)
+        return embedding
+
+    def warm_up(self) -> None:
+        """첫 요청에서 발생하는 초기화 지연을 서버 시작 시점으로 옮긴다. (캐시에 남기지 않음)"""
+        self.model.encode(["warm-up"], convert_to_tensor=True, device=self.device)
+
     def calculate_relevance(self, goal: str, title: str, content: str) -> float:
         """
         최초 작업 목표(goal)와 페이지 Title + Content 간의 의미적 관련성(Semantic Relevance)을 계산합니다.
@@ -88,9 +122,8 @@ class LocalSemanticEmbeddingModel:
             raise ValueError("[AI-001] 유효한 최초 목표와 공백이 아닌 페이지 텍스트가 필요합니다.")
 
         page_text = f"Title: {title}\nContent: {content}"
-        embeddings = self.model.encode([goal, page_text], convert_to_tensor=True, device=self.device)
-        cosine_sim = util.cos_sim(embeddings[0], embeddings[1]).item()
-        
+        cosine_sim = util.cos_sim(self._embed(goal), self._embed(page_text)).item()
+
         return cosine_sim
 
 

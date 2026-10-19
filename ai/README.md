@@ -148,6 +148,24 @@ BE(`AiAnalysisClient`)가 호출하는 API입니다. 실행: `cd ai && uvicorn m
 - 같은 `analysisId`와 같은 내용으로 다시 요청하면 저장된 응답을 그대로 반환합니다. (메모리 보관, 재시작 시 초기화)
 - `GET /health`: 모델 로드가 끝나면 200 `{"status": "READY"}`, 그 전에는 503 `AI_NOT_READY`
 
+## 응답 시간
+
+Window가 Stride 1로 이동하므로 목표와 이전 방문 4개는 직전 요청과 같은 텍스트입니다.
+Embedding Model은 텍스트별 임베딩을 LRU 캐시(`EMBEDDING_CACHE_SIZE`, 기본 4096)에 보관하여
+요청마다 새 방문 1개만 임베딩합니다. 서버 시작 시 한 번 추론(warm-up)한 뒤 READY가 됩니다.
+
+측정 (Embedding-only, CPU 8 threads, Windows, 합성 데이터 4세션 32 Window):
+
+| 구분 | 캐시 전 | 캐시 후 |
+| --- | --- | --- |
+| 세션 첫 Window (새 방문 5개) | 19.3s | p50 11.1s / p95 12.1s |
+| 이후 Window (새 방문 1개) | p50 19.0s / p95 19.9s | p50 2.5s / p95 3.0s |
+
+- 페이지 1개 임베딩 약 2.0s, 목표 약 0.7s. 배치 처리, 16 threads, int8 동적 양자화, bf16은 이 CPU에서 더 느렸습니다.
+- 세션 첫 Window는 CPU에서 BE `response-timeout`(10s)을 넘습니다. GPU 사용 또는 timeout 조정이 필요합니다.
+- Context 사용 구성(Qwen3-4B, CPU fp32)은 Window당 약 210~226s (모델 로드 약 41s)로, CPU에서는 사용할 수 없습니다.
+- 분석은 한 번에 하나씩 처리하므로(`inference_lock`) 여러 세션의 요청이 동시에 오면 대기 시간이 더해집니다.
+
 ## 개발 상태
 
 현재 AI 영역은 기능 설계가 완료된 초기 개발 환경 구성 단계입니다.
