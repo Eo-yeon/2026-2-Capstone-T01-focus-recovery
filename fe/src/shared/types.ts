@@ -77,7 +77,7 @@ export type ContentMessage =
   | { type: 'context' }
   | { type: 'snapshot'; sessionId: string; snapshot: PageSnapshot | null; reason?: ExclusionReason }
   | { type: 'leave'; sessionId: string };
-export type PopupMessage = { type: 'status' } | { type: 'start'; goalText: string } | { type: 'stop' } | { type: 'clear' } | { type: 'sync-permissions' } | { type: 'retry-visits' } | { type: 'retry-behaviors' };
+export type PopupMessage = { type: 'status' } | { type: 'start'; goalText: string } | { type: 'stop' } | { type: 'clear' } | { type: 'sync-permissions' } | { type: 'retry-visits' } | { type: 'retry-behaviors' } | { type: 'end-session' } | { type: 'retry-end' };
 export interface VisitDeliveryStatus {
   blocked?: string;
   visits: { visitId: string; sequence: number; phase: 'queued' | 'sending' | 'retry-wait' | 'failed' | 'acked'; attempts: number; error?: string; code?: string; retryable?: boolean; nextRetryAt?: number }[];
@@ -89,6 +89,7 @@ export interface BehaviorDeliveryStatus {
     error?: string; code?: string; retryable?: boolean; nextRetryAt?: number }[];
 }
 export interface DevStatus {
+  sessionEnd?: Omit<import('../background/session-end').SessionEndCheckpoint, 'request' | 'session'> & { state: 'END_PENDING' | 'ENDED'; sessionId: string };
   storage?: { phase: 'initializing' | 'ready' | 'failed'; recovered: boolean; error?: string; metadataSyncPending?: boolean; legacyCleanupPending?: boolean };
   recoveryCandidates?: number;
   session: ServerSession | null;
