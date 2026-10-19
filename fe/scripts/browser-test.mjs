@@ -16,6 +16,20 @@ const visitRequests = [];
 let loseVisitResponse = true;
 let loseResponse = true;
 const server = createServer(async (req, res) => {
+  const endPath = req.url.match(/^\/api\/sessions\/([a-f0-9-]+)\/end$/);
+  if (endPath && req.method === 'POST') {
+    const session = [...sessions.values()].find(s => s.sessionId === endPath[1]);
+    assert.ok(session);
+    session.status = 'ENDED'; session.endedAt ??= new Date().toISOString();
+    res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(session)); return;
+  }
+  const behaviorPath = req.url.match(/^\/api\/sessions\/([a-f0-9-]+)\/visits\/([a-f0-9-]+)\/behavior$/);
+  if (behaviorPath && req.method === 'PATCH') {
+    let body = ''; for await (const chunk of req) body += chunk;
+    const behavior = JSON.parse(body), visit = savedVisits.get(behaviorPath[2]); assert.ok(visit);
+    Object.assign(visit, behavior, { updatedAt: new Date().toISOString() });
+    res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ...behavior, visitId: visit.visitId, updatedAt: visit.updatedAt, applied: true })); return;
+  }
   const visitPath = req.url.match(/^\/api\/sessions\/([a-f0-9-]+)\/visits$/);
   if (visitPath && req.method === 'POST') {
     let body = ''; for await (const chunk of req) body += chunk;
@@ -93,6 +107,7 @@ try {
   worker ??= await context.waitForEvent('serviceworker', { timeout: 10000 });
   const id = worker.url().split('/')[2];
   const popup = await context.newPage();
+  popup.on('dialog', dialog => dialog.accept());
   await popup.goto(`chrome-extension://${id}/popup.html`);
   const status = () => popup.evaluate(() => chrome.runtime.sendMessage({ type: 'status' })).then(reply => { assert.equal(reply.ok, true); return reply.status; });
   const page = await context.newPage();
@@ -116,8 +131,8 @@ try {
   assert.equal(apiRequests.length, 2); assert.equal(sessions.size, 1);
   assert.equal(apiRequests[0].key, apiRequests[1].key, 'worker restart replays the same durable key');
   assert.equal((await status()).session.sessionId, sessions.values().next().value.sessionId);
-  assert.equal(await popup.getByText(/서버 종료 API는 미연동/).isVisible(), true);
-  console.log('PASS: HTTP session creation, lost response, same-key retry after worker restart, duplicate guard, server session ID, local-only stop notice');
+  assert.equal(await popup.getByText(/마지막 방문·행동 정보의 서버 저장을 확인한 뒤/).isVisible(), true);
+  console.log('PASS: HTTP session creation, lost response, same-key retry after worker restart, duplicate guard, server session ID, server-end ordering notice');
   await page.bringToFront();
   async function until(check, label) {
     for (let i = 0; i < 50; i++) {
@@ -377,7 +392,8 @@ try {
     assert.ok(restored.activeDurationMs >= visit.activeDurationMs);
   }
   assert.equal(apiRequests.length, requestCount, 'durable successful response is reused without POST');
-  await popup.getByRole('button', { name: '로컬 수집 종료', exact: true }).click();
+  await popup.getByRole('button', { name: '작업 세션 종료', exact: true }).click();
+  await until(state => state.sessionEnd?.state === 'ENDED', 'Popup server end persists validated ENDED ACK');
   const corrupt = { idempotencyKey: 'broken', goalText: 'PRIVATE_CORRUPTED_RECORD', apiBaseUrl: 'http://localhost:8080' };
   await popup.evaluate(record => chrome.storage.local.set({ pendingSessionStart: record }), corrupt);
   for (let restart = 0; restart < 2; restart++) {

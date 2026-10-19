@@ -16,3 +16,7 @@ export interface VisitBehaviorResponse extends UpdateVisitBehaviorRequest {
   updatedAt: string | null;
   applied: boolean;
 }
+
+export interface EndWorkSessionRequest {
+  finalBehaviors?: (import('../shared/types').VisitBehavior & { visitId: string })[] | null;
+}

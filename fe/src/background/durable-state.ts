@@ -1,3 +1,7 @@
+import { API_BASE_URL } from '../api/client';
+import { matchesEndedSession, matchesSession, validEndRequest } from '../api/session-end';
+import { validTime } from '../api/visit';
+import type { SessionEndCheckpoint } from './session-end';
 import { Collector, emptyState, MAX_CANDIDATES } from './collector';
 import { VisitDelivery } from './visit-delivery';
 import { BehaviorDelivery } from './behavior-delivery';
@@ -14,6 +18,7 @@ export const STORE = 'state';
 export const LEGACY_KEYS = ['collection', 'visitDelivery', 'behaviorDelivery'];
 export interface DurableState {
   collection: CollectionState;
+  sessionEnd?: SessionEndCheckpoint;
   visitDelivery?: VisitDelivery['checkpoint'];
   behaviorDelivery?: BehaviorDelivery['checkpoint'];
   activeSession?: unknown;
@@ -92,8 +97,45 @@ function assertCollection(state: CollectionState) {
   if (![state.foregroundTabId, state.lastActiveTabId].every(v => v === null || Number.isSafeInteger(v) && v >= 0)
     || (state.lastActiveVisitId !== null && !ids.has(state.lastActiveVisitId))) throw new StorageFailure('corrupt');
 }
+export function endDataDrained(value: DurableState): boolean {
+  const ready = new Collector(structuredClone(value.collection)).status(0, false).readyVisits;
+  const posts = value.visitDelivery?.entries ?? [], behavior = value.behaviorDelivery?.entries ?? [];
+  return !value.collection.session && value.collection.candidates.every(c => c.finalized && !c.recoveryRequired)
+    && ready.length === posts.length && ready.length === behavior.length && ready.every(v => {
+      const p = posts.find(e => e.visitId === v.visitId), b = behavior.find(e => e.visitId === v.visitId);
+      return p?.phase === 'acked' && b?.phase === 'acked' && b.ack !== undefined && coversBehavior(b.ack, v);
+    });
+}
+function assertSessionEnd(value: DurableState) {
+  const e = value.sessionEnd;
+  if (e === undefined) return;
+  const metadata = value.activeSession as { startRequest?: PendingSessionStart } | undefined;
+  if (!e || !isWorkSession(e.session) || e.session.status !== 'ACTIVE' || !isApiOrigin(e.apiBaseUrl)
+    || !validTime(e.requestedAt) || value.collection.session !== null
+    || value.collection.candidates.some(c => c.sessionId !== e.session.sessionId || c.activeSince !== null)
+    || !matchesSession(value.activeSession, e.session) || !metadata?.startRequest || !isStartRecord(metadata.startRequest)
+    || metadata.startRequest.response?.status !== 'ACTIVE' || !matchesSession(metadata.startRequest.response, e.session)
+    || !['draining', 'queued', 'sending', 'retry-wait', 'failed', 'acked'].includes(e.phase)
+    || !Number.isSafeInteger(e.attempts) || e.attempts < 0 || e.attempts > 3
+    || e.nextRetryAt !== undefined && !Number.isFinite(e.nextRetryAt)
+    || ['sending', 'retry-wait', 'acked'].includes(e.phase) && e.attempts === 0
+    || e.phase === 'retry-wait' && (!e.retryable || e.nextRetryAt === undefined)
+    || e.retryable !== undefined && typeof e.retryable !== 'boolean'
+    || e.error !== undefined && (typeof e.error !== 'string' || e.error.length > 2000)
+    || e.code !== undefined && (typeof e.code !== 'string' || !/^[A-Z_]{1,64}$/.test(e.code))
+    || e.attempts > 0 && e.request === undefined
+      && ![...(value.visitDelivery?.entries ?? []), ...(value.behaviorDelivery?.entries ?? [])].some(entry => entry.code === 'SESSION_ENDED')
+    || e.request !== undefined && (!validEndRequest(e.request) || Object.keys(e.request).length !== 0 || !endDataDrained(value))
+    || ['queued', 'acked'].includes(e.phase) && e.request === undefined
+    || e.phase === 'draining' && (e.request !== undefined || e.attempts !== 0)
+    || e.lastServer !== undefined && !matchesSession(e.lastServer, e.session)
+    || (e.phase === 'acked' ? !matchesEndedSession(e.ack, e.session) || canonical(e.lastServer) !== canonical(e.ack)
+      : e.ack !== undefined)) throw new StorageFailure('corrupt');
+  if (e.apiBaseUrl !== API_BASE_URL) throw new StorageFailure('server-changed');
+}
 export function validateState(value: DurableState) {
   assertCollection(value?.collection);
+  assertSessionEnd(value);
   if (value.localMirror !== undefined && (!value.localMirror || typeof value.localMirror !== 'object'
     || Array.isArray(value.localMirror) || !validActiveMetadata(value.localMirror.previous))) throw new StorageFailure('corrupt');
   if (!validActiveMetadata(value.activeSession)) throw new StorageFailure('corrupt');
@@ -175,7 +217,7 @@ export class DurableRepository {
       if (saved.format !== 1 || !Number.isSafeInteger(saved.revision) || saved.revision < 1
         || (saved.migrated !== undefined && (typeof saved.migrated !== 'string' || !/^[a-f0-9]{64}$/.test(saved.migrated)))) throw new StorageFailure('corrupt');
       validateState(saved.value);
-      const sessionId = saved.value.collection.session?.sessionId ?? saved.value.collection.candidates[0]?.sessionId ?? null;
+      const sessionId = saved.value.collection.session?.sessionId ?? saved.value.collection.candidates[0]?.sessionId ?? saved.value.sessionEnd?.session.sessionId ?? null;
       if (saved.sessionId !== sessionId) throw new StorageFailure('conflict');
       if (saved.migrationParts !== undefined && (!saved.migrationParts || typeof saved.migrationParts !== 'object' || Array.isArray(saved.migrationParts)
         || Object.entries(saved.migrationParts).some(([key, value]) => !LEGACY_KEYS.includes(key) || !/^[a-f0-9]{64}$/.test(value)))) throw new StorageFailure('corrupt');
@@ -215,7 +257,7 @@ export class DurableRepository {
     request.onsuccess = () => {
       if ((request.result?.revision ?? 0) !== expectedRevision) { tx.abort(); return; }
       try { store.put({ format: 1, revision, migrated: this.migrated, migrationParts: this.migrationParts,
-        sessionId: snapshot.collection.session?.sessionId ?? snapshot.collection.candidates[0]?.sessionId ?? null, value: snapshot } satisfies RecordState, 'current'); } catch { tx.abort(); }
+        sessionId: snapshot.collection.session?.sessionId ?? snapshot.collection.candidates[0]?.sessionId ?? snapshot.sessionEnd?.session.sessionId ?? null, value: snapshot } satisfies RecordState, 'current'); } catch { tx.abort(); }
     };
     await completed;
     this.revision = revision;

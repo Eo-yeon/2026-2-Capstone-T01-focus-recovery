@@ -1,4 +1,5 @@
-import { DurableRepository, LEGACY_KEYS, StorageFailure, isStartRecord, validActiveMetadata, staleLocalMirror, canonical, type DurableState } from './durable-state';
+import { DurableRepository, LEGACY_KEYS, StorageFailure, isStartRecord, validActiveMetadata, staleLocalMirror, canonical, endDataDrained, type DurableState } from './durable-state';
+import { SessionEndDelivery } from './session-end';
 import { Collector, emptyState } from './collector';
 import { serialExecutor } from './serial';
 import { BehaviorDelivery } from './behavior-delivery';
@@ -32,6 +33,8 @@ async function persistDelivery() {
   try { await persist(); }
   catch (error) { if (!(error instanceof MetadataMirrorFailure)) throw error; }
 }
+let endingRequested = false;
+let endRequestedAt = 0;
 let durablePostAcks = new Set<string>();
 function storageFailure(error: unknown) {
   storage = { ...storage, phase: 'failed', error: error instanceof StorageFailure ? error.code : 'storage' };
@@ -39,6 +42,7 @@ function storageFailure(error: unknown) {
   behaviors.blocked = delivery.blocked;
   if (committed) {
     collector.restore(structuredClone(committed.collection));
+    ending.restore(committed.sessionEnd);
     delivery.checkpoint = structuredClone(committed.visitDelivery ?? { apiBaseUrl: API_BASE_URL, entries: [] });
     behaviors.checkpoint = structuredClone(committed.behaviorDelivery ?? { apiBaseUrl: API_BASE_URL, entries: [] });
   }
@@ -55,18 +59,27 @@ let activatedAt = 0;
 let needsForegroundRecovery = false;
 let focusedWindowId: number | null | undefined;
 const activeWindowTabs = new Map<number, number>();
-const delivery = new VisitDelivery(operation => enqueue(async () => {
+const delivery: VisitDelivery = new VisitDelivery(operation => enqueue(async () => {
   await ready;
   const result = operation();
   await persistDelivery();
   return result;
-}).then(result => { behaviors.kick(); return result; }), () => storage.phase === 'ready' && !pendingStart && !invalidRecovery);
-const behaviors = new BehaviorDelivery(operation => enqueue(async () => {
+}).then(result => { behaviors.kick(); ending.kick(); return result; }), () => storage.phase === 'ready' && !pendingStart && !invalidRecovery && !serverEnded());
+const behaviors: BehaviorDelivery = new BehaviorDelivery(operation => enqueue(async () => {
   await ready;
   const result = operation();
   await persistDelivery();
   return result;
-}), visitId => storage.phase === 'ready' && !pendingStart && !invalidRecovery && !delivery.blocked && durablePostAcks.has(visitId));
+}).then(result => { ending.kick(); return result; }), visitId => storage.phase === 'ready' && !pendingStart && !invalidRecovery && !delivery.blocked && !serverEnded() && durablePostAcks.has(visitId));
+function serverEnded(): boolean { return ending.checkpoint?.lastServer?.status === 'ENDED'; }
+const ending: SessionEndDelivery = new SessionEndDelivery(operation => enqueue(async () => {
+  await ready;
+  const result = operation();
+  await persistDelivery();
+  return result;
+}), () => storage.phase === 'ready' && !pendingStart && !invalidRecovery && !delivery.blocked && !behaviors.blocked,
+() => Boolean(committed && endDataDrained(committed)),
+() => [...delivery.checkpoint.entries, ...behaviors.checkpoint.entries].some(e => e.code === 'SESSION_ENDED'));
 function suspend(now: number) {
   pendingStart ??= activeStart;
   if (!pendingStart && collector.state.session) invalidRecovery ??= 'missing-request';
@@ -80,12 +93,17 @@ function recovery(): SessionStartRecovery {
   return { kind: 'pending', goalText: pendingStart.goalText, blockedReason };
 }
 function status(now: number) {
-  const collected = collector.status(now);
+  const collected = collector.status(endingRequested ? Math.min(now, endRequestedAt) : now);
   if (storage.phase === 'ready') {
     delivery.collect(collected.readyVisits);
     behaviors.collect(collected.readyVisits, delivery.checkpoint.entries);
   }
-  return { ...collected, storage: { ...storage }, recoveryCandidates: collector.state.candidates.filter(c => c.recoveryRequired).length, sessionStartRecovery: recovery(), visitDelivery: delivery.status(), behaviorDelivery: behaviors.status() };
+  const end = ending.checkpoint;
+  const sessionEnd = end && (() => {
+    const { request: _, session, ...state } = end;
+    return { ...structuredClone(state), state: end.phase === 'acked' ? 'ENDED' as const : 'END_PENDING' as const, sessionId: session.sessionId };
+  })();
+  return { ...collected, sessionEnd, storage: { ...storage }, recoveryCandidates: collector.state.candidates.filter(c => c.recoveryRequired).length, sessionStartRecovery: recovery(), visitDelivery: delivery.status(), behaviorDelivery: behaviors.status() };
 }
 const ready = (async () => {
   await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
@@ -115,6 +133,7 @@ const ready = (async () => {
     if (canonical(withoutInterruption(durableMetadata)) !== canonical(withoutInterruption(localMetadata))) throw new StorageFailure('conflict');
   }
   const metadata = hydrated.value.activeSession;
+  ending.restore(hydrated.value.sessionEnd);
   committed = structuredClone(hydrated.value);
   storage = { phase: 'ready', recovered: hydrated.recovered };
   // The migration receipt and imported data are committed together before cleanup.
@@ -134,7 +153,10 @@ const ready = (async () => {
       else invalidRecovery = 'corrupted-record';
     }
   }
-  if (pendingStart && activeStart && (pendingStart.idempotencyKey !== activeStart.idempotencyKey
+  if (ending.checkpoint?.phase === 'acked' && pendingStart && activeStart
+    && (pendingStart.idempotencyKey === activeStart.idempotencyKey
+      || pendingStart.response?.sessionId === activeStart.response?.sessionId)) invalidRecovery = 'conflicting-records';
+  if (ending.checkpoint?.phase !== 'acked' && pendingStart && activeStart && (pendingStart.idempotencyKey !== activeStart.idempotencyKey
     || pendingStart.goalText !== activeStart.goalText || pendingStart.apiBaseUrl !== activeStart.apiBaseUrl
     || (pendingStart.response && pendingStart.response.sessionId !== activeStart.response?.sessionId))) invalidRecovery = 'conflicting-records';
   const state = hydrated.value.collection;
@@ -160,8 +182,8 @@ const ready = (async () => {
     try { await chrome.storage.local.remove('pendingSessionStart'); pendingStart = undefined; }
     catch { storage.metadataSyncPending = true; }
   }
-  if (invalidRecovery || pendingStart || interrupted || (!collector.state.session && activeStart)
-    || (activeStart && activeStart.apiBaseUrl !== API_BASE_URL)) {
+  if (!ending.checkpoint && (invalidRecovery || pendingStart || interrupted || (!collector.state.session && activeStart)
+    || (activeStart && activeStart.apiBaseUrl !== API_BASE_URL))) {
     collector.reconcileForeground(null, Date.now());
     suspend(Date.now());
   }
@@ -185,8 +207,8 @@ async function persist(explicitClear = false) {
   behaviors.collect(collector.status(Date.now(), false).readyVisits, delivery.checkpoint.entries);
   const value: DurableState = {
     localMirror: { previous: structuredClone(localMirror) },
-    collection: collector.state, visitDelivery: delivery.checkpoint, behaviorDelivery: behaviors.checkpoint,
-    activeSession: collector.state.session ? { ...collector.state.session, ...(activeStart ? { startRequest: activeStart } : {}) }
+    collection: collector.state, sessionEnd: ending.checkpoint, visitDelivery: delivery.checkpoint, behaviorDelivery: behaviors.checkpoint,
+    activeSession: ending.checkpoint ? { ...ending.checkpoint.session, source: 'server', startRequest: activeStart } : collector.state.session ? { ...collector.state.session, ...(activeStart ? { startRequest: activeStart } : {}) }
       : pendingStart || invalidRecovery ? retainedSession && { ...retainedSession, ...(activeStart ? { startRequest: activeStart } : {}), interrupted: true } : undefined,
   };
   try { await repository.save(value); }
@@ -194,7 +216,9 @@ async function persist(explicitClear = false) {
   committed = structuredClone(value);
   durablePostAcks = new Set(delivery.checkpoint.entries.filter(e => e.phase === 'acked').map(e => e.visitId));
   if (invalidRecovery) return;
-  if (collector.state.session) {
+  if (ending.checkpoint) {
+    await syncLocalMirror(value.activeSession);
+  } else if (collector.state.session) {
     retainedSession = collector.state.session;
     await syncLocalMirror(value.activeSession);
   } else if (!pendingStart && !activeStart && !invalidRecovery) await syncLocalMirror(undefined);
@@ -242,9 +266,10 @@ function dispatch<T>(operation: (now: number) => Promise<T>, foregroundEvent = f
     } catch (error) {
       // The aggregate already committed: a mirror failure must not rewrite a completed stop or ACK.
       if (error instanceof MetadataMirrorFailure) {
-        if (collector.state.session) { retainedSession = collector.state.session; suspend(Date.now()); }
+        if (!ending.checkpoint && collector.state.session) { retainedSession = collector.state.session; suspend(Date.now()); }
         throw error;
       }
+      if (ending.checkpoint || endingRequested) throw error;
       // Stop collection independently of the durable request/response receipt.
       retainedSession ??= collector.state.session ?? undefined;
       try { suspend(Date.now()); }
@@ -255,11 +280,11 @@ function dispatch<T>(operation: (now: number) => Promise<T>, foregroundEvent = f
       if (storage.phase === 'ready') await persist().catch(() => undefined);
       throw error;
     }
-  }).then(result => { delivery.kick(); behaviors.kick(); return result; });
+  }).finally(() => { delivery.kick(); behaviors.kick(); ending.kick(); });
 }
-function event(operation: (now: number) => Promise<unknown>, foregroundEvent = false) {
+function event(operation: (now: number) => Promise<unknown>, foregroundEvent = false, duringEnd = false) {
   // Never log raw URLs, payloads, goals or platform error messages.
-  void dispatch(async now => { if (storage.phase === 'ready') return operation(now); }, foregroundEvent).catch(() => undefined);
+  void dispatch(async now => { if (storage.phase === 'ready' && (duringEnd || !ending.checkpoint && !endingRequested)) return operation(now); }, foregroundEvent).catch(() => undefined);
 }
 async function readBrowserState<T>(query: () => Promise<T>): Promise<T | undefined> {
   // Only browser state queries are recoverable here; storage and unknown errors escape.
@@ -273,6 +298,7 @@ async function readFocusedWindow(): Promise<number | null | undefined> {
   return focused.length > 1 ? undefined : focused[0]?.id ?? null;
 }
 async function refreshForeground(now: number) {
+  if (endingRequested || ending.checkpoint) return;
   collector.foreground(null, now);
   const windowId = focusedWindowId = await readFocusedWindow();
   const tabs = windowId == null ? [] : await readBrowserState(() => chrome.tabs.query({ active: true, windowId }));
@@ -280,9 +306,10 @@ async function refreshForeground(now: number) {
   if (tabs === undefined) focusedWindowId = undefined;
   if (windowId != null && tabId !== null) activeWindowTabs.set(windowId, tabId);
   // Queries describe their completion time, never an earlier queued event's foreground.
-  collector.foreground(tabId, Math.max(now, Date.now()));
+  if (!endingRequested && !ending.checkpoint) collector.foreground(tabId, Math.max(now, Date.now()));
 }
 async function resumeDocument(tabId: number, now: number) {
+  if (endingRequested || ending.checkpoint) return;
   if (focusedWindowId === undefined) await refreshForeground(now);
   else if (focusedWindowId !== null && collector.state.foregroundTabId === null && activeWindowTabs.get(focusedWindowId) === tabId) collector.foreground(tabId, now);
 }
@@ -296,7 +323,7 @@ async function focusWindow(windowId: number, tabId: number | undefined, now: num
     const observed = tabs?.[0]?.id;
     if (observed !== undefined) {
       activeWindowTabs.set(windowId, observed);
-      collector.foreground(observed, Math.max(now, Date.now()));
+      if (!endingRequested && !ending.checkpoint) collector.foreground(observed, Math.max(now, Date.now()));
     }
   }
 }
@@ -335,6 +362,7 @@ async function syncScripts() {
   }
 }
 async function startSession(goal: string): Promise<string | undefined> {
+  if (endingRequested || ending.checkpoint && ending.checkpoint.phase !== 'acked') return '서버 종료 확인 전에는 새 세션을 시작할 수 없습니다.';
   if (storage.phase !== 'ready') return '영속 저장소 복구를 완료한 뒤 시작해 주세요.';
   if (!pendingStart && collector.state.candidates.some(c => c.recoveryRequired)) return '동일한 문서를 확인하지 못한 후보가 있습니다. 원본을 확인하거나 로컬 기록을 명시적으로 삭제해 주세요.';
   if (invalidRecovery) return '시작 요청 정보 확인이 필요합니다. 원본을 보존한 채 서버 상태를 확인해 주세요.';
@@ -354,9 +382,11 @@ async function startSession(goal: string): Promise<string | undefined> {
     pendingStart.response = response;
     await chrome.storage.local.set({ pendingSessionStart: pendingStart });
     if (response.status !== 'ACTIVE') return '기존 서버 세션이 이미 종료되었습니다. 서버 상태를 확인해 주세요.';
+    if (ending.checkpoint?.phase === 'acked' && response.sessionId === ending.checkpoint.session.sessionId) return '이미 종료한 세션의 ACTIVE 응답이 남아 있습니다. 원본을 보존하고 서버 상태를 확인해 주세요.';
     activatedAt = Date.now();
+    if (ending.checkpoint?.phase === 'acked') { ending.clear(); activeStart = undefined; retainedSession = undefined; }
     if (activeStart) collector.resume(response);
-    else { collector.start(response); delivery.clear(); behaviors.clear(); }
+    else { ending.clear(); collector.start(response); delivery.clear(); behaviors.clear(); }
     activeStart = pendingStart;
     await persist();
     await refreshForeground(Date.now());
@@ -378,6 +408,9 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
   const popup = sender.url === chrome.runtime.getURL('popup.html');
   const tabId = sender.tab?.id;
   if (popup ? !isPopupMessage(message) : !isContentMessage(message) || tabId === undefined || sender.frameId !== 0 || !sender.documentId || sender.documentLifecycle !== 'active') return false;
+  const endingMessage = popup && isPopupMessage(message) && message.type === 'end-session';
+  if (endingMessage && endingRequested) { sendResponse({ ok: false, error: '종료 요청을 저장 중입니다.' }); return false; }
+  if (endingMessage) { endingRequested = true; endRequestedAt = Date.now(); }
   const starting = popup && isPopupMessage(message) && message.type === 'start';
   if (starting && startInFlight) {
     sendResponse({ ok: false, error: '세션 생성 요청을 처리 중입니다. 잠시 기다려 주세요.' });
@@ -386,6 +419,7 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
   if (starting) startInFlight = true;
   const reply = (result: Reply) => {
     if (starting) startInFlight = false;
+    if (endingMessage) endingRequested = false;
     sendResponse(result);
   };
   void dispatch(async (now): Promise<Reply> => {
@@ -394,7 +428,21 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
       if (message.type === 'start') {
         const error = await startSession(message.goalText);
         if (error) return { ok: false, error, status: status(Date.now()) };
+      } else if (message.type === 'end-session') {
+        if (!ending.checkpoint) {
+          const session = collector.state.session;
+          if (!session || pendingStart || invalidRecovery || !activeStart) return { ok: false, error: '종료할 활성 세션의 생성 영수증 확인이 필요합니다.', status: status(now) };
+          collector.stop(now);
+          ending.begin(session, now);
+          delivery.collect(collector.status(now, false).readyVisits);
+          await persistDelivery();
+        }
+        await broadcast();
+      } else if (message.type === 'retry-end') {
+        ending.retry();
       } else if (message.type === 'stop') {
+        if (ending.checkpoint) return { ok: true, status: status(now) };
+
         const wasActive = Boolean(collector.state.session);
         collector.stop(now);
         if (wasActive && !pendingStart && !invalidRecovery) {
@@ -413,6 +461,7 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
       } else if (message.type === 'clear') {
         if (collector.state.session) return { ok: false, error: '세션 종료 후 기록을 지워 주세요.' };
         collector.state = emptyState();
+        if (ending.checkpoint) { ending.clear(); activeStart = undefined; retainedSession = undefined; }
         delivery.clear(); behaviors.clear();
         durablePostAcks.clear();
         await persist(true);
@@ -428,9 +477,10 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
     }
     if (storage.phase !== 'ready') return { ok: false, sessionId: null };
     if (tabId === undefined || !sender.documentId || !isContentMessage(message)) return { ok: false };
-    if (!collector.state.session || collector.state.capacityReached) return { ok: true, sessionId: null };
+    if (endingRequested || ending.checkpoint || !collector.state.session || collector.state.capacityReached) return { ok: true, sessionId: null };
     if (message.type !== 'context' && message.sessionId !== collector.state.session.sessionId) return { ok: true, sessionId: null };
     const frame = await readBrowserState(() => chrome.webNavigation.getFrame({ tabId, frameId: 0 }));
+    if (endingRequested || ending.checkpoint) return { ok: true, sessionId: null };
     if (frame && frame.documentId !== sender.documentId) return { ok: true, sessionId: null };
     if (!frame || !await hasPermission(frame.url)) {
       if (collector.state.foregroundTabId === tabId) collector.foreground(null, now);
@@ -442,14 +492,17 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
       if (collector.state.foregroundTabId === tabId && !collector.state.tabs[tabId]?.navigationFailed) collector.foreground(null, now);
       return { ok: true, sessionId: null };
     }
+    if (endingRequested || ending.checkpoint) return { ok: true, sessionId: null };
     if (message.type === 'context') {
       const url = await describeUrl(frame.url);
+      if (endingRequested || ending.checkpoint) return { ok: true, sessionId: null };
       collector.navigate(tabId, sender.documentId, url?.identity ?? null, 'existing', now);
       await resumeDocument(tabId, now);
     } else if (message.type === 'leave') {
       collector.leave(tabId, sender.documentId, now);
     } else {
       const expected = await describeUrl(frame.url);
+      if (endingRequested || ending.checkpoint) return { ok: true, sessionId: null };
       const snapshot = message.snapshot;
       if (snapshot && (!expected || Object.keys(expected).some(key => key === 'searchQuery' ? expected.searchQuery !== (snapshot.searchQuery ?? null) : expected[key as keyof typeof expected] !== snapshot[key as keyof typeof expected]))) return { ok: false };
       collector.observe(tabId, sender.documentId, message.sessionId, snapshot, message.reason, now);
@@ -472,6 +525,7 @@ chrome.webNavigation.onCommitted.addListener(details => {
     if (frame.documentId !== details.documentId) return;
     const allowed = await hasPermission(details.url);
     const url = allowed ? await describeUrl(details.url) : null;
+    if (endingRequested || ending.checkpoint) return;
     collector.navigate(details.tabId, details.documentId, url?.identity ?? null, details.transitionType === 'reload' ? 'reload' : 'new', now);
     if (frame.errorOccurred) collector.navigationError(details.tabId, frame.documentId, url?.identity ?? null, now);
     await resumeDocument(details.tabId, now);
@@ -521,6 +575,8 @@ chrome.webNavigation.onErrorOccurred.addListener(details => {
 });
 chrome.permissions.onAdded.addListener(() => event(syncScripts));
 chrome.permissions.onRemoved.addListener(() => event(async now => {
+  // An explicit server-end intent survives revocation; erase only on explicit clear.
+  if (ending.checkpoint) { await syncScripts(); await broadcast(); return; }
   // Revocation is privacy-sensitive: stop and erase all in-memory samples.
   suspend(now);
   collector.state = emptyState();
@@ -529,10 +585,10 @@ chrome.permissions.onRemoved.addListener(() => event(async now => {
   await persist(true);
   await syncScripts();
   await broadcast();
-}));
+}, false, true));
 
 const RECOVERY_ALARM = 'durable-delivery';
-chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === RECOVERY_ALARM) event(async () => undefined); });
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === RECOVERY_ALARM) event(async () => undefined, false, true); });
 async function resumeScripts() {
   if (!collector.state.session || pendingStart || invalidRecovery) return;
   // Reload invalidates old isolated-world scripts even when the page document survives.
@@ -545,5 +601,5 @@ chrome.runtime.onInstalled.addListener(() => event(resumeScripts, true));
 void ready.then(async () => {
   if (storage.phase !== 'ready') return;
   await chrome.alarms.create(RECOVERY_ALARM, { periodInMinutes: 1 });
-  delivery.kick(); behaviors.kick();
+  delivery.kick(); behaviors.kick(); ending.kick();
 }).catch(() => undefined);
