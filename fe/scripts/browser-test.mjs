@@ -96,7 +96,7 @@ try {
     const empty = url.searchParams.get(parameter) === 'NO_RESULTS';
     const card = google
       ? '<div class="MjjYud"><a href="https://example.com/docs"><h3>인증</h3></a></div>'
-      : '<div data-block-id="web/prs_template_v2_web_basic_desk.ts"><a href="https://example.com/docs"><span class="sds-comps-text-type-headline1">인증</span></a></div>';
+      : '<div class="fds-web-root"><div class="fds-web-list-root"><div class="fds-web-doc-root fds-web-normal-doc-root"><a href="https://example.com/docs"><span class="sds-comps-text-type-headline1">인증</span></a><a href="https://example.com/docs"><span class="sds-comps-text-type-body1">JWT 검증 방법</span></a></div></div></div>';
     const ad = google ? '<div id="tads" class="MjjYud"><span>Sponsored</span><a href="https://example.com/ad"><h3>PRIVATE_AD</h3></a></div>' : '<div data-ad data-block-id="web/example"><span>광고</span><a href="https://example.com/ad"><span class="sds-comps-text-type-headline1">PRIVATE_AD</span></a></div>';
     const root = google ? '<div id="search"><div id="rso"></div></div>' : '<div id="main_pack"></div>';
     const selector = google ? '#rso' : '#main_pack';
@@ -259,6 +259,8 @@ try {
   await page.goto('https://search.naver.com/search.naver?query=한글+인증');
   result = await until(state => state.visits.length === initialSearchCount + 3, 'synthetic Naver Korean results');
   assert.equal(result.visits.at(-1).searchQuery, '한글 인증');
+  assert.ok(result.visits.at(-1).content.includes('제목: 인증\n설명: JWT 검증 방법'), 'modern Naver card keeps its paired snippet');
+  assert.ok(!result.visits.at(-1).content.includes('PRIVATE_'), 'modern Naver extraction omits the synthetic advertisement and input');
   await page.goBack();
   result = await until(state => state.visits.length === initialSearchCount + 4, 'search back creates a visit');
   assert.notEqual(result.visits.at(-1).visitId, searchVisit.visitId);
@@ -283,6 +285,11 @@ try {
   assert.equal(result.candidates.at(-1).reason, 'unavailable-content', 'zero search results exhaust bounded wait');
   assert.deepEqual(result.visits.map(v => [v.visitId, v.content]), preserved, 'empty search preserves valid visits');
   assert.deepEqual(result.readyVisits.slice(0, searchReady.length), searchReady, 'exclusions do not renumber published visits');
+  await page.goto('https://search.naver.com/search.naver?query=NO_RESULTS'); await page.bringToFront();
+  await new Promise(resolve => setTimeout(resolve, 8500));
+  result = await status();
+  assert.equal(result.candidates.at(-1).reason, 'unavailable-content', 'empty Naver results retain the bounded exclusion policy');
+  assert.deepEqual(result.visits.map(v => [v.visitId, v.content]), preserved);
   await popup.evaluate(() => chrome.runtime.sendMessage({ type: 'stop' }));
   const stopped = await status();
   await until(state => state.visitDelivery.visits.length === stopped.readyVisits.length && state.visitDelivery.visits.every(visit => visit.phase === 'acked'), 'all finalized visits receive validated server ACK');

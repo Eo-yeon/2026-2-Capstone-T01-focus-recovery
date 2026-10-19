@@ -19,7 +19,7 @@ function result(container: Element, titleElement: Element | null, snippetElement
   let target: string | null;
   try { target = normalizeUrl(new URL(link.getAttribute('href')!, base).href); }
   catch { return null; }
-  if (!target || searchEngine(new URL(target)) || /(?:^|\.)(?:googleadservices\.com|doubleclick\.net|adcr\.naver\.com|ads\.naver\.com)$/.test(new URL(target).hostname)) return null;
+  if (!target || searchEngine(new URL(target)) || /(?:^|\.)(?:googleadservices\.com|doubleclick\.net|adcr\.naver\.com|ads\.naver\.com|ader\.naver\.com)$/.test(new URL(target).hostname)) return null;
   const title = cleanText(textFrom(titleElement));
   if (!title) return null;
   const description = snippetElement && safe(snippetElement) ? cleanText(textFrom(snippetElement)) : '';
@@ -36,12 +36,33 @@ function googleResults(doc: Document, base: URL) {
     return entry ? [entry] : [];
   });
 }
+const NAVER_WEB_CARD = '.fds-web-doc-root.fds-web-normal-doc-root';
 function naverResults(doc: Document, base: URL) {
-  // Live desktop sample (2026-10-14): web blocks and searchBasic UGC cards.
-  return [...doc.querySelectorAll('#main_pack [data-block-id^="web/"], #main_pack [data-template-id="ugcItem"][data-template-type="searchBasic"]')].flatMap(container => {
-    const title = container.querySelector('a[href] [class*="sds-comps-text-type-headline"]');
-    const description = [...container.querySelectorAll('a[href] [class~="sds-comps-text-type-body1"]')].find(element => !element.closest('[data-template-id="reply"],[data-template-id="articleSource"]')) ?? null;
+  // Live desktop 2026-10-19: semantic web/list/normal-card boundaries; never all headlines.
+  const titles = new Set<Element>();
+  return [...doc.querySelectorAll(`#main_pack [data-block-id^="web/"], #main_pack [data-template-id="ugcItem"][data-template-type="searchBasic"], #main_pack .fds-web-root .fds-web-list-root > ${NAVER_WEB_CARD}`)].flatMap(container => {
+    const modern = container.matches(NAVER_WEB_CARD);
+    // Empty block IDs occur on real web collections. Unknown nonempty sections fail closed.
+    const otherSection = modern
+      ? '[data-block-id]:not([data-block-id=""]):not([data-block-id^="web/"])'
+      : '[data-block-id]:not([data-block-id=""]):not([data-block-id^="web/"]):not([data-block-id^="ugc/"])';
+    if (container.closest(otherSection + ',[data-template-id="aipickItem"]') || !modern && container.querySelector(NAVER_WEB_CARD)) return [];
+    const headings = [...container.querySelectorAll(modern ? 'a[href] .sds-comps-text-type-headline1' : 'a[href] [class*="sds-comps-text-type-headline"]')];
+    if (modern && (headings.length !== 1 || headings[0].closest(NAVER_WEB_CARD) !== container)) return [];
+    const title = headings[0];
+    if (!title || titles.has(title)) return [];
+    const descriptions = [...container.querySelectorAll('a[href] .sds-comps-text-type-body1')].filter(element => {
+      if (element.closest('[data-template-id="reply"],[data-template-id="articleSource"]')) return false;
+      if (!modern) return true;
+      if (element.closest(NAVER_WEB_CARD) !== container) return false;
+      try { return new URL(element.closest('a')!.getAttribute('href')!, base).href === new URL(title.closest('a')!.getAttribute('href')!, base).href; }
+      catch { return false; }
+    });
+    // Multiple matching snippets are ambiguous; do not guess which belongs to the title.
+    if (modern && descriptions.length > 1) return [];
+    const description = descriptions[0] ?? null;
     const entry = result(container, title, description, base);
+    if (entry) titles.add(title);
     return entry ? [entry] : [];
   });
 }
