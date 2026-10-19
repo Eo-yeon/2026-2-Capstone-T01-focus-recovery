@@ -268,3 +268,139 @@ describe('durable server end lifecycle', () => {
   });
 
 });
+
+describe('review A: END ACK commit boundaries in the same Worker', () => {
+  it.each(['abort', 'quota', 'revision'])('never exposes or reuses an uncommitted END ACK after %s', async kind => {
+    await visit(); const receipt = structuredClone(local.activeSession.startRequest);
+    let release!: () => void; const gate = new Promise<void>(r => { release = r; });
+    const send = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (url, init) => { if (String(url).endsWith('/end')) await gate; return send(url, init); });
+    await message({ type: 'end-session' }); await vi.waitFor(() => expect(endCalls()).toHaveLength(1));
+    const original = await raw();
+    expect(original.value.visitDelivery.entries.every((e: any) => e.phase === 'acked')).toBe(true);
+    expect(original.value.behaviorDelivery.entries.every((e: any) => e.phase === 'acked')).toBe(true);
+    let fault: { mockRestore(): void } | undefined;
+    if (kind === 'abort') fault = faultWhen(v => v.sessionEnd?.phase === 'acked');
+    if (kind === 'quota') {
+      const put = IDBObjectStore.prototype.put;
+      fault = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, ...args) {
+        if ((args[0] as any).value.sessionEnd?.phase === 'acked') throw new DOMException('PRIVATE_QUOTA', 'QuotaExceededError');
+        return put.apply(this, args);
+      });
+    }
+    if (kind === 'revision') {
+      const { DurableRepository } = await import('../src/background/durable-state');
+      const competing = new DurableRepository(); await competing.initialize({}); await competing.save(original.value); await competing.close();
+    }
+    const beforeResponse = await raw(), httpCount = vi.mocked(fetch).mock.calls.length; release();
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.storage!.phase).toBe('failed'));
+    const afterFailure = await raw();
+    expect(afterFailure.value).toEqual(beforeResponse.value);
+    expect(afterFailure.revision).toBeGreaterThanOrEqual(beforeResponse.revision);
+    for (let n = 0; n < 3; n++) {
+      const reply = await message({ type: 'status' });
+      expect(reply.status!.sessionEnd).toMatchObject({ state: 'END_PENDING', sessionId: SERVER_SESSION_ID, attempts: 1 });
+      expect(reply.status!.sessionEnd!.ack).toBeUndefined(); expect(reply.status!.sessionEnd!.lastServer).toBeUndefined();
+      expect(reply.status!.session).toBeNull();
+      expect((await message({ type: 'retry-end' })).ok).toBe(false);
+      expect((await message({ type: 'start', goalText: '새 세션을 만들면 안 됩니다' })).ok).toBe(false);
+      chromeApi.alarms.onAlarm.listeners[0]({ name: 'durable-delivery' });
+      await message({ type: 'context' }, true);
+    }
+    expect(endCalls()).toHaveLength(1); expect(fetch).toHaveBeenCalledTimes(httpCount); expect((await raw())).toEqual(afterFailure);
+    expect(local.activeSession.startRequest).toEqual(receipt);
+    fault?.mockRestore(); await restart(); await completed();
+    const restored = (await raw()).value;
+    expect(endCalls().map(([url, init]) => [String(url), init!.body])).toEqual([
+      [`http://localhost:8080/api/sessions/${SERVER_SESSION_ID}/end`, '{}'],
+      [`http://localhost:8080/api/sessions/${SERVER_SESSION_ID}/end`, '{}'],
+    ]);
+    expect(restored.sessionEnd).toMatchObject({ phase: 'acked', attempts: 2, ack: { endedAt: ended().endedAt } });
+    expect(restored.collection.candidates).toEqual(original.value.collection.candidates);
+    expect(restored.visitDelivery).toEqual(original.value.visitDelivery); expect(restored.behaviorDelivery).toEqual(original.value.behaviorDelivery);
+    expect(restored.activeSession.startRequest).toEqual(receipt);
+  });
+  it('never resurrects END after another Worker commits deletion while its response is in flight', async () => {
+    await visit(); let release!: () => void; const gate = new Promise<void>(r => { release = r; });
+    const send = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (url, init) => { if (String(url).endsWith('/end')) await gate; return send(url, init); });
+    await message({ type: 'end-session' }); await vi.waitFor(() => expect(endCalls()).toHaveLength(1));
+    const { DurableRepository } = await import('../src/background/durable-state');
+    const { emptyState } = await import('../src/background/collector');
+    const other = new DurableRepository(); await other.initialize({});
+    await other.save({ collection: emptyState(), localMirror: { previous: structuredClone(local.activeSession) } }); await other.close();
+    const deleted = await raw(); release();
+    await vi.waitFor(async () => expect((await message({ type: 'status' })).status!.storage!.phase).toBe('failed'));
+    expect((await raw())).toEqual(deleted); await restart();
+    const status = (await message({ type: 'status' })).status!;
+    expect(status.storage!.phase).toBe('ready'); expect(status.sessionEnd).toBeUndefined(); expect(status.candidates).toEqual([]);
+    expect(local.activeSession).toBeUndefined(); expect(endCalls()).toHaveLength(1);
+  });
+});
+
+describe('review B: historical END and a new creation receipt', () => {
+  it('keeps a committed END ACK when only its local mirror set fails', async () => {
+    await visit(); const receipt = structuredClone(local.activeSession);
+    chromeApi.storage.local.remove.mockClear();
+    const set = chromeApi.storage.local.set.getMockImplementation()!;
+    chromeApi.storage.local.set.mockImplementation(async (value: any) => {
+      if ((await raw()).value.sessionEnd?.phase === 'acked') throw Error('PRIVATE_MIRROR_FAILURE');
+      return set(value);
+    });
+    await message({ type: 'end-session' }); await completed();
+    const status = (await message({ type: 'status' })).status!;
+    expect(status.sessionEnd!.state).toBe('ENDED'); expect(status.storage).toMatchObject({ phase: 'ready', metadataSyncPending: true });
+    expect(local.activeSession).toEqual(receipt); expect((await raw()).value.activeSession).toEqual(receipt);
+    expect(chromeApi.storage.local.remove.mock.calls.flat()).not.toContain('activeSession');
+    chromeApi.storage.local.set.mockImplementation(set); await restart();
+    expect((await message({ type: 'status' })).status!.sessionEnd!.state).toBe('ENDED'); expect(endCalls()).toHaveLength(1);
+  });
+  it.each(['pending', 'response', 'active-abort', 'active-mirror'])('recovers the same new key/session across the %s boundary', async boundary => {
+    await visit(); await message({ type: 'end-session' }); await completed();
+    const historical = await raw(), nextId = crypto.randomUUID(), goalText = '새로운 별도 세션의 영수증 검증';
+    const nextResponse = { ...serverSession(goalText), sessionId: nextId };
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify(nextResponse), { status: 201 }));
+    const set = chromeApi.storage.local.set.getMockImplementation()!;
+    chromeApi.storage.local.set.mockImplementation(async (value: any) => {
+      await set(value);
+      if (boundary === 'pending' && value.pendingSessionStart && !value.pendingSessionStart.response
+        || boundary === 'response' && value.pendingSessionStart?.response) throw Error('synthetic interruption after durable receipt');
+      if (boundary === 'active-mirror' && value.activeSession?.sessionId === nextId) {
+        // Simulate a failed local write, not a committed write with a lost callback.
+        local.activeSession = structuredClone(historical.value.activeSession); throw Error('synthetic new active mirror failure');
+      }
+    });
+    const fault = boundary === 'active-abort' ? faultWhen(v => v.collection.session?.sessionId === nextId) : undefined;
+    expect((await message({ type: 'start', goalText })).ok).toBe(false);
+    const pending = structuredClone(local.pendingSessionStart); expect(pending.idempotencyKey).not.toBe(historical.value.activeSession.startRequest.idempotencyKey);
+    if (boundary !== 'active-mirror') expect((await raw()).value).toEqual(historical.value);
+    else { expect((await raw()).value.collection.session.sessionId).toBe(nextId); expect((await raw()).value.sessionEnd).toBeUndefined(); }
+    chromeApi.storage.local.set.mockImplementation(set); fault?.mockRestore(); await restart();
+    const recovered = (await message({ type: 'status' })).status!;
+    expect(recovered.storage!.phase).toBe('ready'); expect(recovered.session?.sessionId).not.toBe(SERVER_SESSION_ID);
+    if (boundary !== 'active-mirror') {
+      expect(recovered.sessionEnd!.state).toBe('ENDED'); expect(recovered.session).toBeNull();
+      expect(recovered.sessionStartRecovery!.kind).toBe('pending');
+      const calls = vi.mocked(fetch).mock.calls.length;
+      expect((await message({ type: 'start', goalText })).ok).toBe(true);
+      expect(vi.mocked(fetch).mock.calls.length).toBe(calls + (boundary === 'pending' ? 1 : 0));
+    }
+    const state = (await raw()).value;
+    expect(state.collection.session.sessionId).toBe(nextId); expect(state.sessionEnd).toBeUndefined(); expect(state.collection.candidates).toEqual([]);
+    expect(state.activeSession.startRequest.idempotencyKey).toBe(pending.idempotencyKey);
+    expect(state.activeSession.startRequest.response).toEqual(nextResponse); expect(local.pendingSessionStart).toBeUndefined();
+  });
+  it.each(['sessionId', 'goalText', 'idempotencyKey'])('preserves a real conflicting %s mirror without overwriting either source', async kind => {
+    await visit(); await message({ type: 'end-session' }); await completed();
+    const saved = await raw();
+    if (kind === 'sessionId') { local.activeSession.sessionId = crypto.randomUUID(); local.activeSession.startRequest.response.sessionId = local.activeSession.sessionId; }
+    if (kind === 'goalText') { local.activeSession.goalText = '다른 기록에 속한 목표'; local.activeSession.startRequest.goalText = local.activeSession.goalText; local.activeSession.startRequest.response.goalText = local.activeSession.goalText; }
+    if (kind === 'idempotencyKey') local.activeSession.startRequest.idempotencyKey = crypto.randomUUID();
+    const conflict = structuredClone(local); await restart();
+    const status = (await message({ type: 'status' })).status!;
+    expect(status.storage!.phase).toBe('failed'); expect(status.session).toBeNull();
+    expect((await message({ type: 'start', goalText: '기록 덮어쓰기는 금지합니다' })).ok).toBe(false);
+    expect((await message({ type: 'clear' })).ok).toBe(false);
+    expect(local).toEqual(conflict); expect(await raw()).toEqual(saved); expect(endCalls()).toHaveLength(1);
+  });
+});

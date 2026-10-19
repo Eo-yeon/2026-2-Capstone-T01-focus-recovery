@@ -24,6 +24,9 @@ function App() {
   const behavior = status?.behaviorDelivery;
   const pendingBehavior = behavior?.visits.filter(visit => visit.phase !== 'acked') ?? [];
   const unconfirmed = delivery?.visits.filter(visit => visit.phase !== 'acked') ?? [];
+  const serverEndConflict = (unconfirmed.length > 0 || pendingBehavior.length > 0)
+    && (end?.code === 'SERVER_ENDED_UNCONFIRMED' || end?.lastServer?.status === 'ENDED'
+      || [...unconfirmed, ...pendingBehavior].some(visit => visit.code === 'SESSION_ENDED'));
   async function request(message: PopupMessage) {
     if (requestInFlight.current) return;
     requestInFlight.current = true;
@@ -77,15 +80,20 @@ function App() {
       <label htmlFor="goal">최초 작업 목표 (현재 BE 구현 기준 5~150자)</label>
       <textarea id="goal" value={pending?.goalText ?? goal} disabled={busy || Boolean(pending) || Boolean(invalid)} onChange={event => setGoal(event.target.value)} />
       {pending && <p>서버에 이미 생성되었을 수 있습니다. 목표와 요청 키를 유지해 재시도합니다. 로컬 기록 삭제로 이 요청을 취소할 수 없습니다.</p>}
-      <button disabled={busy || storageBlocked || endPending || (!pending && (Boolean(status?.recoveryCandidates) || unconfirmed.length > 0 || pendingBehavior.length > 0)) || !status || Boolean(invalid) || Boolean(pending?.blockedReason) || !validGoal(pending?.goalText ?? goal)} onClick={() => { setInspect(false); void request({ type: 'start', goalText: pending?.goalText ?? goal }); }}>{busy ? '처리 중…' : pending ? '같은 요청 재시도' : '작업 세션 시작'}</button>
+      <button disabled={busy || storageBlocked || endPending || serverEndConflict || (!pending && (Boolean(status?.recoveryCandidates) || unconfirmed.length > 0 || pendingBehavior.length > 0)) || !status || Boolean(invalid) || Boolean(pending?.blockedReason) || !validGoal(pending?.goalText ?? goal)} onClick={() => { setInspect(false); void request({ type: 'start', goalText: pending?.goalText ?? goal }); }}>{busy ? '처리 중…' : pending ? '같은 요청 재시도' : '작업 세션 시작'}</button>
     </>}
+    {serverEndConflict && <div role="alert">
+      <p>서버 종료·로컬 데이터 불일치 (운영자 확인 필요)</p>
+      <p>필수 POST 미확인 {unconfirmed.length}건 / PATCH 미확인 {pendingBehavior.length}건이 남아 있습니다. 로컬 기록을 보존하고 담당자와 서버 상태를 확인해 주세요. 일반 네트워크 재시도만으로 최종 데이터 반영을 확인할 수 없습니다.</p>
+      <p>로컬 기록을 삭제하면 미확인 최종 데이터와 종료 복구 정보를 영구적으로 잃습니다. 로컬 삭제는 서버 데이터를 삭제하지 않습니다. 확인 전에는 새 작업을 시작하지 마세요.</p>
+    </div>}
     {end && <div role={endPending ? 'alert' : undefined}>
       <p>서버 종료: {end.state} / {end.phase === 'draining' ? '최종 데이터 전송 대기' : end.phase === 'retry-wait' ? '재시도 대기' : end.phase === 'failed' ? '확인 필요' : end.phase === 'acked' ? '종료 ACK 저장 완료' : '종료 요청 전송 중·대기'}</p>
       <p>필수 POST 미확인 {unconfirmed.length}건 / PATCH 미확인 {pendingBehavior.length}건 / 복구 보류 {held.length}건 · 종료 확인 시도 {end.attempts}/3회</p>
       {end.nextRetryAt !== undefined && <p>다음 재시도 가능 시각: {new Date(end.nextRetryAt).toLocaleString()}</p>}
       {end.error && <p>{end.code && `${end.code}: `}{end.error}</p>}
       {end.ack?.endedAt && <p>서버 종료 시각: {end.ack.endedAt}</p>}
-      <button disabled={busy || storageBlocked || end.phase !== 'failed' || !end.retryable} onClick={() => void request({ type: 'retry-end' })}>같은 종료 요청 재시도</button>
+      <button disabled={busy || storageBlocked || serverEndConflict || end.phase !== 'failed' || !end.retryable} onClick={() => void request({ type: 'retry-end' })}>같은 종료 요청 재시도</button>
       {endPending && <p>종료 ACK를 저장하기 전에는 새 작업을 시작할 수 없습니다. 자동 확인은 최대 3회이며, 예산 소진 후 수동 재시도만 새 예산을 부여합니다.</p>}
       <p>로컬 기록 삭제는 서버 데이터를 삭제하지 않습니다. 미확인 최종 데이터와 종료 복구 정보를 잃으며 진행 중 요청은 서버에 반영될 수 있습니다.</p>
     </div>}

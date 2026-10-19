@@ -44,3 +44,38 @@ describe('v1 session end aggregate validation', () => {
     expect(() => validateState(value)).not.toThrow();
   });
 });
+
+describe('review B5: v1 migration receipts with server-end checkpoints', () => {
+  it.each(['draining', 'retry-wait', 'acked'] as const)('preserves %s beside a verified partial legacy cleanup', async phase => {
+    const repository = new DurableRepository(), next = new DurableRepository();
+    try {
+      const value = fixture();
+      const legacy = { collection: value.collection, activeSession: value.activeSession,
+        visitDelivery: { apiBaseUrl: API_BASE_URL, entries: [] }, behaviorDelivery: { apiBaseUrl: API_BASE_URL, entries: [] } };
+      const imported = await repository.initialize(legacy); expect(imported.value.sessionEnd).toBeUndefined();
+      Object.assign(value, { visitDelivery: legacy.visitDelivery, behaviorDelivery: legacy.behaviorDelivery });
+      if (phase !== 'draining') Object.assign(value.sessionEnd!, { phase, request: {}, attempts: 1 });
+      if (phase === 'retry-wait') Object.assign(value.sessionEnd!, { retryable: true, nextRetryAt: 20000 });
+      if (phase === 'acked') {
+        const ack = { ...session, status: 'ENDED', endedAt: '2026-10-19T00:00:00.000Z' };
+        Object.assign(value.sessionEnd!, { ack, lastServer: ack });
+      }
+      await repository.save(value);
+      // Only the POST remainder survives an interrupted #48 migration cleanup.
+      const restored = await next.initialize({ visitDelivery: structuredClone(legacy.visitDelivery) });
+      expect(restored.value).toEqual(value); expect(restored.value.sessionEnd!.session.sessionId).toBe(SERVER_SESSION_ID);
+      expect(restored.value.activeSession).toEqual(legacy.activeSession);
+    } finally { await repository.close(); await next.close(); }
+  });
+  it('preserves END_PENDING and rejects an unproven legacy remainder', async () => {
+    const repository = new DurableRepository(), next = new DurableRepository();
+    try {
+      const value = fixture(), legacy = { collection: value.collection, activeSession: value.activeSession,
+        visitDelivery: { apiBaseUrl: API_BASE_URL, entries: [] }, behaviorDelivery: { apiBaseUrl: API_BASE_URL, entries: [] } };
+      await repository.initialize(legacy); await repository.save({ ...legacy, sessionEnd: value.sessionEnd });
+      await expect(next.initialize({ visitDelivery: { ...legacy.visitDelivery, apiBaseUrl: 'https://other.example' } })).rejects.toMatchObject({ code: 'conflict' });
+      const intact = new DurableRepository();
+      try { expect((await intact.initialize({})).value).toEqual({ ...legacy, sessionEnd: value.sessionEnd }); } finally { await intact.close(); }
+    } finally { await repository.close(); await next.close(); }
+  });
+});

@@ -1,5 +1,5 @@
 import { readDurable } from './durable-test-utils.mjs';
-// Real Chrome events → disposable Spring Boot/MySQL; only explicitly counted proxy 503 faults are injected.
+// Real Chrome → disposable Spring Boot/MySQL. Response/storage faults below are explicit test injections.
 import { chromium } from 'playwright';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -177,6 +177,150 @@ try {
     console.log(`PASS END-${mode}: real Chrome → POST/PATCH ACK gates → END → SQL ENDED/endedAt, ${done.readyVisits.length} visits/${rows[2]} windows; ${records.length} identical END request(s); original endedAt, real post-end POST/PATCH 409, no new delivery`);
     await request({ type: 'clear' });
   }
+  async function oneVisit(label) {
+    const page = await context.newPage(); await page.goto(`${origin}/${label}`); await page.bringToFront();
+    const reply = await request({ type: 'start', goalText: '공개 합성 문서의 리뷰 경계 검증하기' }); assert.equal(reply.ok, true);
+    await until(s => s.visits.some(v => v.activeDurationMs >= 1500)); await page.close();
+    await until(s => s.visitDelivery.visits.length > 0 && s.visitDelivery.visits.every(e => e.phase === 'acked') && s.behaviorDelivery.visits.every(e => e.phase === 'acked'));
+    return reply.status.session.sessionId;
+  }
+  async function failedStorage() {
+    for (let n = 0; n < 100; n++) { const s = await status(); if (s.storage.phase === 'failed') return s; await wait(50); }
+    assert.fail('Expected injected storage failure');
+  }
+  for (const [fault, mode] of [['abort', 'worker'], ['quota', 'browser'], ['revision', 'reload'], ['mirror', 'worker']]) {
+    const sessionId = await oneVisit(`ack-${fault}`), hold = proxy.holdNextEnd();
+    assert.equal((await request({ type: 'end-session' })).ok, true);
+    const response = await deadline(hold), before = await readDurable(popup);
+    assert.equal(response.record.response.status, 'ENDED'); assert.ok((await sql(sessionId))[0].startsWith('ENDED\t'));
+    assert.ok(before.value.visitDelivery.entries.every(e => e.phase === 'acked'));
+    assert.ok(before.value.behaviorDelivery.entries.every(e => e.phase === 'acked'));
+    if (fault === 'revision') {
+      await popup.evaluate(async () => {
+        const db = await new Promise(resolve => { const r = indexedDB.open('focus-recovery', 1); r.onsuccess = () => resolve(r.result); });
+        try {
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction('state', 'readwrite'), store = tx.objectStore('state'), r = store.get('current');
+            r.onsuccess = () => { const value = r.result; value.revision++; store.put(value, 'current'); };
+            tx.oncomplete = resolve; tx.onabort = reject;
+          });
+        } finally { db.close(); }
+      });
+    } else if (fault === 'mirror') {
+      await worker.evaluate(() => { chrome.storage.local.set = async () => { throw new Error('synthetic local mirror failure'); }; });
+    } else {
+      await worker.evaluate(kind => {
+        const put = IDBObjectStore.prototype.put;
+        IDBObjectStore.prototype.put = function (...args) {
+          if (args[0]?.value?.sessionEnd?.phase !== 'acked') return put.apply(this, args);
+          IDBObjectStore.prototype.put = put;
+          if (kind === 'quota') throw new DOMException('synthetic quota failure', 'QuotaExceededError');
+          const r = put.apply(this, args); r.addEventListener('success', () => this.transaction.abort()); return r;
+        };
+      }, fault);
+    }
+    response.release();
+    if (fault === 'mirror') {
+      for (let n = 0; n < 100 && (await readDurable(popup, 'sessionEnd')).phase !== 'acked'; n++) await wait(50);
+      // A known local-mirror failure returns ok=false with a valid committed ACK/status.
+      const reply = await request({ type: 'status' }); assert.equal(reply.ok, false);
+      assert.equal(reply.status.sessionEnd.state, 'ENDED'); assert.equal(reply.status.storage.phase, 'ready');
+      assert.equal(reply.status.storage.metadataSyncPending, true);
+      assert.equal((await readDurable(popup, 'sessionEnd')).phase, 'acked');
+    } else {
+      let s = await failedStorage(); const failed = await readDurable(popup);
+      assert.equal(s.sessionEnd.state, 'END_PENDING'); assert.equal(s.sessionEnd.ack, undefined);
+      assert.deepEqual(failed.value, before.value);
+      for (let n = 0; n < 2; n++) {
+        s = await status(); assert.equal(s.sessionEnd.state, 'END_PENDING');
+        assert.equal((await request({ type: 'retry-end' })).ok, false);
+        assert.equal((await request({ type: 'start', goalText: '저장 실패 중 새 생성 금지' })).ok, false);
+      }
+      assert.deepEqual(await readDurable(popup), failed);
+    }
+    assert.equal(proxy.endRequests.filter(r => r.sessionId === sessionId).length, 1);
+    await restart(mode);
+    const done = await until(s => s.sessionEnd?.state === 'ENDED'), after = await readDurable(popup);
+    assert.equal(done.sessionEnd.ack.endedAt, response.record.response.endedAt);
+    assert.equal(done.sessionEnd.attempts, fault === 'mirror' ? 1 : 2);
+    assert.deepEqual(after.value.collection.candidates, before.value.collection.candidates);
+    assert.deepEqual(after.value.visitDelivery, before.value.visitDelivery); assert.deepEqual(after.value.behaviorDelivery, before.value.behaviorDelivery);
+    assert.deepEqual(after.value.activeSession.startRequest, before.value.activeSession.startRequest);
+    const requests = proxy.endRequests.filter(r => r.sessionId === sessionId);
+    assert.equal(requests.length, fault === 'mirror' ? 1 : 2); assert.ok(requests.every(r => JSON.stringify(r.body) === '{}'));
+    console.log(`PASS REVIEW-A-${fault}: real BE/SQL ENDED; injected FE ${fault}; same-Worker status/start/retry gates; ${mode} recovery with original receipt/IDs/ACKs/endedAt`);
+    await request({ type: 'clear' });
+  }
+  for (const mode of ['browser', 'reload']) {
+    const oldId = await oneVisit(`receipt-${mode}`); await request({ type: 'end-session' }); await until(s => s.sessionEnd?.state === 'ENDED');
+    const historical = await readDurable(popup);
+    await worker.evaluate(oldId => {
+      const put = IDBObjectStore.prototype.put;
+      IDBObjectStore.prototype.put = function (...args) {
+        if (!args[0]?.value?.collection?.session || args[0].value.collection.session.sessionId === oldId) return put.apply(this, args);
+        IDBObjectStore.prototype.put = put;
+        const r = put.apply(this, args); r.addEventListener('success', () => this.transaction.abort()); return r;
+      };
+    }, oldId);
+    assert.equal((await request({ type: 'start', goalText: '새 서버 세션의 응답 영수증 보존 검증' })).ok, false);
+    const pending = await popup.evaluate(() => chrome.storage.local.get('pendingSessionStart').then(v => v.pendingSessionStart));
+    assert.ok(pending.response); assert.notEqual(pending.response.sessionId, oldId);
+    assert.deepEqual((await readDurable(popup)).value, historical.value);
+    const creates = proxy.sessionRequests;
+    await restart(mode);
+    const recovered = await status(); assert.equal(recovered.session, null); assert.equal(recovered.sessionEnd.state, 'ENDED'); assert.equal(recovered.sessionStartRecovery.kind, 'pending');
+    assert.equal((await request({ type: 'start', goalText: pending.goalText })).ok, true);
+    assert.equal(proxy.sessionRequests, creates, 'cached new creation response must not create or replay another server session');
+    const active = await readDurable(popup); assert.equal(active.value.sessionEnd, undefined);
+    assert.equal(active.value.collection.session.sessionId, pending.response.sessionId);
+    assert.equal(active.value.activeSession.startRequest.idempotencyKey, pending.idempotencyKey);
+    assert.ok(active.value.collection.candidates.every(c => c.sessionId === pending.response.sessionId));
+    await request({ type: 'end-session' }); await until(s => s.sessionEnd?.state === 'ENDED');
+    assert.ok((await sql(oldId))[0].startsWith('ENDED\t')); assert.ok((await sql(pending.response.sessionId))[0].startsWith('ENDED\t'));
+    console.log(`PASS REVIEW-B-${mode}: prior END ACK + new server creation receipt + injected active commit abort; same new key/session after restart, no extra create, no old-session revival`);
+    await request({ type: 'clear' });
+  }
+  for (const method of ['POST', 'PATCH']) {
+    const page = await context.newPage(); await page.goto(`${origin}/conflict-${method}`); await page.bringToFront();
+    const started = await request({ type: 'start', goalText: '서버 종료와 로컬 데이터 불일치 합성 검증' }); assert.equal(started.ok, true);
+    const sessionId = started.status.session.sessionId;
+    await until(s => s.visits.some(v => v.activeDurationMs >= 1500));
+    let release, submitted;
+    let postHold;
+    if (method === 'POST') {
+      const gate = new Promise(r => { release = r; }); submitted = new Promise(r => {
+        proxy.onVisit = async record => { if (record.sessionId === sessionId) { r(); await gate; } };
+      });
+    } else postHold = proxy.holdNext(1);
+    await page.close();
+    const held = postHold ? await deadline(postHold) : undefined; if (submitted) await deadline(submitted);
+    const blank = await context.newPage(); await blank.bringToFront();
+    if (held) await until(s => s.readyVisits[0]?.tabSwitchCount > held.record.body.tabSwitchCount);
+    const endedResponse = await fetch(`${api}/api/sessions/${sessionId}/end`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    assert.equal(endedResponse.status, 200);
+    await request({ type: 'end-session' }); if (held) held.release(); else release(); proxy.onVisit = async () => undefined;
+    const conflict = await until(s => s.sessionEnd?.code === 'SERVER_ENDED_UNCONFIRMED', true);
+    assert.equal(conflict.sessionEnd.state, 'END_PENDING'); assert.equal(conflict.sessionEnd.ack, undefined);
+    assert.equal(conflict.sessionEnd.lastServer.status, 'ENDED'); assert.equal(conflict.session, null);
+    const rows = await sql(sessionId); assert.ok(rows[0].startsWith('ENDED\t')); assert.equal(Number(rows[1]), method === 'POST' ? 0 : 1);
+    const pendingPost = conflict.visitDelivery.visits.filter(e => e.phase !== 'acked').length;
+    const pendingPatch = conflict.behaviorDelivery.visits.filter(e => e.phase !== 'acked').length;
+    assert.ok(pendingPost + pendingPatch > 0);
+    const saved = (await readDurable(popup)).value, counts = [proxy.requests.length, proxy.behaviorRequests.length, proxy.endRequests.length];
+    for (const type of ['retry-end', 'retry-visits', 'retry-behaviors']) await request({ type });
+    assert.equal((await request({ type: 'start', goalText: '운영자 확인 없이 새 생성 금지' })).ok, false);
+    assert.deepEqual((await readDurable(popup)).value, saved);
+    assert.deepEqual([proxy.requests.length, proxy.behaviorRequests.length, proxy.endRequests.length], counts);
+    assert.equal(proxy.endRequests.filter(r => r.sessionId === sessionId).length, 0);
+    await popup.reload(); await popup.getByText('서버 종료·로컬 데이터 불일치 (운영자 확인 필요)', { exact: true }).waitFor();
+    const text = await popup.locator('main').innerText();
+    assert.ok(text.includes(`필수 POST 미확인 ${pendingPost}건 / PATCH 미확인 ${pendingPatch}건`));
+    assert.ok(text.includes('로컬 기록을 보존')); assert.ok(text.includes('영구적으로 잃'));
+    assert.equal(await popup.getByRole('button', { name: '같은 종료 요청 재시도', exact: true }).isDisabled(), true);
+    console.log(`PASS REVIEW-C-${method}: actual SESSION_ENDED + GET ENDED; retained ${pendingPost} POST/${pendingPatch} PATCH, operator Popup, no inferred ACK/delete/create/END`);
+    await blank.close(); await request({ type: 'clear' });
+  }
+
 } finally {
   await context?.close(); await proxy.close(); await new Promise(resolve => fixture.close(resolve)); await rm(root, { recursive: true, force: true });
 }

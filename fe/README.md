@@ -2,6 +2,87 @@
 
 Manifest V3 개발용 수집기입니다. 서버 작업 세션 → 확정 방문 POST → POST ACK 이후 누적 행동 PATCH → 최종 ACK 이후 서버 종료와 END_PENDING 영속 복구를 연동합니다. 이번 변경은 BE 코드·DB 스키마를 변경하지 않습니다.
 
+## Issue #51 코드 리뷰 경계 검증·보완 (2026-10-19)
+
+이번 리뷰 작업은 미커밋 변경 없는 `feat/51/session-end-pending-recovery`, HEAD `777355971e02f01611526cbc771ebc5d05d8207d`에서 시작했습니다. origin은 개인 fork, upstream은 공식 저장소이며 실제 fetch 후 upstream/main은 `05b8d46a40546fbe693d34f12acc96ef768b29d7`으로 동일했습니다. 차이는 upstream 쪽 0개/작업 브랜치 쪽 1개 커밋입니다. 브랜치 전환·병합·기존 변경 폐기는 하지 않았습니다. 아래 #51 최초 구현 절은 당시 기록이며 이번 리뷰 결과는 이 절을 따릅니다.
+
+### A — 종료 ACK의 IndexedDB commit 실패
+
+**미영속 ACK가 ENDED로 표시되거나 재사용되는 문제는 재현되지 않았습니다.** 제품의 `SessionEndDelivery`, Background, DurableRepository는 수정하지 않았습니다. 새 테스트는 실제 fake-indexeddb의 ACK put 성공 후 transaction abort, QuotaExceededError, 다른 repository의 선행 revision commit을 각각 주입합니다. POST/PATCH ACK가 모두 저장되고 검증된 ENDED 응답이 돌아온 뒤에만 실패시킵니다.
+
+실패 직후 Worker를 유지한 채 status를 반복하고 retry-end/start/알람/content 이벤트를 실행했습니다. 메모리는 `storage.phase=failed`, END_PENDING, `ack/lastServer` 없음으로 복원되고 추가 HTTP는 0회였습니다. 마지막 정상 sending checkpoint의 `{}`·sessionId·시도 횟수·후보/방문/행동 ACK·생성 영수증은 보존됐습니다. 실패 전에 이미 직렬 실행기에 들어온 무해한 checkpoint 쓰기는 revision을 증가시킬 수 있지만, 저장 실패가 확인된 뒤 반복 status/wakeup에서는 aggregate와 revision이 변하지 않습니다.
+
+근거는 `persist`가 save 실패를 잡아 `storageFailure`를 실행하고, 그 함수가 독립 복사된 마지막 `committed` aggregate로 `ending.restore` 및 Collector/전송 큐를 복원하는 기존 구조입니다. 공개 status와 다음 mutation은 같은 직렬 실행기 뒤에서 실행됩니다. HTTP는 실행기 밖에서 기다리므로 응답 보류 중 Popup/중지/삭제가 처리됩니다. 실패한 ACK의 옛 객체는 현재 checkpoint가 아니며 전송 가능 조건도 false입니다. Worker 재시작 후 같은 세션·`{}`로만 재전송되고 최초 서버 endedAt을 유지했습니다.
+
+다른 Worker가 END 응답 도중 로컬 삭제를 commit한 경우도 새 테스트에서 검증했습니다. 늦은 ACK 쓰기는 revision 불일치로 거절되고 삭제된 sessionEnd를 재생성하지 않습니다. 재시작은 삭제 aggregate와 localMirror 이전 값 증거를 확인하며, 과거 ACTIVE 기록으로 수집을 되살리지 않습니다.
+
+IDB commit 성공 뒤 `storage.local.set`만 실패하면 ACK는 유효합니다. 이 경우 ENDED와 `metadataSyncPending=true`, storage ready를 유지하며 END를 다시 보내지 않습니다. 사용자 status 요청이 동기화 실패를 알리는 `ok=false`를 반환할 수 있어도 그 안의 영속 ACK/ENDED를 저장 실패로 오인하지 않습니다. 현재 종료 ACK 경로는 역사적 `activeSession`/생성 영수증을 보존하기 위해 **set**을 사용하며 activeSession remove는 호출하지 않습니다. 없는 remove 경계를 만들기 위한 제품 수정은 하지 않았습니다.
+
+### B — 종료 완료와 새 세션 생성 영수증
+
+**검증한 B 경계에서 이전 ACTIVE 부활·새 세션과 이전 END 혼합은 재현되지 않았습니다.** localMirror/migrationParts 검증과 기존 생성 복구 코드를 유지했습니다.
+
+| 경계 | 새 검증과 확인 결과 |
+| --- | --- |
+| B1 ACK commit 후 mirror 실패 | ACK commit 뒤에만 local set 실패를 주입. 같은 Worker/재시작에서 기존 ENDED·생성 영수증 유지, 추가 END 없음. ACK 경로의 activeSession remove 호출 없음도 확인. |
+| B2 새 pending 저장 직후 중단 | 새 키 저장 성공 직후 중단을 모의. 이전 ENDED는 유지하며 재시작 후 같은 새 키로 생성 요청을 재시도. 이전 세션은 수집하지 않음. |
+| B3 새 응답 저장/활성 commit 경계 | 새 응답 영수증 저장 직후, 새 활성 IDB transaction abort, 새 활성 commit 뒤 local mirror 실패를 각각 주입. 이전 acked END+새 pending 공존 또는 새 활성 checkpoint+이전 mirror 증거를 검증해 새 receipt의 키/세션으로 복구. 응답이 저장됐으면 추가 create HTTP 없음. |
+| B4 실제 충돌 | 정상 형식이지만 sessionId·goalText·idempotencyKey가 IDB와 다른 local active 메타데이터를 각각 로드. 기존 증거로 입증되지 않는 충돌은 차단, 양쪽 원본 보존, start/clear 불가. |
+| B5 v1/부분 migration | 기존 `sessionEnd` 없는 v1·과거 로컬 종료의 자동 승격 금지 회귀 유지. 새 draining/retry-wait/acked와 검증된 부분 legacy remainder 공존은 보존. 증명되지 않는 remainder는 원본 보존 및 충돌 거절. |
+| B6 전체 재시작/reload | 실제 Chrome에서 이전 END ACK 뒤 새 서버 생성 응답은 local에 저장되고 새 활성 commit만 abort된 상태를 구성. 같은 프로필 완전 재시작/runtime.reload 후 동일 새 receipt로 복구하며 create 추가 호출·이전 세션 부활 없음. |
+
+요청 스냅샷과 생성 영수증을 새로 조립하거나 ID를 바꾸지 않습니다. sessionId·멱등 키는 기존 request/response를 사용하며, A 실패 전후 후보·POST·PATCH checkpoint의 전체 동등성으로 visitId·sequence·behaviorVersion·누적값·ACK 보존을 검사했습니다. 새 세션만 새 생성 키/세션을 갖고 이전 후보를 이어받지 않습니다. Collector 미결 후보/sequence 판정, 자동 3회 상한·저장된 attempts/nextRetryAt·수동 예산 갱신, POST ACK 선행 및 END 전 최종 ACK 게이트는 기존 테스트와 실제 통합 시나리오로 유지합니다.
+
+### C — 재현한 안내 부족과 최소 변경
+
+수정 전 jsdom에서 실제 Popup을 렌더링한 새 테스트 **2개가 실패**했습니다. `SERVER_ENDED_UNCONFIRMED` 또는 POST/PATCH의 `SESSION_ENDED`가 있어도 일반적인 “확인 필요”/“종료 요청 전송 중·대기”로만 표시됐고, 운영자 불일치와 영구 유실 안내가 명시되지 않았습니다. 데이터 자동 ACK·삭제·새 세션 생성 문제 자체는 재현되지 않았습니다.
+
+제품 변경은 `src/popup/index.tsx`의 **10줄 추가·2줄 변경**입니다. 미확인 POST/PATCH가 있고 기존 status의 오류 code/마지막 서버 ENDED 중 하나가 입증되면 별도의 **“서버 종료·로컬 데이터 불일치 (운영자 확인 필요)”** 안내를 표시합니다. 남은 POST/PATCH 수, 로컬 기록 보존, 담당자의 서버 상태 확인, 로컬 삭제 시 최종 데이터·종료 복구 정보 영구 유실 및 서버 삭제가 아님을 설명합니다. 이 상태에서는 종료 재시도와 새 시작 버튼을 차단합니다. 일반 retryable 네트워크 실패/재시도 대기는 기존 정책대로 구분합니다.
+
+기존 Background status 필드만으로 판정할 수 있어 shared type·저장 모델·API·전송기는 변경하지 않았습니다. 강제 복구/자동 삭제/서버 변경 기능을 추가하지 않았으며 페이지 원문·서버 오류 원문을 메시지나 로그에 사용하지 않습니다.
+
+### 변경 파일과 검증 구분
+
+| 파일 | 변경 이유 |
+| --- | --- |
+| `src/popup/index.tsx` | 재현된 C 안내와 버튼 경계만 보완 |
+| `tests/session-end-background.test.ts` | A/B의 같은 Worker 실패·삭제/revision 경합·새 receipt·충돌 보존 **12개 추가** |
+| `tests/session-end-state.test.ts` | END와 부분 migrationParts/legacy remainder의 호환·거절 **4개 추가** |
+| `tests/session-end-popup.test.ts` | 실제 React Popup의 불일치/네트워크·버튼/유실 안내 **5개 신규** |
+| `scripts/session-end-integration-test.mjs` | 기존 실제 4개 시나리오 유지 + 리뷰 A 4개/B 2개/C 2개 추가. fault injection은 테스트 전용 |
+| `README.md` | 재현/비재현 근거·명령 결과·운영 제약 기록 |
+
+`session-end.ts`, `index.ts`, `durable-state.ts`, 종료/조회 API와 shared types 및 BE/DB/AI에는 제품 코드 변경이 없습니다. 기존 테스트 694개는 삭제하거나 기대값을 완화하지 않았습니다. 신규 21개로 전체 **25개 파일·715개 테스트**입니다. 모의 테스트의 저장 경계 중단은 의도적인 예외 주입이며 실제 브라우저 종료와 구분합니다.
+
+### 리뷰 최종 실행 결과와 제약
+
+| 실행 | 실제 결과 |
+| --- | --- |
+| 수정 전 기준 `npm test` | 기존 **24개 파일·694개 성공** |
+| `cd fe && npm run typecheck` | 성공 |
+| `cd fe && npm test` | **25개 파일·715개 성공** (기존 694개 + 신규 21개) |
+| `cd fe && npm run build` | 성공, production MV3/콘텐츠 빌드 |
+| `git diff --check` | 성공 (신규 Popup 테스트도 별도 whitespace 검사) |
+| `CHROMIUM_PATH=ChromeForTesting npm run test:browser` | 실제 Chrome MV3·**합성 API** 기존 회귀 성공 |
+| 실제 `session-end-integration-test.mjs` | 기존 4개 + 리뷰 A 4개/B 2개/C 2개 = **12개 시나리오 성공** |
+
+실제 환경은 macOS, headless Chrome for Testing **151.0.7922.34**, Java **21.0.10**, Spring Boot **4.1.1**, 전용 임시 MySQL **8.4.9**입니다. BE는 기존 빌드 JAR을 실행했고 소스/스키마를 변경하지 않았습니다. 모든 페이지·목표는 합성 자료입니다.
+
+- 기존 정상/Worker/완전 브라우저/reload 종료 회귀는 각각 실제 방문 **6개·Window 2개**, POST/PATCH 영속 ACK 전 END 0회, 응답 유실 후 `{}` 재전송·동일 endedAt, 종료 후 추가 FE 전송 없음과 실제 BE 409를 재확인했습니다.
+- 리뷰 A는 실제 BE 종료 commit과 SQL ENDED를 확인한 뒤 응답을 보류하고 실제 MV3 Worker에 **테스트용** IDB abort/QuotaExceeded, 별도 revision commit 또는 local set 실패를 주입했습니다. IDB 실패 3종은 같은 Worker의 status/start/retry 차단·원본 유지 후 Worker/전체 Chrome/reload로 복구하며 동일 세션·요청·영수증·후보/POST/PATCH ACK와 최초 endedAt을 유지했습니다. mirror 실패는 이미 commit한 ENDED를 유지하고 추가 END가 없었습니다.
+- 리뷰 B는 실제 서버가 새 세션을 생성하고 응답 영수증이 저장된 뒤 새 활성 checkpoint commit만 abort했습니다. 이전 END ACK와 새 pending receipt가 공존하는 상태에서 실제 Chrome PID SIGKILL/같은 프로필 재실행 및 실제 runtime.reload를 각각 수행했고, 같은 새 키·세션을 재사용하며 create HTTP 추가 호출이 없었습니다. 새 세션도 검증 후 정상 종료했습니다.
+- 리뷰 C는 실제 BE를 먼저 종료시킨 후 POST/PATCH를 전송해 각각 실제 `409 SESSION_ENDED`, GET ENDED를 확인했습니다. POST 거절 시 **POST 1/PATCH 1 미확인**, PATCH 거절 시 **POST 0/PATCH 1 미확인**이 보존됐고, 정상 종료 ACK/자동 삭제/새 세션 생성/FE END 호출은 없었습니다. SQL은 각각 방문 0개/1개를 유지했습니다. 실제 Popup의 운영자 안내·건수·영구 유실 문구와 비활성 종료 재시도 버튼도 확인했습니다.
+
+**실제 DB 결과와 실패 주입은 구분합니다.** 서버 ENDED/endedAt·방문/Window 수·409는 실제 BE/MySQL 결과입니다. proxy 응답 보류 및 Worker의 IDB/Quota/revision/local 오류는 의도적인 테스트 어댑터 주입이며 실제 디스크 고장/스토리지 용량 소진을 재현한 것이 아닙니다. B2/B3의 일부 중단·B4 충돌·B5 legacy/migration 및 일반 네트워크/3회 재시도 등은 fake-indexeddb/모의 Chrome·HTTP 또는 기존 API 테스트 범위입니다.
+
+최초 실제 통합 실행은 mirror 실패에서도 공통 status 헬퍼가 `ok=true`만 허용해 중단됐습니다. 영속 ACK와 동기화 오류를 함께 반환하는 정상 `ok=false` 상태를 헬퍼에서 구분한 뒤 **제품 저장 코드 수정 없이 12개 전체 재실행을 통과**했습니다. 모의 A/B 테스트의 초기 revision/remove 호출 비교도 실패 전 idle commit·초기화 이력을 포함하지 않도록 관측 범위를 교정했으며, 이를 제품 ACK/영수증 결함으로 보고하지 않습니다.
+
+검증 후 실제 SQL 누적(초기 중단 실행 포함)은 ENDED **22세션·59방문·16Window**, ACTIVE 0개였습니다. 테스트 BE와 전용 MySQL 컨테이너/익명 볼륨은 종료·제거했고, 각 실행의 임시 Chrome 프로필·확장·합성 HTTP 서버도 정리했습니다. 원래 DB/브라우저 프로필은 사용하지 않았습니다.
+
+디스크 전원 상실·실제 저장소 퇴거/물리 손상, Windows Stable, HEADED native 다중 창/최소화, 실제 검색 사이트 DOM은 재검증하지 않았습니다. commit 전 이벤트나 중단 중 행동을 복원한다고 보장하지 않습니다. 운영자 확인이 필요한 서버 ENDED+미확인 데이터의 자동 복구, 미결 recoveryRequired 판정, 강제 서버 수정/삭제 기능은 추가하지 않았습니다. 후속 Issue 후보는 운영자 확인 절차/관측 도구, 사용자 동의가 포함된 미결 후보 처리 정책 및 Windows/native 환경 검증입니다.
+
+종료 Git 상태는 같은 브랜치·같은 HEAD `7773559`에서 위 **6개 파일**만 미커밋 변경(기존 5개 수정·새 테스트 1개)으로 남았습니다. 이번 리뷰 작업에서는 commit·push·PR을 생성하지 않았습니다.
+
 ## 서버 세션 종료와 END_PENDING (Issue #51, 2026-10-19)
 
 이 절이 현재 종료·복구 동작의 기준입니다. 아래 #48/#46/#43/#34 절은 당시 구현·검증 이력입니다. 과거의 “종료 API 미연동”, “END_PENDING 후속 작업”, “권한 철회 시 항상 모든 큐 삭제” 설명은 현재 Popup의 서버 종료 흐름에는 적용하지 않습니다.
