@@ -172,6 +172,29 @@ class AnalysisIntegrationTest {
 		assertThat(jsonMapper.readTree(analysis.getInputSnapshot())).isEqualTo(request);
 	}
 
+	// h2c 호환성: AI 서버(uvicorn 등)가 HTTP/2 업그레이드 요청을 처리하지 못하므로 평문 HTTP/1.1로만 보내야 한다.
+	// JDK HttpServer는 업그레이드 헤더가 있어도 HTTP/1.1로 응답하므로 프로토콜만으로는 잡히지 않아 헤더도 확인한다
+	@Test
+	void AI_요청은_h2c_업그레이드_없이_HTTP_1_1로_보내고_정상_결과를_저장한다() throws Exception {
+		saveVisits(4, 3000);
+		saveVisit(UUID.randomUUID().toString(), 5, 12000).andExpect(status().isCreated());
+
+		AnalysisResult analysis = awaitFinished(onlyWindow());
+
+		assertThat(AI.receivedRequests()).hasSize(1);
+		MockAiServer.ReceivedRequest received = AI.receivedRequests().getFirst();
+		assertThat(received.protocol()).isEqualTo("HTTP/1.1");
+		assertThat(received.header("Upgrade")).isEmpty();
+		assertThat(received.header("HTTP2-Settings")).isEmpty();
+		assertThat(received.header("Connection").stream()
+			.flatMap(value -> java.util.Arrays.stream(value.split(",")))
+			.map(token -> token.trim().toLowerCase(java.util.Locale.ROOT)))
+			.doesNotContain("upgrade", "http2-settings");
+		assertThat(jsonMapper.readTree(received.body())).isEqualTo(jsonMapper.readTree(analysis.getInputSnapshot()));
+		assertThat(analysis.getProcessingStatus()).isEqualTo(AnalysisStatus.COMPLETED);
+		assertThat(analysis.getResult()).isEqualTo("TRANSITION");
+	}
+
 	@Test
 	void 마지막_방문이_10초_전이면_분석하지_않고_PATCH로_10초에_도달하면_분석한다() throws Exception {
 		saveVisits(4, 3000);

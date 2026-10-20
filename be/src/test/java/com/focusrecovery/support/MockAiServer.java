@@ -7,7 +7,10 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -29,8 +32,17 @@ public final class MockAiServer {
 		return new Response(200, body, 0);
 	}
 
+	// 서버가 실제로 받은 요청: 프로토콜, 헤더(이름은 소문자), 본문
+	public record ReceivedRequest(String protocol, Map<String, List<String>> headers, String body) {
+
+		public List<String> header(String name) {
+			return headers.getOrDefault(name.toLowerCase(Locale.ROOT), List.of());
+		}
+	}
+
 	private final HttpServer server;
 	private final List<String> requests = Collections.synchronizedList(new ArrayList<>());
+	private final List<ReceivedRequest> received = Collections.synchronizedList(new ArrayList<>());
 	private volatile Function<String, Response> responder;
 	private volatile CountDownLatch gate = new CountDownLatch(0);
 
@@ -52,6 +64,7 @@ public final class MockAiServer {
 	public void reset(Function<String, Response> responder) {
 		this.responder = responder;
 		requests.clear();
+		received.clear();
 	}
 
 	public void hold() {
@@ -64,6 +77,10 @@ public final class MockAiServer {
 
 	public List<String> requests() {
 		return List.copyOf(requests);
+	}
+
+	public List<ReceivedRequest> receivedRequests() {
+		return List.copyOf(received);
 	}
 
 	public void awaitRequests(int count) throws InterruptedException {
@@ -80,6 +97,9 @@ public final class MockAiServer {
 			exchange.sendResponseHeaders(405, -1);
 			return;
 		}
+		Map<String, List<String>> headers = new HashMap<>();
+		exchange.getRequestHeaders().forEach((name, values) -> headers.put(name.toLowerCase(Locale.ROOT), List.copyOf(values)));
+		received.add(new ReceivedRequest(exchange.getProtocol(), headers, body));
 		requests.add(body);
 		Response response = responder.apply(body);
 		try {

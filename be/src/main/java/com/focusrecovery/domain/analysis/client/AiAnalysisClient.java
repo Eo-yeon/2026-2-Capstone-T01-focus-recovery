@@ -41,7 +41,11 @@ public class AiAnalysisClient {
 	public AiAnalysisClient(AiProperties properties, JsonMapper jsonMapper) {
 		this.properties = properties;
 		this.jsonMapper = jsonMapper;
-		this.httpClient = HttpClient.newBuilder().connectTimeout(properties.connectTimeout()).build();
+		// 기본값(HTTP_2)은 평문 http에서 h2c 업그레이드 헤더(Upgrade·HTTP2-Settings)를 보내 AI 서버(uvicorn)와 호환되지 않으므로 HTTP/1.1로 고정한다
+		this.httpClient = HttpClient.newBuilder()
+			.version(HttpClient.Version.HTTP_1_1)
+			.connectTimeout(properties.connectTimeout())
+			.build();
 	}
 
 	public AiAnalysisOutcome analyze(String requestBody, UUID analysisId, UUID sessionId, UUID windowId) {
