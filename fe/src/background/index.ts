@@ -496,7 +496,11 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse: (r
     if (message.type === 'context') {
       const url = await describeUrl(frame.url);
       if (endingRequested || ending.checkpoint) return { ok: true, sessionId: null };
-      collector.navigate(tabId, sender.documentId, url?.identity ?? null, 'existing', now);
+      const tab = collector.state.tabs[tabId];
+      const granted = tab?.documentId === sender.documentId && tab.awaitingPermission === true;
+      if (granted) delete tab.awaitingPermission;
+      // Start a fresh post-grant candidate; never revive a policy-excluded sample.
+      collector.navigate(tabId, sender.documentId, url?.identity ?? null, granted && url ? 'spa' : 'existing', now);
       await resumeDocument(tabId, now);
     } else if (message.type === 'leave') {
       collector.leave(tabId, sender.documentId, now);
@@ -524,9 +528,13 @@ chrome.webNavigation.onCommitted.addListener(details => {
     }
     if (frame.documentId !== details.documentId) return;
     const allowed = await hasPermission(details.url);
-    const url = allowed ? await describeUrl(details.url) : null;
+    const inspected = await describeUrl(details.url);
+    const url = allowed ? inspected : null;
     if (endingRequested || ending.checkpoint) return;
     collector.navigate(details.tabId, details.documentId, url?.identity ?? null, details.transitionType === 'reload' ? 'reload' : 'new', now);
+    const tab = collector.state.tabs[details.tabId];
+    if (!allowed && inspected && !isApiHost(details.url) && !frame.errorOccurred && tab?.identity === null
+      && collector.current(details.tabId)?.reason === 'url-policy') tab.awaitingPermission = true;
     if (frame.errorOccurred) collector.navigationError(details.tabId, frame.documentId, url?.identity ?? null, now);
     await resumeDocument(details.tabId, now);
     await chrome.tabs.sendMessage(details.tabId, { type: 'capture' }).catch(() => undefined);

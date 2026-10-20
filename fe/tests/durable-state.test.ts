@@ -84,6 +84,22 @@ describe('IndexedDB aggregate transactions', () => {
 });
 
 describe('migration and corruption', () => {
+  it('persists only a consistent permission wait marker without any sampled content', async () => {
+    const c = new Collector(); c.start({ ...serverSession(), sessionId: SERVER_SESSION_ID });
+    c.navigate(1, 'unpermitted-document', null, 'new', 1000); c.state.tabs[1].awaitingPermission = true;
+    const state = { collection: c.state }; await repository.initialize(state);
+    expect((await repo().initialize({})).value).toEqual(state);
+    for (const change of [
+      (s: any) => { s.collection.tabs[1].awaitingPermission = false; },
+      (s: any) => { s.collection.tabs[1].awaitingPermission = 'true'; },
+      (s: any) => { s.collection.tabs[1].awaitingPermission = null; },
+      (s: any) => { s.collection.tabs[1].identity = 'a'.repeat(64); },
+      (s: any) => { s.collection.candidates[0].reason = 'dom-policy'; },
+      (s: any) => { s.collection.candidates[0].activeDurationMs = 1; },
+    ]) {
+      const corrupt = structuredClone(state); change(corrupt); expect(() => validateState(corrupt)).toThrow();
+    }
+  });
   it('persists an erased prefix without weakening candidate or POST sequence validation', async () => {
     const state = await fixture();
     state.collection.sequenceStart = 7; state.collection.nextSequence = 8;

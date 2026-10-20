@@ -93,7 +93,9 @@ function assertCollection(state: CollectionState) {
   for (const [id, t] of Object.entries(state.tabs)) {
     const c = state.candidates.find(c => c.visitId === t?.candidateId);
     if (!/^\d+$/.test(id) || !c || c.browserTabKey !== t.browserTabKey || typeof t.documentId !== 'string'
-      || ![t.identity, t.currentIdentity].every(v => v === null || typeof v === 'string' && /^[a-f0-9]{64}$/.test(v))) throw new StorageFailure('corrupt');
+      || ![t.identity, t.currentIdentity].every(v => v === null || typeof v === 'string' && /^[a-f0-9]{64}$/.test(v))
+      || t.awaitingPermission !== undefined && (t.awaitingPermission !== true || t.identity !== null || t.currentIdentity !== null
+        || c.state !== 'excluded' || c.reason !== 'url-policy' || !c.finalized || c.sequence !== null || c.activeDurationMs !== 0)) throw new StorageFailure('corrupt');
   }
   if (![state.foregroundTabId, state.lastActiveTabId].every(v => v === null || Number.isSafeInteger(v) && v >= 0)
     || (state.lastActiveVisitId !== null && !ids.has(state.lastActiveVisitId))) throw new StorageFailure('corrupt');

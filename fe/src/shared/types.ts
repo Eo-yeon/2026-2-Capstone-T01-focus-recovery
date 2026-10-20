@@ -60,6 +60,7 @@ export interface TabState {
   currentIdentity: string | null;
   navigationFailed?: boolean;
   documentLeft?: boolean;
+  awaitingPermission?: true; // Safe URL observed without site permission; no content captured.
   candidateId: string;
 }
 export interface CollectionState {
